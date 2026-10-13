@@ -1,0 +1,8 @@
+# 仓库内一律使用 LF：Windows 下 git 默认会把行尾转成 CRLF，
+# 会让 diff / 警告变得很吵，也让跨平台贡献者拿到不一致的换行。
+* text=auto eol=lf
+
+# 二进制文件不参与换行转换
+*.png binary
+*.exe binary
+*.ico binary
