@@ -580,3 +580,7 @@ docs/
 
 Windows 10 1803+ 或 Windows 11（Acrylic 需要 1803+，低版本自动降级）。
 Rust 1.77+（用到了 C 字符串字面量）。
+
+## 许可证
+
+[MIT License](LICENSE) —— 可自由使用、修改、分发与商用，仅需保留版权声明。

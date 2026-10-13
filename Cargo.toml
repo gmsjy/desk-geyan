@@ -3,6 +3,7 @@ name = "desk-geyan"
 version = "0.1.0"
 edition = "2021"
 description = "桌面格言挂件：毛玻璃/纯文字 per-pixel alpha 渲染，跑马灯动效，点击穿透，不抢焦点"
+license = "MIT"
 
 [dependencies]
 windows-sys = { version = "0.59", features = [
