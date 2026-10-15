@@ -2,12 +2,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
+mod bench;
+mod clipboard;
 mod config;
+mod config_ui;
 mod consts;
+mod favorites;
 mod ffi;
 mod gfx;
+mod layout;
 mod png;
 mod quotes;
+mod transition;
 mod util;
 
 fn main() {
@@ -25,6 +32,10 @@ fn main() {
     if args.iter().any(|a| a == "--clicktest") {
         std::process::exit(app::clicktest());
     }
+    // 收藏当前句子：**真的按一次 Ctrl+Alt+F**，再验剪贴板 / 收藏夹 / 幂等
+    if args.iter().any(|a| a == "--favtest") {
+        std::process::exit(app::favtest());
+    }
     if args.iter().any(|a| a == "--quotes") {
         std::process::exit(quotes::audit());
     }
@@ -33,6 +44,23 @@ fn main() {
     }
     if args.iter().any(|a| a == "--memtest") {
         std::process::exit(app::memtest());
+    }
+    // --autostart on|off|query：开机自启的查询 / 设置。
+    // 除了给脚本用，也是**端到端验证通道**：设完要用独立工具（reg query）
+    // 读回注册表对数，不能只信自己写进去的返回值。
+    if let Some(i) = args.iter().position(|a| a == "--autostart") {
+        match args.get(i + 1).map(|s| s.as_str()) {
+            Some("on") => std::process::exit(if autostart::apply(true) { 0 } else { 4 }),
+            Some("off") => std::process::exit(if autostart::apply(false) { 0 } else { 4 }),
+            Some("query") => {
+                println!("{}", if autostart::enabled() { "on" } else { "off" });
+                std::process::exit(0);
+            }
+            _ => {
+                println!("用法: desk-geyan --autostart on|off|query");
+                std::process::exit(2);
+            }
+        }
     }
     if args.iter().any(|a| a == "--perf") {
         std::process::exit(app::perf());

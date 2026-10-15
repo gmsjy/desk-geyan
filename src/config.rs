@@ -54,6 +54,34 @@ pub fn next_date_color(cur: u32) -> u32 {
     cycle_u32(&DATE_COLOR_PRESETS, cur)
 }
 
+/// 循环「格言颜色」：跟随主色 → 七个预设 → 回到跟随主色。
+/// 把 `COLOR_UNSET` 也放进循环，是因为「跟随主色」本来就是最常用的那一档，
+/// 不该只能靠手改配置文件走回去。
+pub fn next_quote_color(cur: u32) -> u32 {
+    if cur == COLOR_UNSET {
+        return COLOR_PRESETS[0];
+    }
+    let i = COLOR_PRESETS
+        .iter()
+        .position(|&v| v == cur)
+        .unwrap_or(usize::MAX);
+    let j = i.wrapping_add(1);
+    if j >= COLOR_PRESETS.len() {
+        COLOR_UNSET
+    } else {
+        COLOR_PRESETS[j]
+    }
+}
+
+/// 「格言颜色」的可读标签
+pub fn quote_color_label(c: u32) -> String {
+    if c == COLOR_UNSET {
+        "跟随主色".to_string()
+    } else {
+        fmt_color(c)
+    }
+}
+
 /// 字体在其预设表里的下一个
 pub fn next_font(cur: &str) -> String {
     let i = FONT_PRESETS
@@ -167,6 +195,65 @@ impl fmt::Display for Anim {
     }
 }
 
+/// 版式：横排 / 竖排。
+///
+/// 放在这里而不是 `layout.rs`，是为了和 `Mode` / `Anim` 一样**同源**：
+/// 它同样要经过 `apply_kv → save → 菜单 → --dump` 四端，也要有
+/// `label()` / `key()` / `parse()`。排版引擎只是它的消费者。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Orient {
+    Horizontal,
+    Vertical,
+}
+
+impl Orient {
+    pub fn all() -> [Orient; 2] {
+        [Orient::Horizontal, Orient::Vertical]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Orient::Horizontal => "横版",
+            Orient::Vertical => "竖版（卷轴式）",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Orient::Horizontal => "horizontal",
+            Orient::Vertical => "vertical",
+        }
+    }
+
+    pub fn parse(s: &str) -> Orient {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "vertical" | "v" | "竖版" | "竖排" => Orient::Vertical,
+            _ => Orient::Horizontal,
+        }
+    }
+
+    /// 这一形态的**默认窗口尺寸**。切换版式时只在这套默认值上做手脚，
+    /// 用户自己改过的尺寸一律不覆盖（见 `set_orient`）。
+    pub fn default_size(self) -> (i32, i32) {
+        match self {
+            Orient::Horizontal => (620, 176),
+            Orient::Vertical => (300, 660),
+        }
+    }
+}
+
+impl fmt::Display for Orient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
+/// `quote_color` 的哨兵值：表示「跟随主色」。
+///
+/// 用哨兵而不是 `Option<u32>`，是为了让**旧 ini（没有这个键）载入后行为逐像素不变** ——
+/// 默认就是跟随主色，而 `color` 的取值范围是 `0x00RRGGBB`，永远不会撞上这个值。
+pub const COLOR_UNSET: u32 = 0xFFFF_FFFF;
+
 #[derive(Clone)]
 pub struct Config {
     pub x: i32,
@@ -206,8 +293,26 @@ pub struct Config {
     /// 是否在布局模式（可拖动 / 缩放）
     pub layout_mode: bool,
     pub visible: bool,
+    /// 全屏应用（游戏 / 全屏播放）运行时自动隐藏，退出后恢复。
+    /// 默认开：挂件漂在游戏画面上的观感很差，而这个场景几乎无法手动补救。
+    pub auto_hide_fs: bool,
     /// 首次定位时自动吸附到屏幕右上角
     pub placed: bool,
+    /// 版式：横排 / 竖排（形态 A 卷轴式）
+    pub orient: Orient,
+    /// 格言字距（0..=8，按整体字号缩放后生效）。0 = 今天的样子
+    pub letter_spacing: i32,
+    /// 格言专用色。`COLOR_UNSET` = 跟随主色（默认，保证旧配置行为不变）
+    pub quote_color: u32,
+    /// 放不下时是否允许「缩字号」回退（100% → 85% → 70%）。
+    /// 关掉就直接走跑马灯 / 省略号
+    pub shrink_fit: bool,
+    /// 横版上次的窗口尺寸（切版式时用来还给用户）
+    pub h_w: i32,
+    pub h_h: i32,
+    /// 竖版上次的窗口尺寸
+    pub v_w: i32,
+    pub v_h: i32,
 }
 
 impl Default for Config {
@@ -237,7 +342,16 @@ impl Default for Config {
             clock_dy: 0,
             layout_mode: false,
             visible: true,
+            auto_hide_fs: true,
             placed: false,
+            orient: Orient::Horizontal,
+            letter_spacing: 0,
+            quote_color: COLOR_UNSET,
+            shrink_fit: true,
+            h_w: 620,
+            h_h: 176,
+            v_w: 300,
+            v_h: 660,
         }
     }
 }
@@ -253,6 +367,15 @@ impl Config {
     /// 用户配置上改几个字段。用户一旦按 `Ctrl+Alt+C` 把时间关掉，
     /// 「拖动时间日期块」的测试就再也命中不了目标（命中判定直接返回 false），
     /// 于是测试静默变成一句空跑，还报绿。测试的起点必须是常量。
+    ///
+    /// ⚠️ **换完 `cfg` 必须接着 `rebuild_fonts()`。** 字体对象是 `App::new()` 按
+    /// **用户配置**建好的一版（`Fonts::build(cfg.font, ...)`），它不会跟着 `cfg`
+    /// 自己变 —— 只换 `cfg` 等于在「起点是常量」这条规矩上给字体留了个洞，
+    /// 而且后果不小：用户选了个纵向度量很大的字体（手写体 / 装饰体）时，
+    /// 时钟块会被撑得几乎填满窗口，命中判定于是把「拖空白处移动整窗」认成
+    /// 「拖时间日期块」，`--dragtest` 的整窗移动整组失败（实测 `霞鹜文楷 Medium`
+    /// → 时钟块高 128px / 窗高 176px，窗口正中心落在块内）。对 `--perf` /
+    /// `--dragbench` 这类基准，它还会让读数随用户字体漂移。
     pub fn for_test() -> Config {
         Config {
             placed: true,
@@ -262,8 +385,74 @@ impl Config {
         }
     }
 
-    pub fn quotes_path() -> PathBuf {
-        data_dir().join("quotes.txt")
+    /// **唯一**的「生效动效」出口。
+    ///
+    /// 竖排下跑马灯没有意义（横向滚动的文字配竖排字格 = 横竖混排的怪物），
+    /// 所以竖版一律降级为静态。`step` / `needs_frame` / `paint_main` / 菜单
+    /// 四处都必须读这一个函数 —— 各写各的必然走偏（菜单说静态、实际在滚）。
+    pub fn eff_anim(&self) -> Anim {
+        match self.orient {
+            Orient::Vertical => Anim::Static,
+            Orient::Horizontal => self.anim,
+        }
+    }
+
+    /// 格言最终用的绘制色。哨兵表示跟随主色。
+    pub fn quote_paint_color(&self) -> u32 {
+        if self.quote_color == COLOR_UNSET {
+            self.color
+        } else {
+            self.quote_color
+        }
+    }
+
+    /// 格言基准字号（px）—— 与 `gfx::Fonts::build` 里的 `s(20, quote_scale)`
+    /// 是同一把尺子（缩字阶梯另说）。过渡滑入距离等「一个 em」的量都从它推，
+    /// 两边走偏就会「滑入距离和字号脱钩」。
+    pub fn quote_font_px(&self) -> i32 {
+        ((20 * self.scale / 100) * self.quote_scale / 100).max(6)
+    }
+
+    /// 格言字距（px）：配置值是「相对值」，按整体字号缩放。
+    /// 放大字号时字距得跟着放大，否则大字号下的字距等于没加。
+    pub fn quote_spacing(&self) -> i32 {
+        if self.letter_spacing <= 0 {
+            return 0;
+        }
+        ((self.letter_spacing * self.scale) as f32 / 100.0).round() as i32
+    }
+
+    /// 切换版式，并按「只在默认尺寸上做手脚」的规矩调整窗口大小。
+    ///
+    /// 规则（三种情况各不相同，缺一个都会让用户骂人）：
+    ///   * 当前尺寸**正好等于旧形态的默认值** → 换成新形态上次的尺寸（初次就是它的默认值）
+    ///   * 用户手动改过尺寸 → **不动**，只是换版式
+    ///   * 无论哪种，都把「离开时的尺寸」记回旧形态的槽里，来回切才找得回来
+    pub fn set_orient(&mut self, new: Orient) {
+        if new == self.orient {
+            return;
+        }
+        let old = self.orient;
+        let (odw, odh) = old.default_size();
+        match old {
+            Orient::Horizontal => {
+                self.h_w = self.w;
+                self.h_h = self.h;
+            }
+            Orient::Vertical => {
+                self.v_w = self.w;
+                self.v_h = self.h;
+            }
+        }
+        if self.w == odw && self.h == odh {
+            let (nw, nh) = match new {
+                Orient::Horizontal => (self.h_w, self.h_h),
+                Orient::Vertical => (self.v_w, self.v_h),
+            };
+            self.w = nw;
+            self.h = nh;
+        }
+        self.orient = new;
     }
 
     pub fn load() -> Config {
@@ -271,15 +460,25 @@ impl Config {
         let Ok(text) = std::fs::read_to_string(Self::path()) else {
             return cfg;
         };
+        let mut kvs: Vec<(String, String)> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            apply_kv(&mut cfg, k.trim(), v.trim());
+            if let Some((k, v)) = line.split_once('=') {
+                kvs.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+        // 版式必须**先**落地：`orient` 会顺手把窗口尺寸换成该形态的尺寸，
+        // 而竖版默认尺寸是 300x660。若先读 `w=`/`h=`（竖版存下来的 300/660），
+        // 再切版式，就会被误判成「用户把横版改成了 300x660」，
+        // 把横版那对记忆槽写成 300x660 —— 以后再切回横版就找不回 620x176 了。
+        for (k, v) in kvs.iter().filter(|(k, _)| k == "orient") {
+            apply_kv(&mut cfg, k, v);
+        }
+        for (k, v) in kvs.iter().filter(|(k, _)| k != "orient") {
+            apply_kv(&mut cfg, k, v);
         }
         cfg
     }
@@ -315,7 +514,16 @@ impl Config {
              clock_dy={}\n\
              layout_mode={}\n\
              visible={}\n\
-             placed={}\n",
+             auto_hide_fs={}\n\
+             placed={}\n\
+             orient={}\n\
+             letter_spacing={}\n\
+             quote_color={}\n\
+             shrink_fit={}\n\
+             h_w={}\n\
+             h_h={}\n\
+             v_w={}\n\
+             v_h={}\n",
             self.x,
             self.y,
             self.w,
@@ -340,7 +548,21 @@ impl Config {
             self.clock_dy,
             self.layout_mode,
             self.visible,
+            self.auto_hide_fs,
             self.placed,
+            self.orient.key(),
+            self.letter_spacing,
+            // 哨兵不能过 fmt_color（那是 6 位十六进制），只能原样写成 unset
+            if self.quote_color == COLOR_UNSET {
+                "unset".to_string()
+            } else {
+                fmt_color(self.quote_color)
+            },
+            self.shrink_fit,
+            self.h_w,
+            self.h_h,
+            self.v_w,
+            self.v_h,
         );
         let _ = std::fs::write(Self::path(), text);
     }
@@ -401,7 +623,25 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
         "clock_dy" => cfg.clock_dy = v.parse().unwrap_or(cfg.clock_dy).clamp(-8000, 8000),
         "layout_mode" => cfg.layout_mode = parse_bool(v, cfg.layout_mode),
         "visible" => cfg.visible = parse_bool(v, cfg.visible),
+        "auto_hide_fs" => cfg.auto_hide_fs = parse_bool(v, cfg.auto_hide_fs),
         "placed" => cfg.placed = parse_bool(v, cfg.placed),
+        // 版式：走 set_orient 而不是裸赋值 —— 它会顺手把窗口尺寸换成新形态的默认值
+        // （只在该形态还没被用户改过时），这正是 `--dump orient=vertical` 想要的。
+        "orient" => cfg.set_orient(Orient::parse(v)),
+        "letter_spacing" => cfg.letter_spacing = v.parse().unwrap_or(cfg.letter_spacing).clamp(0, 8),
+        "quote_color" => {
+            let t = v.trim();
+            if t.eq_ignore_ascii_case("unset") || t.eq_ignore_ascii_case("auto") || t == "跟随主色" {
+                cfg.quote_color = COLOR_UNSET;
+            } else if let Some(c) = parse_color(t) {
+                cfg.quote_color = c;
+            }
+        }
+        "shrink_fit" => cfg.shrink_fit = parse_bool(v, cfg.shrink_fit),
+        "h_w" => cfg.h_w = v.parse().unwrap_or(cfg.h_w),
+        "h_h" => cfg.h_h = v.parse().unwrap_or(cfg.h_h),
+        "v_w" => cfg.v_w = v.parse().unwrap_or(cfg.v_w),
+        "v_h" => cfg.v_h = v.parse().unwrap_or(cfg.v_h),
         _ => {}
     }
 }

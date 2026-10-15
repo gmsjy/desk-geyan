@@ -1,9 +1,15 @@
 //! 格言库。
 //!
-//! 内置一批经典中文格言，另外支持在 `%APPDATA%\DeskGeyan\quotes.txt`
-//! 里每行追加一条（`正文 —— 作者` 或直接写正文），文件里已有的条目优先显示。
+//! 内置一批经典中文格言，另外支持**外部文件**，外部条目优先显示：
+//!
+//! * `quotes.txt` —— 单文件用法，一行一条（`正文 —— 作者` 或直接写正文）。
+//! * `quotes/*.txt` —— 多文件分组：每个 `.txt` 是一组，**按文件名字典序**排，
+//!   组内按行序，组间**轮流**出现（见 `library_from` 的 round-robin）。
+//!   想控制分组顺序就用 `01_乡村振兴.txt` / `02_基层治理.txt` 这种命名。
+//!
+//! 单文件用法完全向后兼容：只有一个组时，round-robin 退化成原行序。
 
-use crate::config::Config;
+use crate::util::data_dir;
 
 #[derive(Clone)]
 pub struct Quote {
@@ -115,7 +121,10 @@ fn strip_bom(s: &str) -> &str {
 }
 
 /// 逐行解析外部文件，跳过空行与 `#` / `;` 注释。
-fn read_external(path: &std::path::Path) -> std::io::Result<Vec<Quote>> {
+///
+/// `pub(crate)`：收藏夹（`favorites.rs`）要复用同一个解析器 ——
+/// 「写出去的行能被读回来」必须是同一个函数保证的，各写一份必走偏。
+pub(crate) fn read_external(path: &std::path::Path) -> std::io::Result<Vec<Quote>> {
     let text = std::fs::read_to_string(path)?;
     let mut list = Vec::new();
     for raw in strip_bom(&text).lines() {
@@ -128,20 +137,115 @@ fn read_external(path: &std::path::Path) -> std::io::Result<Vec<Quote>> {
     Ok(list)
 }
 
-/// 内置库 + 外部文件；外部文件里的条目排在前面。
+/// 一组外部格言：`(组名, 条目)`。组名取文件名（不含目录），
+/// 诊断输出里要能看出「哪条来自哪个文件」。
+pub(crate) type Group = (String, Vec<Quote>);
+
+/// 收集所有外部分组：先 `quotes.txt`（老用法，保持「行序即优先级」的
+/// 向后兼容），再 `quotes/` 目录下每个 `.txt`（按文件名字典序）。
+///
+/// 空文件、空目录都会被跳过 —— 「建了 quotes/ 但还没放文件」不该让程序
+/// 退化成「只有内置库」之外的任何异常状态。
+///
+/// `pub(crate)`：收藏夹的测试要验「收藏夹确实成为独立一组、且组名对」，
+/// 路由到这个函数而不是自己再数一遍文件。
+pub(crate) fn load_groups(dir: &std::path::Path) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+
+    // ① 单文件：`<dir>/quotes.txt`
+    let single = dir.join("quotes.txt");
+    if let Ok(list) = read_external(&single) {
+        if !list.is_empty() {
+            groups.push(("quotes.txt".to_string(), list));
+        }
+    }
+
+    // ② 分组目录：`<dir>/quotes/*.txt`，按文件名排序
+    let qdir = dir.join("quotes");
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&qdir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .map(|x| x.eq_ignore_ascii_case("txt"))
+                        .unwrap_or(false)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // 字典序 = 「01_、02_、10_」也会按数字意图排（不会 10 排到 2 前面，
+    // 因为前导零保证了字典序与数值序一致）。
+    files.sort();
+    for f in files {
+        if let Ok(list) = read_external(&f) {
+            if !list.is_empty() {
+                let name = f
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| f.to_string_lossy().to_string());
+                groups.push((name, list));
+            }
+        }
+    }
+    groups
+}
+
+/// 组间 round-robin 交织：组内保序，组间轮流取一条。
+///
+/// ```
+/// A = [a1, a2]   B = [b1, b2, b3]
+/// → a1, b1, a2, b2, b3
+/// ```
+///
+/// 为什么不是「A 播完再播 B」：组大小往往差一个量级（申论 152 条 vs
+/// 古诗 30 条），顺序播放会让小组几分钟才露一次面。round-robin 让每个
+/// 文件都按自己的行序均匀出现 —— 组内相邻两条仍相距不远，
+/// 而「放到最前的组最先出现」这个老语义也保住了（第一轮就是按组序）。
+/// 只有一个组时退化为原行序，与旧实现逐字节一致。
+fn interleave(groups: &[Group]) -> Vec<Quote> {
+    let max_len = groups.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for i in 0..max_len {
+        for (_, list) in groups {
+            if i < list.len() {
+                out.push(list[i].clone());
+            }
+        }
+    }
+    out
+}
+
+/// 内置库 + 所有外部分组（外部在前）。分组细节见模块文档。
 pub fn library() -> Vec<Quote> {
-    let mut list = read_external(&Config::quotes_path()).unwrap_or_default();
+    library_from(&data_dir())
+}
+
+/// 从**指定数据目录**加载。抽出来是为了让测试指向临时目录 ——
+/// 直接测真实 `%APPDATA%\DeskGeyan` 的话，测试结果会随机器上
+/// 用户自己的 quotes.txt 变化（这条项目已经为「测试读用户配置」
+/// 栽过一次，见 `Config::for_test` 的注释）。
+pub fn library_from(dir: &std::path::Path) -> Vec<Quote> {
+    let mut list = interleave(&load_groups(dir));
     for (t, a) in BUILTIN {
         list.push(Quote::new(t, a));
     }
     list
 }
 
+/// 内置库条数。测试断言总条数时用，免得把「72」这个魔数写进测试。
+pub fn builtin_len() -> usize {
+    BUILTIN.len()
+}
+
 /// 一条格言在候选表里的「规范形态」，用来查重。
 ///
 /// 只去空白、去标点，不碰文字 —— 查重的目标是「同一句话写了两遍」，
 /// 而不是「看起来像」。
-fn norm(s: &str) -> String {
+///
+/// `pub(crate)`：收藏夹查重要用同一把尺子（见 `favorites::decide`）。
+pub(crate) fn norm(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_whitespace() && !"，。；：、！？「」\"'".contains(*c))
         .collect()
@@ -155,42 +259,71 @@ fn norm(s: &str) -> String {
 pub fn audit() -> i32 {
     use std::collections::HashSet;
 
-    let path = Config::quotes_path();
+    let dir = data_dir();
     let mut rows: Vec<(&'static str, bool, String)> = Vec::new();
 
-    let read = read_external(&path);
-    // `io::Error` 不是 Clone，所以走 `as_ref()` 借一次再克隆条目。
-    let ext: Vec<Quote> = read.as_ref().map(|v| v.clone()).unwrap_or_default();
+    let groups = load_groups(&dir);
+    // 交织后的完整外部队列（= 实际播放顺序的前缀）
+    let ext: Vec<Quote> = interleave(&groups);
     let builtin_n = BUILTIN.len();
     let list = library();
 
-    rows.push((
-        "格言文件可读",
-        read.is_ok(),
-        match &read {
-            Ok(_) => format!("{}", path.display()),
-            Err(e) => format!("{} —— {}", path.display(), e),
-        },
-    ));
+    // ---- 分组结构（新增：多文件用法要能一眼看出加载了几组、各几条）
+    if groups.is_empty() {
+        rows.push((
+            "外部格言文件",
+            true,
+            format!(
+                "未发现 quotes.txt / quotes/*.txt，仅用内置 {} 条",
+                builtin_n
+            ),
+        ));
+    } else {
+        let desc = groups
+            .iter()
+            .map(|(n, l)| format!("{}:{}", n, l.len()))
+            .collect::<Vec<_>>()
+            .join("  ");
+        rows.push((
+            "分组加载",
+            true,
+            format!(
+                "{} 组 · {} 条外部（交织后）+ {} 条内置 = {} 条 —— {}",
+                groups.len(),
+                ext.len(),
+                builtin_n,
+                list.len(),
+                desc
+            ),
+        ));
+    }
 
-    // 文件不存在时 library() 会退回纯内置库，程序不崩 —— 这里只报数不判失败。
-    let raw_bom = std::fs::read_to_string(&path)
-        .map(|t| t.starts_with('\u{feff}'))
-        .unwrap_or(false);
+    // ---- BOM：记事本「另存为 UTF-8」的产物。已自动剥离，只报数不判失败
+    // （漏剥的后果是「# 注释行变成一条格言」，那由「注释未被当成格言」兜住）。
+    let bom_files: Vec<String> = {
+        let mut v = Vec::new();
+        for (name, _) in &groups {
+            let p = if name == "quotes.txt" {
+                dir.join("quotes.txt")
+            } else {
+                dir.join("quotes").join(name)
+            };
+            if let Ok(t) = std::fs::read_to_string(&p) {
+                if t.starts_with('\u{feff}') {
+                    v.push(name.clone());
+                }
+            }
+        }
+        v
+    };
     rows.push((
         "无 BOM 污染",
         true,
-        if raw_bom {
-            "文件带 UTF-8 BOM（已自动剥离，不影响显示）".into()
-        } else {
+        if bom_files.is_empty() {
             "无 BOM".to_string()
+        } else {
+            format!("{} 带 UTF-8 BOM（已自动剥离）", bom_files.join(" / "))
         },
-    ));
-
-    rows.push((
-        "外部条目非空",
-        !ext.is_empty(),
-        format!("{} 条外部 + {} 条内置 = {} 条", ext.len(), builtin_n, list.len()),
     ));
 
     let blank: Vec<usize> = ext
@@ -256,6 +389,7 @@ pub fn audit() -> i32 {
         },
     ));
 
+    // 跨组查重：同一个文件里写两遍、或者两个文件里放同一句，都算。
     let mut seen: HashSet<String> = HashSet::new();
     let dup_ext: Vec<&str> = ext
         .iter()
@@ -303,7 +437,7 @@ pub fn audit() -> i32 {
     println!("  ……（第 {} 条）· {}", list.len(), list[list.len() - 1].display());
 
     println!(
-        "\n{}\n提示：改完 quotes.txt 保存，托盘菜单「重新载入配置」即生效。",
+        "\n{}\n提示：改完 quotes.txt 或 quotes/*.txt 保存，托盘菜单「重新载入格言 / 配置」即生效。",
         if pass {
             "格言库解析全部符合预期"
         } else {

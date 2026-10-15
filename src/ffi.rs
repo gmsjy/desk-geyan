@@ -13,7 +13,10 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{BOOL, HWND};
+use windows_sys::Win32::Foundation::BOOL;
+/// 重新导出：剪贴板 / 注册表的自持 FFI 签名要出现在 `pub` 位置上，
+/// 私有 `use` 的类型不能写在 `pub fn` 的参数里（E0603）。
+pub use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, GetProcAddress, LoadLibraryW,
@@ -108,6 +111,94 @@ extern "system" {
 
 /// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: *mut c_void = -4isize as *mut c_void;
+
+// ---------------------------------------------------------------- 剪贴板
+//
+// 同样不拉 `Win32_System_DataExchange` / `Win32_System_Memory` feature：
+// 收藏功能只要 6 个函数，签名极稳定，自持声明与 `consts.rs` 的哲学一致。
+// `SetClipboardData` 的第二个参数在文档里是 `HANDLE`，实际收的是
+// `GlobalAlloc` 出来的可移动内存句柄 —— 所以 Global* 系列（kernel32）
+// 和剪贴板系列（user32）必须一起声明。
+#[link(name = "user32")]
+extern "system" {
+    pub fn OpenClipboard(hwnd: HWND) -> BOOL;
+    pub fn CloseClipboard() -> BOOL;
+    pub fn EmptyClipboard() -> BOOL;
+    pub fn IsClipboardFormatAvailable(format: u32) -> BOOL;
+    pub fn SetClipboardData(format: u32, hmem: *mut c_void) -> *mut c_void;
+    pub fn GetClipboardData(format: u32) -> *mut c_void;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+    pub fn GlobalLock(hmem: *mut c_void) -> *mut c_void;
+    pub fn GlobalUnlock(hmem: *mut c_void) -> BOOL;
+    pub fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
+}
+
+// ---------------------------------------------------------------- 注册表
+//
+// advapi32 的 Reg* 系列在 SDK 导入库里，正常 `#[link]` 即可。
+// 自己声明而不是拉 `Win32_System_Registry` feature：整个程序只用到 5 个函数，
+// 为一个 feature 把一整套注册表绑定拖进来不值当，而且签名自持可以让
+// `HKEY` 直接落在 `*mut c_void` 上，和 `consts.rs` 里的自持常量对得上。
+#[link(name = "advapi32")]
+extern "system" {
+    /// `HKEY` 就是 `*mut c_void`（句柄都是不透明指针）
+    pub fn RegOpenKeyExW(
+        hkey: *mut c_void,
+        subkey: *const u16,
+        options: u32,
+        sam_desired: u32,
+        out_key: *mut *mut c_void,
+    ) -> u32;
+    pub fn RegQueryValueExW(
+        hkey: *mut c_void,
+        value_name: *const u16,
+        reserved: *mut u32,
+        out_type: *mut u32,
+        data: *mut u8,
+        inout_len: *mut u32,
+    ) -> u32;
+    pub fn RegSetValueExW(
+        hkey: *mut c_void,
+        value_name: *const u16,
+        reserved: u32,
+        value_type: u32,
+        data: *const u8,
+        data_len: u32,
+    ) -> u32;
+    pub fn RegDeleteValueW(hkey: *mut c_void, value_name: *const u16) -> u32;
+    pub fn RegCloseKey(hkey: *mut c_void) -> u32;
+}
+
+type ShQueryUnsfn = unsafe extern "system" fn(*mut u32) -> i32;
+
+/// 当前「用户通知状态」（`QUERY_USER_NOTIFICATION_STATE`）。
+///
+/// 返回 `None` = 系统没这个 API（Vista 之前的系统）或查询失败 ——
+/// 调用方必须能接受「拿不到状态」：自动隐藏是个增强，不是功能前提。
+/// 走运行时解析而不是静态导入：API 不存在时静态导入会让**进程起不来**
+/// （导入表解析失败），而它只是可选的增强项。
+pub fn user_notification_state() -> Option<u32> {
+    static CACHE: OnceLock<Option<ShQueryUnsfn>> = OnceLock::new();
+    let f = *CACHE.get_or_init(|| unsafe {
+        // shell32 在任何 GUI 进程里都必然加载，GetModuleHandleW 就够
+        let name = crate::util::wide("shell32.dll");
+        let m = GetModuleHandleW(name.as_ptr());
+        if m.is_null() {
+            return None;
+        }
+        GetProcAddress(m, c"SHQueryUserNotificationState".as_ptr() as *const u8)
+            .map(|a| std::mem::transmute::<_, ShQueryUnsfn>(a))
+    });
+    let f = f?;
+    let mut state: u32 = 0;
+    // HRESULT：S_OK = 0。非 0 一律视为拿不到
+    let hr = unsafe { f(&mut state) };
+    (hr == 0).then_some(state)
+}
 
 // ---------------------------------------------------------------- 资源计数
 //

@@ -33,8 +33,19 @@ pub fn local_time() -> SYSTEMTIME {
     }
 }
 
-/// `%APPDATA%\DeskGeyan`
+/// 数据目录：`%APPDATA%\DeskGeyan`，可用 `DG_DATA_DIR` 覆盖。
+///
+/// 覆盖不只是为了测试（`--favtest` 要能指向临时目录，否则测试会
+/// **真的往用户的格言库里写收藏**）—— 对用户它也是便携模式：
+/// U 盘 / 绿色版指一下就能把配置和格言库都带在身上。
+///
+/// 空字符串视为未设置：`set VAR=` 这种清空写法不该把程序指到当前目录。
 pub fn data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("DG_DATA_DIR") {
+        if !d.trim().is_empty() {
+            return PathBuf::from(d);
+        }
+    }
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(base).join("DeskGeyan")
 }
@@ -43,22 +54,6 @@ pub fn ensure_data_dir() -> PathBuf {
     let d = data_dir();
     let _ = std::fs::create_dir_all(&d);
     d
-}
-
-pub fn clamp_f(v: f32, lo: f32, hi: f32) -> f32 {
-    if v < lo {
-        lo
-    } else if v > hi {
-        hi
-    } else {
-        v
-    }
-}
-
-/// 0→1 的平滑插值
-pub fn smoothstep(t: f32) -> f32 {
-    let t = clamp_f(t, 0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 // ---------------------------------------------------------------- 颜色

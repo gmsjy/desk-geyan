@@ -6,8 +6,11 @@
 
 #![allow(dead_code)]
 
+use std::ffi::c_void;
+
 // ---------------------------------------------------------------- 窗口样式
 pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 
 pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
@@ -81,9 +84,41 @@ pub const HTBOTTOM: isize = 15;
 pub const HTBOTTOMLEFT: isize = 16;
 pub const HTBOTTOMRIGHT: isize = 17;
 
+// ---------------------------------------------------------------- 注册表
+/// 开机自启写在 `HKCU`（当前用户）下 —— **不要写 HKLM**：那个要管理员权限，
+/// 而且「只为当前用户开机启动」本来就不该动机器级设置。
+pub const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001u32 as *mut c_void;
+pub const KEY_READ: u32 = 0x0002_0019;
+pub const KEY_WRITE: u32 = 0x0002_0006;
+pub const REG_SZ: u32 = 1;
+pub const ERROR_SUCCESS: u32 = 0;
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+// ---------------------------------------------------------------- 用户通知状态
+/// `SHQueryUserNotificationState` 的返回码。只有
+/// `QUNS_RUNNING_D3D_FULL_SCREEN`（独占式全屏 Direct3D 应用：游戏 / 全屏播放器）
+/// 会触发「全屏时自动隐藏」—— 其余状态（演示模式、安静时间…）都不该动窗口，
+/// 那些场景下用户恰恰可能正盯着屏幕。
+pub const QUNS_NOT_PRESENT: u32 = 1;
+pub const QUNS_BUSY: u32 = 2;
+pub const QUNS_RUNNING_D3D_FULL_SCREEN: u32 = 3;
+pub const QUNS_PRESENTATION_MODE: u32 = 4;
+pub const QUNS_ACCEPTS_NOTIFICATIONS: u32 = 5;
+pub const QUNS_QUIET_TIME: u32 = 6;
+pub const QUNS_APP: u32 = 7;
+
 // ---------------------------------------------------------------- ShowWindow
 pub const SW_HIDE: i32 = 0;
+/// 设置面板「已经开着就置前」用：正常显示 + 激活
+pub const SW_SHOWNORMAL: i32 = 1;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
+
+// ---------------------------------------------------------------- 静态文字控件样式
+/// 静态文字的样式位（`SS_*`）。自己声明而不是从 crate 里取：这几位在
+/// `windows-sys` 里挂在一个默认关闭的 feature 底下，为它们开一个 feature 不值当，
+/// 而常量值本身就是 ABI 稳定的事实标准（见本文件顶部说明）。
+pub const SS_LEFT: u32 = 0x0000_0000;
+pub const SS_CENTER: u32 = 0x0000_0001;
 
 // ---------------------------------------------------------------- 分层窗口属性
 pub const LWA_ALPHA: u32 = 0x0000_0002;
@@ -111,6 +146,8 @@ pub const MOD_CONTROL: u32 = 0x0002;
 pub const MOD_SHIFT: u32 = 0x0004;
 pub const MOD_NOREPEAT: u32 = 0x4000;
 
+pub const VK_MENU: u32 = 0x12;
+pub const VK_CONTROL: u32 = 0x11;
 pub const VK_LEFT: u32 = 0x25;
 pub const VK_UP: u32 = 0x26;
 pub const VK_RIGHT: u32 = 0x27;
@@ -118,6 +155,7 @@ pub const VK_DOWN: u32 = 0x28;
 pub const VK_C: u32 = 0x43;
 pub const VK_D: u32 = 0x44;
 pub const VK_E: u32 = 0x45;
+pub const VK_F: u32 = 0x46;
 pub const VK_H: u32 = 0x48;
 pub const VK_K: u32 = 0x4B;
 pub const VK_M: u32 = 0x4D;
@@ -127,6 +165,8 @@ pub const VK_S: u32 = 0x53;
 pub const VK_T: u32 = 0x54;
 pub const VK_V: u32 = 0x56;
 pub const VK_X: u32 = 0x58;
+/// 打开 / 置前设置面板
+pub const VK_O: u32 = 0x4F;
 /// `Ctrl+Alt+=` / `Ctrl+Alt+-` 调字号
 pub const VK_OEM_PLUS: u32 = 0xBB;
 pub const VK_OEM_MINUS: u32 = 0xBD;
@@ -144,12 +184,20 @@ pub const FW_SEMIBOLD: i32 = 600;
 pub const FW_BOLD: i32 = 700;
 /// 灰度抗锯齿（不要用 CLEARTYPE_QUALITY，次像素渲染会给掩码带上彩色边）
 pub const ANTIALIASED_QUALITY: u32 = 4;
+/// `GetGlyphIndicesW` 的 flag：字体里没有这个字形时回 `0xFFFF`（而不是 0）。
+/// 于是「这个字体能不能打出这个字」变成一次**可判定**的比较 —— 设置面板
+/// 的字体列表就是靠它把「不含汉字的西文字体」挡在外面的。
+pub const GGI_MARK_NONEXISTING_GLYPHS: u32 = 0x0001;
 
 pub const WHITE: u32 = 0x00FF_FFFF;
 pub const BLACK: u32 = 0x0000_0000;
 
 // ---------------------------------------------------------------- 系统
 pub const SPI_GETWORKAREA: u32 = 0x0030;
+/// `MonitorFromPoint` 的 flags：取「离这个点最近的显示器」。
+/// 点落在所有屏幕之外时也能落到正确的那块，比 `MONITOR_DEFAULTTOPRIMARY` 更适合
+/// 「挂件被拖到屏外后要按哪块屏夹回去」这个场景。
+pub const MONITOR_DEFAULTTONEAREST: u32 = 0x0000_0002;
 pub const ERROR_HOTKEY_ALREADY_EXISTS: u32 = 1409;
 /// 单实例互斥量已存在
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
