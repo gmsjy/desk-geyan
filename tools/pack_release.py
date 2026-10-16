@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 """打包 desk-geyan 的 Windows x64 发布包。
 
-产物：`dist/desk-geyan-v<版本>-windows-x64.zip`，**平铺 4 个文件**（不加目录）：
-    desk-geyan.exe · README.md · LICENSE · quotes-shenlun.txt
+产物：`dist/desk-geyan-v<版本>-windows-x64.zip`，**平铺 5 个文件**（不加目录）：
+    desk-geyan.exe · quotes-builtin.txt · README.md · LICENSE · quotes-shenlun.txt
 
 为什么要有这个脚本：
-  * 发布包结构是「平铺 4 文件」，手工压容易漏件或压出目录层级；
+  * 发布包结构是「平铺 5 文件」，手工压容易漏件或压出目录层级；
   * 包里的 README **必须**等于当前 `README.md`（README 一改就得重打包）；
+  * `quotes-builtin.txt` 是**内置格言库**，程序启动时按「exe 同目录」去找它 ——
+    漏了它程序只会显示一句提示语，所以它和 exe 一样是**必需件**；
   * 更要紧的是**别拿陈旧 exe 打包** —— 2026-10-16 踩过：`target/release/` 里躺着
     一个早于当日改动的 exe，用它量 A/B 得到 580px 的假回归。这里加了一道
     「exe 必须比全部源文件新」的守卫，不满足直接拒绝打包。
   * 打完包从**新用户视角**自检：解压到空目录 + 空 `DG_DATA_DIR` 跑 `--selftest`
-    与 `--quotes`，全绿才算成包。
+    与 `--quotes`，全绿才算成包（这两条也顺带验证了内置库文件确实在包里且能被找到）。
 
 用法：
     python tools/pack_release.py
@@ -33,6 +35,8 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PAYLOAD = [  # (zip 内的名字, 仓库内相对路径)
     ("desk-geyan.exe", "target-rel/release/desk-geyan.exe"),
+    # 内置格言库：程序按「exe 同目录」找它 ⇒ 必需件，和 exe 一个待遇
+    ("quotes-builtin.txt", "assets/quotes-builtin.txt"),
     ("README.md", "README.md"),
     ("LICENSE", "LICENSE"),
     ("quotes-shenlun.txt", "assets/quotes-shenlun.txt"),

@@ -16,6 +16,21 @@ use crate::util::*;
 
 // ---------------------------------------------------------------- 自检
 
+/// 打印断言表，返回是否全绿。
+///
+/// 抽出来是为了**两处**都能用：正常收尾，以及前置条件不满足时的早退
+/// （见 `selftest` 里的「内置库文件」）。
+fn print_rows(rows: &[(&str, bool, String)]) -> bool {
+    let mut pass = true;
+    for (name, ok, detail) in rows {
+        if !ok {
+            pass = false;
+        }
+        println!("[{}] {:<32} {}", if *ok { "PASS" } else { "FAIL" }, name, detail);
+    }
+    pass
+}
+
 /// `desk-geyan --selftest`：不建窗口，直接把一帧走完整条渲染管线，
 /// 然后按**预乘 ARGB 的数学约束**逐个像素验算。
 ///
@@ -81,6 +96,44 @@ pub(crate) fn selftest() -> i32 {
     }
 
     let mut rows: Vec<(&str, bool, String)> = Vec::new();
+
+    // ---- 环境前提：内置库现在是**与 exe 同目录的文件**（`quotes-builtin.txt`），
+    // 不再编进二进制。这条断言守的是「装到用户手里时文件齐不齐」—— 缺件时程序
+    // 只剩一条提示语，下面那些读 `list[0]` 的断言（字号判据等）全部失去意义，
+    // 所以它必须排在第一个报出来。
+    // 下界取 100：内置库是「一部格言集」，退化成个位数只可能是文件被截断 /
+    // 换成了别的东西。上界不设 —— 条数是会长大的数据，不是契约。
+    {
+        let path = quotes::builtin_file();
+        let n = quotes::load_builtin().len();
+        let ok = path.is_some() && n >= 100;
+        rows.push((
+            "内置库文件（与 exe 同目录）",
+            ok,
+            match &path {
+                Some(p) => format!("{} 条 · {}", n, p.display()),
+                None => format!(
+                    "未找到 {}（在 exe 目录及其上溯各级里查找）",
+                    quotes::BUILTIN_FILE
+                ),
+            },
+        ));
+        if !ok {
+            // **早退**：库缺件时，后面靠「换句 / 过渡 / 竖排列数」的断言全部
+            // 失去对象，跑下去只会刷出 8 条互相传染的 FAIL（实测 56 PASS /
+            // 9 FAIL），把「少拷了一个文件」这个真因淹掉。一个前置条件不满足，
+            // 就只报这一条。
+            print_rows(&rows);
+            println!(
+                "\n存在失败项  自检中止：内置格言库不可用（{}）—— 补齐后重跑",
+                match &path {
+                    Some(p) => format!("{} 只解出 {} 条", p.display(), n),
+                    None => format!("{} 未找到", quotes::BUILTIN_FILE),
+                }
+            );
+            return 3;
+        }
+    }
 
     // ---- 动效状态机 soak：四种动效各跑 180 帧 × 0.1s = 18 秒动画时间。
     // 这个时长足以跨过跑马灯的轮转点(约 14.5s)、静态/淡入淡出的 dwell
@@ -473,8 +526,21 @@ pub(crate) fn selftest() -> i32 {
             }
         }
         let single_quiet = !single_activated && (a.eff_quote_k() - 1.0).abs() < 1e-6;
-        // 对照组：两句库，同样 15s，必须至少启过一次过渡
-        a.list = vec![saved[0].clone(), saved[1].clone()];
+        // 对照组：两句库，同样 15s，必须至少启过一次过渡。
+        // 库不足两句（内置库缺件时只剩一条兜底提示语）时**合成**第二句 ——
+        // 这一组的被测对象是过渡状态机、不是格言库本身，不能因为库小就把对照组
+        // 抽掉；缺件该由「内置库文件（与 exe 同目录）」那条断言单独报红。
+        a.list = if saved.len() >= 2 {
+            vec![saved[0].clone(), saved[1].clone()]
+        } else {
+            vec![
+                saved[0].clone(),
+                Quote {
+                    text: "对照组第二句".into(),
+                    author: String::new(),
+                },
+            ]
+        };
         a.qi = 0;
         a.qn = 1 % a.list.len();
         a.cur_w = measure_quote(&a, &a.list[0]);
@@ -2368,18 +2434,7 @@ pub(crate) fn selftest() -> i32 {
         a.rebuild_fonts();
     }
 
-    let mut pass = true;
-    for (name, ok, detail) in &rows {
-        if !ok {
-            pass = false;
-        }
-        println!(
-            "[{}] {:<32} {}",
-            if *ok { "PASS" } else { "FAIL" },
-            name,
-            detail
-        );
-    }
+    let pass = print_rows(&rows);
     println!(
         "\n{}  像素构成: 全不透明 {} / 半透明 {} / 全透明 {}",
         if pass { "全部通过" } else { "存在失败项" },

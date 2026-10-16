@@ -58,16 +58,22 @@ Rust + 纯 Win32（`windows-sys`，无 GUI 框架）实现的桌面格言 / 时�
 **时间日期块可单独拖到任意位置**；开机自启；全屏游戏 / 播放器运行时自动隐藏；
 多显示器下按"挂件所在屏"取基准。
 
-**格言库** —— 内置 317 条（经典格言 · 诗词名句 · 谚语俗语 · 名人名言）+ 外部 `quotes.txt`
-（多文件分组、按行序轮播）；`Ctrl+Alt+F` 收藏当前句（同时复制到剪贴板），收藏夹自成一组参与轮播。
+**格言库** —— 内置 317 条（经典格言 · 诗词名句 · 谚语俗语 · 名人名言），存在与 exe
+**同目录**的 `quotes-builtin.txt` 里，**不编进二进制**（程序本体不为这几百条文案买单）；
+另外支持外部 `quotes.txt`（多文件分组、按行序轮播）；
+`Ctrl+Alt+F` 收藏当前句（同时复制到剪贴板），收藏夹自成一组参与轮播。
 
 ---
 
 ## 快速开始
 
 从 [Releases](https://github.com/gmsjy/desk-geyan/releases) 下载
-`desk-geyan-vX.Y.Z-windows-x64.zip`，解压后直接运行 `desk-geyan.exe` ——
+`desk-geyan-vX.Y.Z-windows-x64.zip`，解压后运行 `desk-geyan.exe` ——
 免安装、不需要 Rust 或任何运行时（只用 Windows 自带的 UCRT / `vcruntime140`）。
+
+> 解压出来的文件请**放在一起**：`desk-geyan.exe` 启动时会去同目录读 `quotes-builtin.txt`
+> （内置格言库）。只把 exe 单独拷走的话，程序会照常运行，但画面上只有一句
+> 「未找到格言库文件 quotes-builtin.txt」的提示 —— 这是有意为之的退化，不会静默空转。
 
 从源码跑：
 
@@ -137,6 +143,15 @@ cargo run --release
 
 ### 自定义格言与收藏
 
+**内置库是个普通文本文件**：`quotes-builtin.txt` 放在 `desk-geyan.exe` **同一目录**，
+格式与下面的外部文件一模一样（一行一条，`#` 开头是注释，分四节只是给人看的）。
+它是**装出来的数据文件而不是编进程序的常量** —— 317 条文案编进去会让 exe 多 18 KB，
+而这些文案跟渲染管线一行都无关。代价是它成了安装完整性的一部分：缺了就只有一句提示语
+（`--selftest` / `--quotes` 会把缺件直接判红）。
+
+想自己改内容，**不要改这个文件**（升级覆盖安装会被替换）：复制一份到
+`%APPDATA%\DeskGeyan\quotes.txt` 再编辑，外部库优先显示，改完按 `Ctrl+Alt+R` 重载。
+
 在 `%APPDATA%\DeskGeyan\quotes.txt` 里一行一条，格式 `正文 —— 作者`
 （作者可省略；`--`、`——`、制表符都能当分隔符；`#` 或 `;` 开头是注释）。
 外部条目**排在内置 317 条之前**优先显示，改完按 `Ctrl+Alt+R` 重载。
@@ -174,7 +189,7 @@ desk-geyan.exe                        # 正常启动（不常驻的命令见下�
 desk-geyan.exe --autostart on|off|query   # 开机自启的查询 / 设置
 
 # 自检与行为探测：都不常驻、跑完即退，且零副作用（配置先快照再原样写回）
---selftest    # 渲染管线 + 动效状态机 + 各可配置项的断言（64 条）
+--selftest    # 渲染管线 + 动效状态机 + 各可配置项的断言（65 条）
 --probe       # 读回窗口样式与可见性，验证「不干扰桌面」三道闸
 --clicktest   # 鼠标穿透的**行为**实测（真实光标，不读样式位）
 --dragtest    # 把「按下→移动→松开」灌进真窗口过程，验证拖动链路
@@ -477,7 +492,7 @@ src/
   transition.rs  **纯逻辑换句动效状态机**：顺序相位 + 缓动 + 分通道 alpha 系数（不碰 GDI）
   gfx.rs         渲染核心：DIB / 一趟画三条掩码通道 / 预乘合成 / PolyTextOutW 逐段合批 / ULW
   config_ui.rs   **设置面板**：表格驱动的控件布局 + 系统字体枚举 + owner-draw 字体列表
-  quotes.rs      内置格言库 + 多文件分组（round-robin）+ --quotes 自检
+  quotes.rs      格言库加载：内置库读同目录文件 + 外部多文件分组（round-robin）+ --quotes 自检
   favorites.rs   收藏夹：当前句子 → quotes/favorites.txt（独立一组，查重幂等）
   autostart.rs   开机自启：Run 键读写 + 备份/恢复决策（纯函数可测）
   config.rs      配置读写 + 预设（字体 / 颜色 / 字号档位）
@@ -486,7 +501,8 @@ src/
   consts.rs      Win32 常量（自持，不依赖 crate 的常量导出）
   util.rs        宽字符串 / 时间格式化 / 颜色解析
   png.rs         极简 PNG 写出（stored deflate，零依赖），只给 --dump 用
-assets/quotes-shenlun.txt   申论写作素材 152 条
+assets/quotes-builtin.txt    内置格言库 317 条（**随包平铺发布，必须与 exe 同目录**）
+assets/quotes-shenlun.txt   申论写作素材 152 条（可选，复制到数据目录才生效）
 docs/申论写作素材.md          同一批素材的可检索版
 tools/glass_shot.py          效果图抓屏脚本（毛玻璃是 DWM 合成的，--dump 抓不到）
 ```
