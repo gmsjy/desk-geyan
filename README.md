@@ -466,7 +466,13 @@ Dwell(4~10s) → Leave(160ms) → Gap(140ms) → Arrive(260ms) → Dwell …
 ```
 src/
   main.rs        入口 + 各 --xxx 验证入口的分派
-  app.rs         双窗口、消息泵、托盘、热键、动效状态机、布局与拖动、全屏守卫
+  app/           应用主体（原 app.rs，9151 行拆成 8 个模块）
+    mod.rs       App 状态 + 建窗引导 + 进程入口 + 模块间共享面
+    window.rs    Win32 窗口层：创建 / Acrylic / 穿透 / 几何 / 可见性
+    render.rs    帧构建与绘制：三通道掩码 → 合批 → ULW 上屏
+    frame.rs     帧调度：tick / step / needs_frame / 全屏守卫
+    input.rs     窗口过程、拖拽、命中判定、热键、托盘与菜单
+    verify/      验证与基准（自检 / 探测 / 单帧导出 / 性能 / 拖动 / 内存）
   layout.rs      **纯函数排版引擎**：折行 + 避头尾 + 缩字回退 + 竖版列切分与标点归位
   transition.rs  **纯逻辑换句动效状态机**：顺序相位 + 缓动 + 分通道 alpha 系数（不碰 GDI）
   gfx.rs         渲染核心：DIB / 一趟画三条掩码通道 / 预乘合成 / PolyTextOutW 逐段合批 / ULW
