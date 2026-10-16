@@ -302,7 +302,7 @@ fn favorite(a: &mut App) {
 /// `--favtest` 指向临时目录；运行时才用真实目录。
 fn favorite_at(a: &mut App, dir: &std::path::Path) {
     if a.list.is_empty() {
-        // 空库不该发生（内置 72 条兜底），但 `list` 是运行时状态，
+        // 空库不该发生（内置 317 条兜底），但 `list` 是运行时状态，
         // 别在这里panic —— 静默返回比崩掉强。
         return;
     }
