@@ -4,9 +4,22 @@
 //! 让整个程序保持零运行时依赖，`cargo build` 出来就是个能直接拷走的 exe。
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::util::{data_dir, ensure_data_dir, fmt_color, parse_color};
+
+/// 最近一次 `save()` 的失败码（0 = 成功，`u32::MAX` = 有错但拿不到 OS 错误码）。
+///
+/// 托盘菜单和设置面板都弹不出错误框，写入失败会表现为「改了设置，重启后没了」——
+/// 用户只会认为程序没记住。原因必须留在一个能被读出来的地方（诊断报告 / `--selftest`），
+/// 否则这类问题永远只能靠猜。
+static LAST_SAVE_ERR: AtomicU32 = AtomicU32::new(0);
+
+/// 最近一次 `save()` 的失败码（0 = 无失败）
+pub fn last_save_err() -> u32 {
+    LAST_SAVE_ERR.load(Ordering::Relaxed)
+}
 
 /// 可循环切换的字体候选。都是系统自带、一定存在的字体，
 /// 不做「字体是否存在」的探测 —— 不存在的字体 GDI 会静默回退，不会崩。
@@ -270,6 +283,10 @@ pub struct Config {
     pub show_quote: bool,
     /// 时钟是否带秒
     pub seconds: bool,
+    /// 暂停轮播：冻结换句、跑马灯与呼吸，保留当前这一句供阅读。
+    pub paused: bool,
+    /// 仅播放收藏夹这一组；收藏夹为空时回退到内置库，避免空画面。
+    pub fav_only: bool,
     /// 文字阴影：浅色壁纸下把白字托起来
     pub shadow: bool,
     /// 跑马灯速度 px/s
@@ -313,6 +330,22 @@ pub struct Config {
     /// 竖版上次的窗口尺寸
     pub v_w: i32,
     pub v_h: i32,
+    /// 字号是否跟着**当前显示器 DPI** 走（96dpi = 100%）。
+    ///
+    /// 关掉时行为与旧版逐像素相同（`scale` 就是最终字号百分比）；
+    /// 打开时物理尺寸在 100% / 150% / 200% 屏上看起来一样大 ——
+    /// 不跟着走的话，同一份配置在 4K 屏上会明显偏小，在 720p 上偏大。
+    pub dpi_auto: bool,
+    /// 当前显示器的 DPI 百分比（96 = 100）。
+    ///
+    /// **必须与物理尺寸一起落盘**：`w/h` 是已经按 DPI 缩放过的物理像素，
+    /// 不记录对应的 DPI，下次启动就会把「150% 下保存的 930px」再乘 1.5。
+    pub dpi: i32,
+    /// 当前配置里的 `dpi` 是否来自磁盘（或新装初始化）。
+    ///
+    /// 旧版配置没有 `dpi=` 键，不能拿 100 当真相去乘。首次加载时按
+    /// 「尺寸已经是当前屏的物理值」迁移一次，不再缩放。
+    pub dpi_known: bool,
 }
 
 impl Default for Config {
@@ -330,6 +363,8 @@ impl Default for Config {
             show_date: true,
             show_quote: true,
             seconds: true,
+            paused: false,
+            fav_only: false,
             shadow: true,
             speed: 60,
             scale: 100,
@@ -352,6 +387,12 @@ impl Default for Config {
             h_h: 176,
             v_w: 300,
             v_h: 660,
+            // 默认**关**：老配置（没有这个键）载入后行为逐像素不变。
+            // 新装（`placed == false`）时由 `run()` 改成 true —— 那台机器上
+            // 没有「旧行为」要保护，跟着系统缩放才是对的。
+            dpi_auto: false,
+            dpi: 100,
+            dpi_known: false,
         }
     }
 }
@@ -410,7 +451,35 @@ impl Config {
     /// 是同一把尺子（缩字阶梯另说）。过渡滑入距离等「一个 em」的量都从它推，
     /// 两边走偏就会「滑入距离和字号脱钩」。
     pub fn quote_font_px(&self) -> i32 {
-        ((20 * self.scale / 100) * self.quote_scale / 100).max(6)
+        ((20 * self.eff_scale_pct() / 100) * self.quote_scale / 100).max(6)
+    }
+
+    /// **有效缩放百分比**：用户字号 × 显示器 DPI（`dpi_auto` 关闭时 DPI 恒 100）。
+    ///
+    /// 这是全程序**唯一**的字号出口：字体、内边距、跑马灯间隙、命中带宽
+    /// 全部从它推。以前每个调用点各自写 `scale / 100.0`，于是「跟着屏缩放」
+    /// 这种横切改动根本没地方落 —— 漏一处就是字号和内边距不同步。
+    pub fn eff_scale_pct(&self) -> i32 {
+        let dpi = if self.dpi_auto { self.dpi.max(48) } else { 100 };
+        (((self.scale as f32) * (dpi as f32) / 100.0).round() as i32).clamp(20, 1200)
+    }
+
+    /// 有效缩放倍数（`eff_scale_pct / 100`）。内边距 / 间隙 / 阴影位移都用它。
+    pub fn eff_scale(&self) -> f32 {
+        self.eff_scale_pct() as f32 / 100.0
+    }
+
+    /// 版心内边距（px）。**唯一**定义：以前 `((24.0 * scale).round()).max(10)`
+    /// 在 8 处各写一遍，`frame.rs` 那处还漏了 `.max(10)` —— 于是 scale<42%
+    /// 时跑马灯带比版心宽 3px。收成一个方法之后，这类漂移没有发生的地方。
+    pub fn pad(&self) -> i32 {
+        ((24.0 * self.eff_scale()).round() as i32).max(10)
+    }
+
+    /// 跑马灯两条格言之间的间隙（px）。同样是单一出口 ——
+    /// 轮转判定（f32）与绘制间距（i32）以前各算一份，取整不同就会累积跳字。
+    pub fn marquee_gap(&self) -> i32 {
+        (130.0 * self.eff_scale()).round() as i32
     }
 
     /// 格言字距（px）：配置值是「相对值」，按整体字号缩放。
@@ -419,7 +488,22 @@ impl Config {
         if self.letter_spacing <= 0 {
             return 0;
         }
-        ((self.letter_spacing * self.scale) as f32 / 100.0).round() as i32
+        ((self.letter_spacing * self.eff_scale_pct()) as f32 / 100.0).round() as i32
+    }
+
+    /// 某种版式在**当前 DPI** 下对应的物理默认尺寸。
+    ///
+    /// `w/h` 是物理像素，而 `Orient::default_size()` 是 100% 下的逻辑尺寸。
+    /// 开 DPI 跟随却直接拿两者比较，150% 新装环境永远认不出「这是默认尺寸」，
+    /// 切版式时就会保留错误的长宽比。
+    pub fn default_size_px(&self, orient: Orient) -> (i32, i32) {
+        let (w, h) = orient.default_size();
+        let k = if self.dpi_auto {
+            self.dpi.clamp(48, 480) as f32 / 100.0
+        } else {
+            1.0
+        };
+        ((w as f32 * k).round() as i32, (h as f32 * k).round() as i32)
     }
 
     /// 切换版式，并按「只在默认尺寸上做手脚」的规矩调整窗口大小。
@@ -433,7 +517,7 @@ impl Config {
             return;
         }
         let old = self.orient;
-        let (odw, odh) = old.default_size();
+        let (odw, odh) = self.default_size_px(old);
         match old {
             Orient::Horizontal => {
                 self.h_w = self.w;
@@ -462,6 +546,7 @@ impl Config {
         };
         let mut kvs: Vec<(String, String)> = Vec::new();
         for line in text.lines() {
+
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
@@ -480,6 +565,9 @@ impl Config {
         for (k, v) in kvs.iter().filter(|(k, _)| k != "orient") {
             apply_kv(&mut cfg, k, v);
         }
+        // 旧配置没有 `dpi`，此时 `w/h` 已经是当前屏幕的物理值；
+        // 标记为「未知」，由启动阶段按当前 DPI 接管一次且**不再缩放**。
+        cfg.dpi_known = kvs.iter().any(|(k, _)| k == "dpi");
         cfg
     }
 
@@ -490,6 +578,7 @@ impl Config {
              # opacity 30-255；scale/clock_scale/quote_scale 为字号百分比；speed 为跑马灯速度(px/s)\n\
              # color / date_color 支持 #RRGGBB 或 RRGGBB；font 为字体名\n\
              # clock_dx / clock_dy 是时间日期块相对默认位置的像素偏移（布局模式下拖动即可）\n\
+             # dpi_auto 为 true 时字号跟随所在显示器 DPI（窗口尺寸同比缩放）\n\
              x={}\n\
              y={}\n\
              w={}\n\
@@ -502,6 +591,8 @@ impl Config {
              show_date={}\n\
              show_quote={}\n\
              seconds={}\n\
+             paused={}\n\
+             fav_only={}\n\
              shadow={}\n\
              speed={}\n\
              scale={}\n\
@@ -520,6 +611,8 @@ impl Config {
              letter_spacing={}\n\
              quote_color={}\n\
              shrink_fit={}\n\
+             dpi_auto={}\n\
+             dpi={}\n\
              h_w={}\n\
              h_h={}\n\
              v_w={}\n\
@@ -536,6 +629,8 @@ impl Config {
             self.show_date,
             self.show_quote,
             self.seconds,
+            self.paused,
+            self.fav_only,
             self.shadow,
             self.speed,
             self.scale,
@@ -559,15 +654,51 @@ impl Config {
                 fmt_color(self.quote_color)
             },
             self.shrink_fit,
+            self.dpi_auto,
+            self.dpi,
             self.h_w,
             self.h_h,
             self.v_w,
             self.v_h,
         );
-        let _ = std::fs::write(Self::path(), text);
+        match write_atomic(&Self::path(), text.as_bytes()) {
+            Ok(()) => LAST_SAVE_ERR.store(0, Ordering::Relaxed),
+            Err(e) => LAST_SAVE_ERR.store(
+                e.raw_os_error().map(|c| c as u32).unwrap_or(u32::MAX),
+                Ordering::Relaxed,
+            ),
+        }
     }
 }
 
+/// 先写同级临时文件、再改名覆盖。
+///
+/// 直接 `fs::write` 到 `config.ini` 的失败模式是**写一半就没了**：磁盘满、
+/// 杀进程、断电都会留下一个截断的文件，下次启动解析失败 → 位置 / 字体 /
+/// DPI / 收藏夹开关全部回默认。用户看到的不是「这次没保存」，而是
+/// 「配置全丢了」。
+///
+/// 改名在 NTFS 同卷上是原子的，最坏情况退化成「这一笔没写进去」。
+/// `sync_all` 不能省：不然内容还在系统缓存里就已经改名成功，断电后
+/// 得到的是一个长度为 0 的正式文件。
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let tmp = path.with_extension("ini.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 改名失败时别把 tmp 留下：下次再失败会一直堆着
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
 fn parse_bool(v: &str, def: bool) -> bool {
     match v.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => true,
@@ -599,6 +730,8 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
         "show_date" => cfg.show_date = parse_bool(v, cfg.show_date),
         "show_quote" => cfg.show_quote = parse_bool(v, cfg.show_quote),
         "seconds" => cfg.seconds = parse_bool(v, cfg.seconds),
+        "paused" => cfg.paused = parse_bool(v, cfg.paused),
+        "fav_only" => cfg.fav_only = parse_bool(v, cfg.fav_only),
         "shadow" => cfg.shadow = parse_bool(v, cfg.shadow),
         "speed" => cfg.speed = v.parse().unwrap_or(cfg.speed).clamp(10, 400),
         "scale" => cfg.scale = v.parse().unwrap_or(cfg.scale).clamp(30, 600),
@@ -638,10 +771,16 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
             }
         }
         "shrink_fit" => cfg.shrink_fit = parse_bool(v, cfg.shrink_fit),
-        "h_w" => cfg.h_w = v.parse().unwrap_or(cfg.h_w),
-        "h_h" => cfg.h_h = v.parse().unwrap_or(cfg.h_h),
-        "v_w" => cfg.v_w = v.parse().unwrap_or(cfg.v_w),
-        "v_h" => cfg.v_h = v.parse().unwrap_or(cfg.v_h),
+        "dpi_auto" => cfg.dpi_auto = parse_bool(v, cfg.dpi_auto),
+        // `dpi` 与 `w/h` 是**一对**：窗口尺寸是物理像素，必须记录当时 DPI。
+        "dpi" => {
+            cfg.dpi = v.parse().unwrap_or(cfg.dpi).clamp(48, 480);
+            cfg.dpi_known = true;
+        }
+        "h_w" => cfg.h_w = v.parse().unwrap_or(cfg.h_w).clamp(240, 4000),
+        "h_h" => cfg.h_h = v.parse().unwrap_or(cfg.h_h).clamp(80, 2000),
+        "v_w" => cfg.v_w = v.parse().unwrap_or(cfg.v_w).clamp(240, 4000),
+        "v_h" => cfg.v_h = v.parse().unwrap_or(cfg.v_h).clamp(80, 2000),
         _ => {}
     }
 }

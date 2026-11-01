@@ -79,16 +79,18 @@ pub fn decide(current: Option<&str>, prev: Option<&str>, exe: &str, want: bool) 
         } else {
             Action::Write
         }
-    } else if current.is_some() {
+    } else if cur_is_mine {
         if prev.is_some() {
             Action::DeleteAndRestore
         } else {
             Action::Delete
         }
-    } else if prev.is_some() {
+    } else if current.is_none() && prev.is_some() {
         // 我们的值没了但备份还在（异常状态）：把别人的东西还回去
         Action::DeleteAndRestore
     } else {
+        // 当前值属于别的程序 / 别的安装位置：关闭自启只能关「我们的」，
+        // 不能借机把别人的启动项删掉或替换。
         Action::Noop
     }
 }
@@ -178,26 +180,37 @@ fn delete_value(name: &str) -> bool {
 
 /// 本进程 exe 的完整路径。启动项必须写绝对路径（Run 键的工作目录是未定义的）。
 pub fn exe_path() -> String {
-    let mut buf = vec![0u16; 260];
-    // 截断时 windows 会返回写入长度并补 NUL；路径超长时退化为「空」而不 panic
-    let n = unsafe {
-        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
-            null_mut(),
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-        )
-    };
-    if n == 0 || n as usize >= buf.len() {
-        return String::new();
+    // `MAX_PATH` 长度不足时按文档语义扩容重试；不能把长路径直接判成空。
+    for cap in [260usize, 1024, 32768] {
+        let mut buf = vec![0u16; cap];
+        let n = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+                null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        };
+        if n == 0 {
+            return String::new();
+        }
+        if (n as usize) < cap {
+            buf.truncate(n as usize);
+            return String::from_utf16_lossy(&buf);
+        }
     }
-    buf.truncate(n as usize);
-    String::from_utf16_lossy(&buf)
+    String::new()
+}
+
+/// 写进 Run 键的命令行。始终加引号：路径含空格时裸路径会被系统拆成
+/// 「程序 + 参数」，表现为开机时静默不启动。
+fn quoted_cmd(exe: &str) -> String {
+    format!("\"{}\"", exe.trim_matches('"'))
 }
 
 /// 当前是否处于「已启用且指向本 exe」状态。
 pub fn enabled() -> bool {
     let exe = exe_path();
-    !exe.is_empty() && read_value(VALUE).as_deref() == Some(exe.as_str())
+    !exe.is_empty() && read_value(VALUE).as_deref().map(norm).as_deref() == Some(norm(&exe).as_str())
 }
 
 /// 启动项存在但**不指向当前 exe**（exe 被挪窝 / 用户自己改过）。
@@ -228,17 +241,29 @@ pub fn apply(on: bool) -> bool {
     let prev = read_value(VALUE_PREV);
     let ok = match decide(current.as_deref(), prev.as_deref(), &exe, on) {
         Action::Noop => true,
-        Action::Write => write_value(VALUE, &exe),
+        Action::Write => write_value(VALUE, &quoted_cmd(&exe)),
         Action::BackupAndWrite => {
+            // 已有备份时**绝不覆盖**：那是用户原本的启动项，覆盖一次就永久丢失。
+            // 宁可本次开启失败并留下错误码，也不做不可逆的破坏。
+            if prev.is_some() {
+                LAST_ERR.store(ERROR_ALREADY_EXISTS, Ordering::Relaxed);
+                return false;
+            }
             // 备份失败就不写：宁可保持原状，也不能把别人的启动项弄丢
             let cur = current.clone().unwrap_or_default();
             if !write_value(VALUE_PREV, &cur) {
                 return false;
             }
-            write_value(VALUE, &exe)
+            write_value(VALUE, &quoted_cmd(&exe))
         }
         Action::Delete => delete_value(VALUE),
         Action::DeleteAndRestore => {
+            // 只有当前值仍是我们写入的（或已经不存在）才恢复备份，
+            // 避免把用户在这期间手工设置的新值覆盖掉。
+            let still_mine = current.as_deref().map(norm).as_deref() == Some(norm(&exe).as_str());
+            if current.is_some() && !still_mine {
+                return false;
+            }
             let restored = prev.as_deref().map(|p| write_value(VALUE, p)).unwrap_or(false);
             delete_value(VALUE_PREV) && (restored || prev.is_none())
         }
@@ -247,9 +272,10 @@ pub fn apply(on: bool) -> bool {
         return false;
     }
     LAST_ERR.store(0, Ordering::Relaxed);
-    // 读回验证：最终状态必须正好是「想要的状态」
+    // 读回验证：最终状态必须正好是「想要的状态」。
+    // 路径比较统一走 `norm`（去引号、忽略大小写），与菜单勾选态同源。
     let now = read_value(VALUE);
-    let now_is_mine = now.as_deref() == Some(exe.as_str());
+    let now_is_mine = now.as_deref().map(norm).as_deref() == Some(norm(&exe).as_str());
     on == now_is_mine && (on || read_value(VALUE_PREV).is_none())
 }
 

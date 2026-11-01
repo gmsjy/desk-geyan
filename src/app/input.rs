@@ -17,7 +17,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, 
 use crate::{autostart, clipboard, favorites};
 use crate::config::{self, Anim, Config, Mode, Orient};
 use crate::config_ui;
-use crate::quotes::{self};
 use crate::consts::*;
 use crate::util::*;
 
@@ -61,6 +60,8 @@ pub(crate) const HK_FAV: i32 = 118;
 /// 打开 / 置前设置面板（选字体等）
 const HK_CONFIG: i32 = 119;
 
+const HK_PAUSE: i32 = 120;
+
 // ---------------------------------------------------------------- 热键
 
 /// 全部全局热键：`(id, 虚拟键)`，统一 `Ctrl+Alt+<键>`。
@@ -68,7 +69,7 @@ const HK_CONFIG: i32 = 119;
 /// 抽成模块级常量是为了让「注册」和「`--probe` 的期望值」**同源**：
 /// 曾经期望值是文案里写死的 `17`，加了收藏热键之后它变成了
 /// 「18/17 注册成功」—— 一个自己打自己脸的输出。
-const HOTKEY_TABLE: [(i32, u32); 19] = [
+const HOTKEY_TABLE: [(i32, u32); 20] = [
     (HK_TOGGLE, VK_H),
     (HK_ANIM, VK_M),
     (HK_MODE, VK_T),
@@ -87,6 +88,7 @@ const HOTKEY_TABLE: [(i32, u32); 19] = [
         (HK_COLOR, VK_K),
         (HK_FAV, VK_F),
         (HK_CONFIG, VK_O),
+        (HK_PAUSE, VK_SPACE),
         (HK_QUIT, VK_X),
     ];
 
@@ -126,6 +128,7 @@ fn on_hotkey(a: &mut App, id: i32) {
             }
             a.cfg.anim = next;
             a.phase = 0.0;
+            a.pulse = 0.0;
             a.m = 0.0;
             // 切动效时把在飞的过渡落定：否则从静态切走的那一下
             // 会接着上个模式的半个动画放
@@ -155,8 +158,12 @@ fn on_hotkey(a: &mut App, id: i32) {
                 (a.qi + n - 1) % n
             };
             a.qn = (a.qi + 1) % n;
-            a.m = 0.0;
+            // 跑马灯已初始化时必须直接落到带左缘。只把 `m` 置 0 的话，
+            // 绘制位置是 `band_r - m`（带右缘之外），新句第一帧是空白，
+            // 与「0 帧直切」相反。
+            a.m = if a.primed { marquee_band_w(&a.cfg) } else { 0.0 };
             a.phase = 0.0;
+            a.pulse = 0.0;
             // 手动换句是 **0 帧直切**：用户主动操作要即时响应，不等动画。
             // 在飞的过渡直接落定，不会留下半段影子。
             a.trans.settle();
@@ -169,16 +176,11 @@ fn on_hotkey(a: &mut App, id: i32) {
             a.cfg.save();
         }
         HK_QUOTES => {
-            a.list = quotes::library();
-            if a.qi >= a.list.len() {
-                a.qi = 0;
-            }
-            a.qn = (a.qi + 1) % a.list.len();
-            a.m = 0.0;
-            a.cur_w = measure_quote(a, &a.list[a.qi]);
+            a.reload_library();
             render_and_present(a);
         }
         HK_FAV => favorite(a),
+        HK_PAUSE => on_menu(a, MI_PAUSE),
         HK_CLOCK => on_menu(a, MI_CLOCK),
         HK_DATE => on_menu(a, MI_DATE),
         HK_SIZE_UP => on_menu(a, MI_SCALE_UP),
@@ -188,6 +190,8 @@ fn on_hotkey(a: &mut App, id: i32) {
         HK_QUIT => quit(a),
         _ => {}
     }
+    // 热键绕过了设置面板。统一在这里把面板拉回真实状态；窗口没开时是空调用。
+    config_ui::resync(a);
 }
 
 fn bump_opacity(a: &mut App, delta: i32) {
@@ -302,7 +306,7 @@ fn favorite(a: &mut App) {
 /// `--favtest` 指向临时目录；运行时才用真实目录。
 fn favorite_at(a: &mut App, dir: &std::path::Path) {
     if a.list.is_empty() {
-        // 空库不该发生（内置 317 条兜底），但 `list` 是运行时状态，
+        // 空库不该发生（内置 455 条兜底），但 `list` 是运行时状态，
         // 别在这里panic —— 静默返回比崩掉强。
         return;
     }
@@ -311,30 +315,29 @@ fn favorite_at(a: &mut App, dir: &std::path::Path) {
     // ① 复制。窗口句柄传底板：托盘气泡的回调也挂在它上面，同一扇门。
     let copied = clipboard::copy_text(a.panel, &q.display());
 
-    // ② 加入收藏夹（幂等：已在夹里就不重复写）
-    let added = favorites::append(dir, &q).unwrap_or(false);
+    // ② 加入收藏夹（幂等：已在夹里就不重复写）。`append` 能区分
+    // 新增 / 重复 / I/O 错误，上层不能把三者合并成 false。
+    let appended = favorites::append(dir, &q);
 
     // ③ 真的加了 → 重载列表，让这句**立刻**进入轮播候选。
     // 关键：`qi` 必须仍指向同一条句子。直接 `a.qi = a.qi.min(len-1)`
     // 是不够的 —— 追加发生在列表尾部，索引虽然不越界，但 round-robin
     // 交织后位置全变，qi 会 silently 指向另一句，用户就觉得「画面自己跳了」。
-    if added {
-        let cur = q.display();
-        a.list = quotes::library();
-        a.qi = keep_index(&cur, &a.list, a.qi);
-        a.qn = (a.qi + 1) % a.list.len();
-        // **不碰** m / phase / alpha / cur_w：这句还在显示，位置和宽度都没变，
+    if matches!(appended, Ok(true)) {
+        a.reload_library();
+        // **不碰** m / phase / cur_w：这句还在显示，位置和宽度都没变，
         // 重置滚动相位会让画面无谓地跳一下。收藏对当前画面必须无感。
     }
 
-    // ④ 反馈
-    let msg = match (added, copied) {
-        (true, true) => "已收藏，并复制到剪贴板",
-        (true, false) => "已收藏（剪贴板被占用，复制失败）",
-        (false, true) => "这句已在收藏夹里（已复制）",
-        (false, false) => "这句已在收藏夹里（剪贴板被占用）",
+    // ④ 反馈：写盘失败必须说失败，不能伪装成「已在收藏夹」。
+    let msg = match (&appended, copied) {
+        (Ok(true), true) => "已收藏，并复制到剪贴板".to_string(),
+        (Ok(true), false) => "已收藏（剪贴板被占用，复制失败）".to_string(),
+        (Ok(false), true) => "这句已在收藏夹里（已复制）".to_string(),
+        (Ok(false), false) => "这句已在收藏夹里（剪贴板被占用）".to_string(),
+        (Err(e), _) => format!("收藏失败：{e}"),
     };
-    toast(a, msg);
+    toast(a, &msg);
 }
 
 fn menu_add(menu: *mut c_void, id: u32, text: &str, checked: bool, enabled: bool) {
@@ -375,12 +378,41 @@ fn show_menu(a: &mut App) {
         sep(menu);
         menu_add(menu, MI_PREV, "上一条格言  (Ctrl+Alt+←)", false, true);
         menu_add(menu, MI_NEXT, "下一条格言  (Ctrl+Alt+→)", false, true);
+        menu_add(
+            menu,
+            MI_PAUSE,
+            "暂停轮播（固定当前句）  (Ctrl+Alt+空格)",
+            a.cfg.paused,
+            true,
+        );
+        menu_add(menu, MI_FAV_ONLY, "仅播放收藏夹", a.cfg.fav_only, true);
         // 收藏：挨着「上/下一条」放 —— 三条都是针对**当前这句**的操作，
         // 用户找的时候在同一处。
         menu_add(menu, MI_FAV, "收藏当前句子  (Ctrl+Alt+F)", false, true);
         sep(menu);
         menu_add(menu, MI_RELOAD, "重新载入格言 / 配置  (Ctrl+Alt+R)", false, true);
         menu_add(menu, MI_RESET, "挂件回到右上角", false, true);
+        menu_add(menu, MI_BACKUP, "备份配置与收藏…", false, true);
+        menu_add(menu, MI_DIAG, "导出诊断报告…", false, true);
+        // 分辨率适配两项：换显示器 / 改缩放比例之后，用户需要的是
+        // 「一键把整套比例按当前屏重落一遍」，而不是自己去猜字号。
+        menu_add(
+            menu,
+            MI_FIT,
+            "适应当前屏幕（缩进工作区 · 字号同比）",
+            false,
+            true,
+        );
+        let dpi_label = if a.cfg.dpi_auto {
+            let pct = a.cfg.eff_scale_pct();
+            format!(
+                "跟随屏幕 DPI 缩放  ·  当前 {}%（字号 {}%）",
+                a.cfg.dpi, pct
+            )
+        } else {
+            "跟随屏幕 DPI 缩放（关）".to_string()
+        };
+        menu_add(menu, MI_DPI, &dpi_label, a.cfg.dpi_auto, true);
         menu_add(menu, MI_CLOCK_RESET, "重置时间日期位置", false, a.clock_visible());
         sep(menu);
         menu_add(menu, MI_QUIT, "退出", false, true);
@@ -596,15 +628,42 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
         MI_PREV => on_hotkey(a, HK_PREV),
         MI_NEXT => on_hotkey(a, HK_NEXT),
         MI_FAV => favorite(a),
+        MI_PAUSE => {
+            a.cfg.paused = !a.cfg.paused;
+            // 暂停必须落在稳定画面上：把在飞的过渡收掉，避免停在半透明/半位移。
+            if a.cfg.paused {
+                a.trans.settle();
+            } else {
+                a.phase = 0.0;
+                a.pulse = 0.0;
+                if a.primed {
+                    a.m = marquee_band_w(&a.cfg);
+                }
+            }
+            a.cfg.save();
+            render_and_present(a);
+        }
+        MI_FAV_ONLY => {
+            a.cfg.fav_only = !a.cfg.fav_only;
+            a.reload_library();
+            a.cfg.save();
+            render_and_present(a);
+        }
+        MI_BACKUP => match crate::backup::backup(&crate::util::data_dir()) {
+            Ok(p) => toast(a, &format!("已备份到 {}", p.display())),
+            Err(e) => toast(a, &format!("备份失败：{e}")),
+        },
+        MI_DIAG => match export_diagnostics(a) {
+            Ok(p) => toast(a, &format!("诊断报告已写入 {}", p.display())),
+            Err(e) => toast(a, &format!("诊断报告写入失败：{e}")),
+        },
         MI_RELOAD => {
-            a.list = quotes::library();
             let old = a.cfg.clone();
             let new = Config::load();
             a.cfg = new;
             a.cfg.x = old.x;
             a.cfg.y = old.y;
-            a.qi = a.qi.min(a.list.len().saturating_sub(1));
-            a.qn = (a.qi + 1) % a.list.len();
+            a.reload_library();
             // 配置里的字号/字体/颜色可能都变了，无条件重建一次最省心
             a.rebuild_fonts();
             sync_from_panel(a);
@@ -622,10 +681,27 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
             apply_geometry(a, false, true);
             a.cfg.save();
         }
+        // 分辨率适配：把窗口 + 字号按当前屏重落一遍，再回到该屏右上角
+        MI_FIT => {
+            a.fit_to_screen();
+            apply_geometry(a, true, true);
+            render_and_present(a);
+            a.cfg.save();
+        }
+        // 跟随屏幕 DPI：开关两个方向都同比缩放窗口（见 `App::set_dpi_auto`）
+        MI_DPI => {
+            let on = !a.cfg.dpi_auto;
+            let dpi = window_dpi(a.text);
+            a.set_dpi_auto(on, dpi);
+            apply_geometry(a, true, true);
+            render_and_present(a);
+            a.cfg.save();
+        }
         MI_QUIT => quit(a),
         c if (MI_ANIM_BASE..MI_ANIM_BASE + 4).contains(&c) => {
             a.cfg.anim = Anim::all()[(c - MI_ANIM_BASE) as usize];
             a.phase = 0.0;
+            a.pulse = 0.0;
             a.m = 0.0;
             // 同 HK_ANIM：落定在飞的过渡再切
             a.trans.settle();
@@ -687,12 +763,6 @@ fn sync_from_panel(a: &mut App) {
     }
 }
 
-/// 同步几何并立刻出一帧（系统事件、热键这类「对用户是一次动作」的场合用）
-fn sync_from_panel_now(a: &mut App) {
-    sync_from_panel(a);
-    render_and_present(a);
-}
-
 // ---------------------------------------------------------------- 窗口过程
 
 /// 从 `WM_LBUTTONDOWN` / `WM_MOUSEMOVE` 的 lparam 取出坐标。
@@ -724,7 +794,7 @@ fn cursor_screen() -> (i32, i32) {
 
 /// 客户区坐标 → 边框命中码。不在边框带里就返回 `HTCLIENT`（= 中间，整体拖动）。
 pub(crate) fn edge_zone(a: &App, cx: i32, cy: i32) -> isize {
-    let m = (8i32 * a.cfg.scale / 100).max(6);
+    let m = (8.0 * a.cfg.eff_scale()).round().max(6.0) as i32;
     let (w, h) = (a.cfg.w, a.cfg.h);
     let left = cx < m;
     let right = cx >= w - m;
@@ -773,6 +843,10 @@ fn end_grab(a: &mut App) {
     // 窗口必须停在你松手的地方，不能还欠着最后那一格。
     apply_geometry(a, true, true);
     a.cfg.save();
+    // 缩放之后文字层的尺寸是**由帧缓冲决定的**（`present` 里 ULW 一起提交），
+    // 所以收尾这一帧必须无条件出：`dirty` 可能已经被前一条消息的那一帧清掉了，
+    // 而那一帧用的是旧尺寸。这里多花 700µs，换「松手后画面一定是对的」。
+    mark_dirty(a);
     render_if_due(a, true);
 }
 
@@ -820,8 +894,7 @@ pub(crate) fn normalize_clock_offset(a: &mut App) {
         return;
     }
 
-    let scale = a.cfg.scale as f32 / 100.0;
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = a.cfg.pad();
     let (w, h) = (a.cfg.w, a.cfg.h);
     let (x0, y0) = (pad, (h - cb.h) / 2);
     let max_x = (w - cb.w).max(0);
@@ -838,9 +911,21 @@ pub(crate) unsafe extern "system" fn panel_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let Some(a) = app_ready() else {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    };
+    // 重入（菜单 / ShowWindow / DestroyWindow 的同步回调）时已经有外层
+    // `&mut App`，这里必须返回默认处理，不能再造第二份可变引用。
+    match with_app(|a| panel_proc_inner(a, hwnd, msg, wparam, lparam)) {
+        Some(r) => r,
+        None => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn panel_proc_inner(
+    a: &mut App,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     MSG_TALLY[(msg & 0xFF) as usize].fetch_add(1, Ordering::Relaxed);
     if msg == WM_MOUSEMOVE {
         // 恒在最前面计数（在「是不是布局模式」的判断**之前**）：
@@ -1036,6 +1121,24 @@ pub(crate) unsafe extern "system" fn panel_proc(
                         }
                         h = MIN_H;
                     }
+                    // **上界 = 工作区**（P1-D）。只夹下界时用户能把挂件拖成
+                    // 2926px 宽（屏只有 2560），右侧永远在屏外，而且这个尺寸
+                    // 会被 `end_grab → save` 立刻写进配置。
+                    // 上界与 `clamp_to_work_area` 共用 `resize_limits`，
+                    // 拖的时候和重启之后是同一套标准。
+                    let (max_w, max_h) = resize_limits(&a.cfg);
+                    if w > max_w {
+                        if matches!(zone, HTLEFT | HTTOPLEFT | HTBOTTOMLEFT) {
+                            x += max_w - w;
+                        }
+                        w = max_w;
+                    }
+                    if h > max_h {
+                        if matches!(zone, HTTOP | HTTOPLEFT | HTTOPRIGHT) {
+                            y += max_h - h;
+                        }
+                        h = max_h;
+                    }
                     apply_resize(a, x, y, w, h);
                 }
                 Grab::None => {}
@@ -1080,9 +1183,33 @@ pub(crate) unsafe extern "system" fn panel_proc(
         }
 
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            // 分辨率 / 缩放变了：先按新 DPI 算字号与目标尺寸，再夹进新工作区，
+            // 最后**单向应用**到窗口。
+            //
+            // 这里绝不能调 `sync_from_panel`：它从窗口读回旧矩形并覆盖 cfg，
+            // 会把刚算好的 DPI 缩放和夹取结果原样撤销。`WM_MOVE/WM_SIZE` 的
+            // 回声在 grab==None 时本来就会做反向同步，不需要在这里补。
+            let dpi = window_dpi(a.text);
+            a.apply_dpi(dpi);
             clamp_to_work_area(&mut a.cfg);
-            sync_from_panel_now(a);
+            apply_geometry(a, true, true);
+            render_and_present(a);
             a.cfg.save();
+            0
+        }
+
+        // 拖到另一块 DPI 不同的屏：字号与窗口必须一起换挡，
+        // 否则不是字变小就是版式挤爆。`lparam` 里是系统建议的矩形，
+        // 这里不采纳 —— 我们的尺寸由自己的缩放规则决定，采納它等于
+        // 把用户调好的比例交给系统重排一次。
+        WM_DPICHANGED => {
+            // wParam 低字是 96 基准的原始 DPI（150% 屏 = 144），换成百分数再比。
+            let dpi = crate::ffi::dpi_pct((wparam & 0xFFFF) as i32);
+            if a.apply_dpi(dpi) {
+                apply_geometry(a, true, true);
+                render_and_present(a);
+                a.cfg.save();
+            }
             0
         }
 
@@ -1104,9 +1231,19 @@ pub(crate) unsafe extern "system" fn text_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let Some(a) = app_ready() else {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    };
+    match with_app(|a| text_proc_inner(a, hwnd, msg, wparam, lparam)) {
+        Some(r) => r,
+        None => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn text_proc_inner(
+    a: &mut App,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_MOUSEMOVE {
         // 文字层理论上永远收不到鼠标移动（layered + transparent）。
         // 收得到就说明穿透破了 —— `--clicktest` 把它当失败信号。

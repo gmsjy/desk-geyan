@@ -43,6 +43,8 @@
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 
+use crate::app::window_dpi;
+
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint,
@@ -60,12 +62,15 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnab
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
     GetCursorPos, GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadCursorW,
-    LoadIconW, MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW,
+    LoadIconW, MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
+    SetWindowTextW,
     ShowWindow, BM_CLICK, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
     BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, LBN_SELCHANGE, LB_ADDSTRING,
     LB_GETCURSEL, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_GETMINMAXINFO, WM_MEASUREITEM, WM_PAINT,
+    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+    WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_GETMINMAXINFO, WM_MEASUREITEM,
+    WM_PAINT,
     WM_SETFONT, WM_SETICON, WM_SIZE, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL, WNDCLASSW,
 };
@@ -73,9 +78,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::app::{
     on_menu, App, MI_ANIM_BASE, MI_AUTOHIDE, MI_AUTOSTART, MI_CLOCK, MI_CLOCK_DOWN, MI_CLOCK_RESET,
     MI_CLOCK_UP, MI_COLOR, MI_DATE, MI_DATE_COLOR, MI_FAV, MI_GLASS, MI_LAYOUT, MI_NEXT, MI_OP_DOWN,
-    MI_OP_UP, MI_ORIENT_BASE, MI_PREV, MI_QUOTE, MI_QUOTE_COLOR, MI_QUOTE_DOWN, MI_QUOTE_UP,
-    MI_RELOAD, MI_RESET, MI_SCALE_DOWN, MI_SCALE_UP, MI_SECONDS, MI_SHADOW, MI_SHRINK_FIT,
-    MI_SPACING_DOWN, MI_SPACING_UP, MI_SPEED_DOWN, MI_SPEED_UP, MI_TEXT, MI_TOGGLE, MI_TOPMOST,
+    MI_OP_UP, MI_ORIENT_BASE, MI_PAUSE, MI_FAV_ONLY, MI_PREV, MI_QUOTE, MI_QUOTE_COLOR,
+    MI_QUOTE_DOWN, MI_QUOTE_UP, MI_RELOAD, MI_RESET, MI_SCALE_DOWN, MI_SCALE_UP, MI_SECONDS,
+    MI_SHADOW, MI_SHRINK_FIT, MI_SPACING_DOWN, MI_SPACING_UP, MI_SPEED_DOWN, MI_SPEED_UP,
+    MI_TEXT, MI_TOGGLE, MI_TOPMOST,
 };
 use crate::config::{self, Anim, Mode, Orient, FONT_PRESETS};
 use crate::consts::*;
@@ -94,6 +100,17 @@ const ID_BTN_FONT_DEFAULT: i32 = 1002;
 /// 而「点击要干什么」由 `Ctl.cmd` 决定。
 const ID_SETTINGS_BASE: i32 = 2000;
 
+/// 下面这些尺寸**全部是逻辑像素**（96 dpi 基准）。
+///
+/// 面板是 per-monitor DPI aware 进程里的普通窗口：从 100% 屏拖到 150% 屏时，
+/// 系统**不会**替我们放大任何东西（不做 DPI 虚拟化），字号 / 行高 / 间距若还是
+/// 同一批物理像素，整个界面就会缩成一小块挤在左上角。
+///
+/// 所以换算只在两处发生，中间一律逻辑值：
+///   * 进来：客户区尺寸 ÷ `scale()`（见 `slots`）；
+///   * 出去：矩形 / 字号 × `scale()`（见 `ConfigUi::sp`）。
+///
+/// 这样「加一行设置」仍然只是往 `table()` 里加一行，不必去想 DPI。
 const PAD: i32 = 14;
 const GAP: i32 = 10;
 /// 左列宽度（字体列表 + 预览）
@@ -114,22 +131,30 @@ const COLOR_SWATCH_GAP: i32 = 4;
 const COLOR_BTN_W: i32 = 40;
 /// 设置区一行 = 6 格
 const UNITS: i32 = 6;
-/// 列表每行高度（物理像素）
+/// 列表每行高度（逻辑像素，96dpi 基准）
 const ITEM_H: i32 = 26;
 /// 列表里每个字体名用它自己的字号渲染
 const ITEM_PX: i32 = 18;
-/// 预览区字号（物理像素）
+/// 预览区字号（逻辑像素）
 const PREVIEW_PX: i32 = 26;
+/// 界面字体字号（逻辑像素）
+const UI_FONT_PX: i32 = 15;
 /// 预览区高度
 const PREVIEW_H: i32 = 120;
 const BTN_H: i32 = 28;
 const BTN_W_FONT_DEFAULT: i32 = 200;
 const CLIENT_W: i32 = 800;
-const CLIENT_H: i32 = 620;
-/// 窗口最小尺寸。比这个小，设置区就会被挤到放不下（数值行的 [+]
-/// 会被挤出行外）—— 与其让用户看到半截界面，不如不许缩到那么小。
+const CLIENT_H: i32 = 640;
+/// 窗口**最小客户区**尺寸：比这个小，设置区就会排不下（最后一行被切掉，
+/// 数值行的 `[+]` 也会被挤出行外）—— 与其让用户看到半截界面，不如不许缩到那么小。
+///
+/// 这两个数是客户区尺寸，`WM_GETMINMAXINFO` 里必须经 `AdjustWindowRectEx`
+/// 换成窗口尺寸再交出去，否则标题栏和边框等于从客户区里白扣。
+///
+/// **往 `table()` 里加行之后一定要跑 `--selftest`**：断言会报出
+/// 「需要 Npx / 常量 Mpx」，把这里顶上去。
 const MIN_TRACK_W: i32 = 780;
-const MIN_TRACK_H: i32 = 620;
+const MIN_TRACK_H: i32 = 640;
 
 /// 判「字体含不含汉字」用的样本字。挑的都是最常用的字：一个字体连「永」
 /// （CJK 覆盖率的事实标准测试字）都没有，挂件上的中文必然糊成豆腐。
@@ -253,6 +278,8 @@ fn table() -> Vec<W> {
         chk(MI_AUTOHIDE, "全屏时隐藏", 2),
         chk(MI_AUTOSTART, "开机自启", 2),
         chk(MI_LAYOUT, "布局模式（可拖动 / 缩放）", 3),
+        chk(MI_PAUSE, "暂停轮播", 2),
+        chk(MI_FAV_ONLY, "仅播放收藏夹", 3),
         chk(MI_SHRINK_FIT, "放不下时缩小字号", 3),
         rad(MI_GLASS, "毛玻璃", 2),
         rad(MI_TEXT, "纯文字", 2),
@@ -342,6 +369,9 @@ pub struct ConfigUi {
     btn_font_default: HWND,
     /// 「字体：仅列含中文的字体，共 N 个」—— 数量要等枚举完才填，所以留个句柄
     lbl_font_title: HWND,
+    /// 「预览：」标签。它也必须留句柄：DPI 变了要重发 `WM_SETFONT`，
+    /// 拿不到句柄的那一个会一直用旧字号的字体（看起来像「就它没放大」）。
+    lbl_preview: HWND,
     /// 设置区的控件，按 `slots()` 的顺序（与 `table()` 一一对应）
     ctls: Vec<Ctl>,
     /// 列表里的字体名（去重 + 排序 + 只含中文字体）。行序即插入序。
@@ -361,6 +391,9 @@ pub struct ConfigUi {
     /// 预览区矩形（客户端坐标）。布局时算出来，绘制时直接用 ——
     /// 两处各算一遍迟早会走偏。
     preview_rc: RECT,
+    /// 面板当前所在屏的 DPI **百分比**（96 dpi = 100）。所有布局常量按 96 基准写，
+    /// `sp()` 是唯一的换算出口。
+    dpi: u32,
 }
 
 impl Default for ConfigUi {
@@ -370,6 +403,7 @@ impl Default for ConfigUi {
             list: null_mut(),
             btn_font_default: null_mut(),
             lbl_font_title: null_mut(),
+            lbl_preview: null_mut(),
             ctls: Vec::new(),
             items: Vec::new(),
             item_fonts: Vec::new(),
@@ -380,6 +414,7 @@ impl Default for ConfigUi {
             bg_brush: null_mut(),
             frame_brush: null_mut(),
             preview_rc: unsafe { zeroed() },
+            dpi: 100,
         }
     }
 }
@@ -398,6 +433,21 @@ impl ConfigUi {
     /// 按 id 找回一个控件（`WM_COMMAND` 只给 id，不给指针）
     fn by_id(&self, id: i32) -> Option<&Ctl> {
         self.ctls.iter().find(|c| c.id == id)
+    }
+
+    /// 当前缩放倍率（96 dpi 基准 = 1.0）。
+    ///
+    /// 夹在 48%~480%：`WM_DPICHANGED` 的 `wParam` 是系统给的值，正常情况下
+    /// 落在 96~480 之间，但**不能假设**（远程桌面 / 虚拟机里见过 0）。
+    /// 倍率一旦是 0，所有尺寸都变 0，控件会集体消失 —— 那不是「显示不对」，
+    /// 是「窗口一片空白且无从下手」。夹取是这里唯一的防线。
+    fn scale(&self) -> f32 {
+        (self.dpi.clamp(48, 480) as f32) / 100.0
+    }
+
+    /// 逻辑像素 → 物理像素。**所有**布局常量与自建字号都从这里过一遍。
+    fn sp(&self, v: i32) -> i32 {
+        (v as f32 * self.scale()).round() as i32
     }
 
     /// 释放所有 GDI 资源。**新增句柄必须加进来** —— 漏一个就是一次真实泄漏，
@@ -430,6 +480,7 @@ impl ConfigUi {
         self.list = null_mut();
         self.btn_font_default = null_mut();
         self.lbl_font_title = null_mut();
+        self.lbl_preview = null_mut();
         self.ctls.clear();
         self.items.clear();
     }
@@ -440,7 +491,60 @@ impl ConfigUi {
                 DeleteObject(self.preview_font as HGDIOBJ);
             }
         }
-        self.preview_font = gfx::make_font(PREVIEW_PX, FW_NORMAL, &wide(face));
+        self.preview_font = gfx::make_font(self.sp(PREVIEW_PX), FW_NORMAL, &wide(face));
+    }
+
+    /// 按**当前 DPI** 重建所有自建字体：界面 / 粗体 / 列表每行 / 预览。
+    ///
+    /// 只有 `WM_DPICHANGED` 会用到 —— 平时字号只随字体选择变（`rebuild_preview_font`）。
+    /// 重建之后**必须**再走一次 `retag_fonts`：子控件的字体是 `WM_SETFONT` 设进去的
+    /// 一次性值，不会自己跟着句柄走；旧句柄这时已经 `DeleteObject` 了，
+    /// 控件还拿着它就是一个悬垂 GDI 对象，画出来是随机的。
+    fn rebuild_scaled_fonts(&mut self, face: &str) {
+        unsafe {
+            for h in [self.ui_font, self.bold_font, self.preview_font] {
+                if !h.is_null() {
+                    DeleteObject(h as HGDIOBJ);
+                }
+            }
+            for h in self.item_fonts.drain(..) {
+                if !h.is_null() {
+                    DeleteObject(h as HGDIOBJ);
+                }
+            }
+        }
+        let ui_px = self.sp(UI_FONT_PX);
+        let item_px = self.sp(ITEM_PX);
+        let yahei = wide("Microsoft YaHei UI");
+        self.ui_font = gfx::make_font(ui_px, FW_NORMAL, &yahei);
+        self.bold_font = gfx::make_font(ui_px, FW_BOLD, &yahei);
+        self.preview_font = gfx::make_font(self.sp(PREVIEW_PX), FW_NORMAL, &wide(face));
+        self.item_fonts = self
+            .items
+            .iter()
+            .map(|f| gfx::make_font(item_px, FW_NORMAL, &wide(f)))
+            .collect();
+    }
+
+    /// 把当前界面字体重新发给每个子控件（DPI 变了才需要）。
+    ///
+    /// 列表的行高也在这里一起换挡：`LB_SETITEMHEIGHT` 是**物理像素**，
+    /// 不跟着放大就会出现「字号 30px、行高 26px」——每行字都压住下一行。
+    unsafe fn retag_fonts(&self) {
+        let ui = self.ui_font;
+        for h in [self.lbl_font_title, self.lbl_preview, self.list, self.btn_font_default] {
+            if !h.is_null() {
+                SendMessageW(h, WM_SETFONT, ui as WPARAM, 1);
+            }
+        }
+        for c in &self.ctls {
+            if !c.hwnd.is_null() {
+                SendMessageW(c.hwnd, WM_SETFONT, ui as WPARAM, 1);
+            }
+        }
+        if !self.list.is_null() {
+            SendMessageW(self.list, LB_SETITEMHEIGHT, 0, self.sp(ITEM_H) as LPARAM);
+        }
     }
 
     /// 列表里某一行的字体。下标越界时回 null（绘制里再退到界面字体）。
@@ -562,6 +666,8 @@ fn read_bool(a: &App, cmd: u32) -> bool {
         MI_TOPMOST => c.always_on_top,
         MI_AUTOHIDE => c.auto_hide_fs,
         MI_LAYOUT => c.layout_mode,
+        MI_PAUSE => c.paused,
+        MI_FAV_ONLY => c.fav_only,
         MI_SHRINK_FIT => c.shrink_fit,
         MI_AUTOSTART => crate::autostart::enabled(),
         _ => false,
@@ -652,7 +758,13 @@ fn ctl_enabled(a: &App, c: &Ctl) -> bool {
 /// `_ch` 现在不参与计算：行高是固定的，最小窗口高度（`MIN_TRACK_H`）已经保证
 /// 整张表放得下。留这个参数是为了让签名和 `layout_children` 一致，读代码时不必
 /// 怀疑「高度是不是在别处被用了」。
-fn slots(cw: i32, _ch: i32) -> Vec<Slot> {
+fn slots(cw: i32, _ch: i32, k: f32) -> Vec<Slot> {
+    // 进来先把物理客户区换成**逻辑**尺寸：下面的算式全是 96 dpi 基准的常量。
+    let cw = if k > 0.0 {
+        (cw as f32 / k).round() as i32
+    } else {
+        cw
+    };
     let rx = PAD + LIST_W + GAP;
     let rw = (cw - rx - PAD).max(UNITS * 40);
     let unit = (rw / UNITS).max(40);
@@ -743,13 +855,28 @@ fn slots(cw: i32, _ch: i32) -> Vec<Slot> {
         }
         col += w.span;
     }
+    // 出去时统一乘回物理像素。**这是唯一的缩放出口** —— 中间那几十处
+    // `x0 + NUM_LABEL_W` 之类的加法全在逻辑坐标系里做，于是不管倍率是多少，
+    // 「标签 74 逻辑 + 按钮 26 逻辑」都不会互相压住（只缩终点不缩分段的写法
+    // 会在 200% 屏上让字挤出自己的格子）。
+    if k != 1.0 && k > 0.0 {
+        for s in &mut out {
+            s.rc = RECT {
+                left: (s.rc.left as f32 * k).round() as i32,
+                top: (s.rc.top as f32 * k).round() as i32,
+                right: (s.rc.right as f32 * k).round() as i32,
+                bottom: (s.rc.bottom as f32 * k).round() as i32,
+            };
+        }
+    }
     out
 }
 
 /// 左列 + 设置区一起摆。窗口可缩放，所以每一处都从**当前**客户区算，不缓存尺寸。
 unsafe fn layout_children(c: &mut ConfigUi, cw: i32, ch: i32) {
+    let k = c.scale();
     // ---- 设置区：表格决定，重新算一遍坐标（控件已在 WM_CREATE 建好）
-    for (i, s) in slots(cw, ch).into_iter().enumerate() {
+    for (i, s) in slots(cw, ch, k).into_iter().enumerate() {
         let Some(ctl) = c.ctls.get_mut(i) else { break };
         ctl.rc = s.rc;
         if ctl.hwnd.is_null() {
@@ -766,20 +893,65 @@ unsafe fn layout_children(c: &mut ConfigUi, cw: i32, ch: i32) {
     }
 
     // ---- 左列：标题 → 字体列表 → [恢复默认字体] → 预览
-    let preview_bottom = ch - PAD;
-    let preview_top = preview_bottom - PREVIEW_H;
-    let lbl_preview_y = preview_top - 20 - 4;
-    let btn_y = lbl_preview_y - 8 - BTN_H;
-    let list_top = PAD + 20 + 6;
-    let list_h = (btn_y - 8 - list_top).max(80);
+    // 全部走 `sp()`：这里是物理像素，不换算的话 150% 屏上列表只有半列宽。
+    let preview_bottom = ch - c.sp(PAD);
+    let preview_top = preview_bottom - c.sp(PREVIEW_H);
+    let lbl_preview_y = preview_top - c.sp(20) - c.sp(4);
+    let btn_y = lbl_preview_y - c.sp(8) - c.sp(BTN_H);
+    let list_top = c.sp(PAD) + c.sp(20) + c.sp(6);
+    let list_h = (btn_y - c.sp(8) - list_top).max(c.sp(80));
 
-    MoveWindow(c.list, PAD, list_top, LIST_W, list_h, 1);
-    MoveWindow(c.btn_font_default, PAD, btn_y, BTN_W_FONT_DEFAULT, BTN_H, 1);
+    // 两个 `STATIC` 标签也必须在这里摆：它们的初始矩形只是占位，
+    // 不跟着走的话「预览：」会一直停在窗口**顶部**（离预览框十万八千里），
+    // 而 150% 屏上还会因为矩形没放大被字撑爆、折成两行再被裁掉。
+    MoveWindow(c.lbl_font_title, c.sp(PAD), c.sp(PAD), c.sp(LIST_W), c.sp(20), 1);
+    MoveWindow(c.lbl_preview, c.sp(PAD), lbl_preview_y, c.sp(LIST_W), c.sp(20), 1);
+    MoveWindow(c.list, c.sp(PAD), list_top, c.sp(LIST_W), list_h, 1);
+    MoveWindow(c.btn_font_default, c.sp(PAD), btn_y, c.sp(BTN_W_FONT_DEFAULT), c.sp(BTN_H), 1);
 
-    c.preview_rc = RECT { left: PAD, top: preview_top, right: PAD + LIST_W, bottom: preview_bottom };
+    c.preview_rc = RECT {
+        left: c.sp(PAD),
+        top: preview_top,
+        right: c.sp(PAD + LIST_W),
+        bottom: preview_bottom,
+    };
 }
 
 // ---------------------------------------------------------------- 打开 / 关闭
+
+/// 百分数 DPI（100 = 96 dpi）→ `adjust_window_rect_for_dpi` 要的原始值。
+///
+/// 这两个单位在本 crate 里各有一套（`Config::dpi` 存百分数，系统 API 收 96 基准），
+/// `ffi::dpi_pct` 是「原始 → 百分数」，这里是反向。125% → 120、150% → 144，
+/// 常见档位都是整除，不会因为来回换算出偏差。
+fn raw_dpi(pct: u32) -> u32 {
+    ((pct as f32) * 0.96).round() as u32
+}
+
+/// 容纳 `lw × lh`（**逻辑**客户区）所需的**窗口**尺寸（物理像素）。
+///
+/// 标题栏和边框必须算进去，且要按**目标屏**的 DPI 算 —— 150% 屏的标题栏
+/// 比 96 基准高一半，拿 96 的结果建窗会让客户区整整矮一截（最后一行贴边）。
+unsafe fn window_size_for_client(lw: i32, lh: i32, k: f32, dpi_raw: u32) -> (i32, i32) {
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: (lw as f32 * k).round() as i32,
+        bottom: (lh as f32 * k).round() as i32,
+    };
+    if crate::ffi::adjust_window_rect_for_dpi(
+        &mut rc,
+        WS_OVERLAPPEDWINDOW,
+        WS_EX_APPWINDOW,
+        0,
+        dpi_raw,
+    )
+    .is_none()
+    {
+        AdjustWindowRectEx(&mut rc, WS_OVERLAPPEDWINDOW, 0, WS_EX_APPWINDOW);
+    }
+    (rc.right - rc.left, rc.bottom - rc.top)
+}
 
 /// 打开设置面板。已经开着就置前，不重复建。
 pub fn open(a: &mut App) {
@@ -807,11 +979,16 @@ pub fn open(a: &mut App) {
         wc.lpszClassName = cls.as_ptr();
         RegisterClassW(&wc);
 
-        // 窗口尺寸由客户区反推（含标题栏与边框）
+        // 窗口尺寸由客户区反推（含标题栏与边框）。
+        // 建窗前不知道窗口会落在哪块屏，先按**系统 DPI** 估一版；
+        // 建完 `create_children` 会读回**实际所在屏**的 DPI，若不同就在下面重算一次。
+        let dpi0 = crate::ffi::dpi_for_system()
+            .map(crate::ffi::dpi_pct)
+            .unwrap_or(100)
+            .clamp(48, 480) as u32;
+        let k0 = dpi0 as f32 / 100.0;
         let style = WS_OVERLAPPEDWINDOW;
-        let mut rc = RECT { left: 0, top: 0, right: CLIENT_W, bottom: CLIENT_H };
-        AdjustWindowRectEx(&mut rc, style, 0, WS_EX_APPWINDOW);
-        let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
+        let (ww, wh) = window_size_for_client(CLIENT_W, CLIENT_H, k0, raw_dpi(dpi0));
         let (x, y) = place_on_cursor_screen(ww, wh);
 
         let title = wide("desk-geyan 设置");
@@ -833,8 +1010,23 @@ pub fn open(a: &mut App) {
         if h.is_null() {
             return;
         }
-        // 子控件在 WM_CREATE 里建（`a.config.hwnd` 也在那里落定）——
-        // 这里刻意不再读写 `a`，免得踩「&mut 别名观测」那口井（见 README 踩坑第 4 条）。
+        // CreateWindowExW 的嵌套 WM_CREATE 在 `with_app` 闸门下会被交回
+        // DefWindowProc；因此子控件事后显式建一次。
+        create_children(a, h);
+        // 尺寸校正：估的那一版如果和实际所在屏不一致，按真实 DPI 重算并重新摆位。
+        // 这一步不能省 —— 系统只在**窗口跨越 DPI 边界**时发 `WM_DPICHANGED`，
+        // 「新建时就在 150% 屏上」不会触发它（窗口一开始就在那儿，没跨过任何边界）。
+        let k = a.config.scale();
+        if (k - k0).abs() > f32::EPSILON {
+            let (ww, wh) = window_size_for_client(CLIENT_W, CLIENT_H, k, raw_dpi(a.config.dpi));
+            let (x, y) = place_on_cursor_screen(ww, wh);
+            SetWindowPos(h, null_mut(), x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+            // 同上：`SetWindowPos` 带出的 WM_SIZE 也被闸门挡掉了，得显式重排一次。
+            let mut cli: RECT = zeroed();
+            if GetClientRect(h, &mut cli) != 0 {
+                layout_children(&mut a.config, cli.right, cli.bottom);
+            }
+        }
         let icon = LoadIconW(null_mut(), IDI_APPLICATION_RES);
         SendMessageW(h, WM_SETICON, 0, icon as LPARAM); // ICON_SMALL
         SendMessageW(h, WM_SETICON, 1, icon as LPARAM); // ICON_BIG
@@ -845,9 +1037,14 @@ pub fn open(a: &mut App) {
 
 /// 关掉设置面板（退出程序时用；用户点 X 也走同一条路）。
 pub fn close(a: &mut App) {
-    if a.config.is_open() {
-        unsafe { DestroyWindow(a.config.hwnd) };
+    let hwnd = a.config.hwnd;
+    if hwnd.is_null() {
+        return;
     }
+    // DestroyWindow 的嵌套 WM_DESTROY 同样会被闸门挡掉，所以资源在这里
+    // 显式释放；`free_resources` 会先清空句柄，销毁用保存下来的局部值。
+    a.config.free_resources();
+    unsafe { DestroyWindow(hwnd) };
 }
 
 /// 把窗口摆到「光标所在那块屏」的**底部居中**。
@@ -871,9 +1068,12 @@ fn place_on_cursor_screen(ww: i32, wh: i32) -> (i32, i32) {
                 bottom: GetSystemMetrics(SM_CYSCREEN).max(768),
             }
         };
-        let x = wa.left + ((wa.right - wa.left) - ww) / 2;
-        let y = (wa.bottom - wa.top - wh - 24).max(wa.top);
-        (x, wa.top + y)
+        // 全部用**绝对屏幕坐标**。旧实现先把 y 算成「相对工作区顶部」，
+        // 又加了一次 `wa.top`，顶部任务栏或副屏（top > 0）时面板会向下偏移。
+        let x = (wa.left + ((wa.right - wa.left) - ww) / 2)
+            .clamp(wa.left, (wa.right - ww).max(wa.left));
+        let y = (wa.bottom - wh - 24).max(wa.top);
+        (x, y)
     }
 }
 
@@ -918,11 +1118,15 @@ unsafe fn make_child(
 unsafe fn create_children(a: &mut App, hwnd: HWND) {
     a.config = ConfigUi::default(); // 上次关闭时清过；这里显式重来一遍更稳
     a.config.hwnd = hwnd;
+    // DPI 必须**先**定下来：字体、行高、每一格矩形都从它换挡。
+    // 窗口已经建出来了，`GetDpiForWindow` 拿到的是它**所在那块屏**的值 ——
+    // 比用系统 DPI 准（面板是摆到光标所在屏底部的，可能不是主屏）。
+    a.config.dpi = window_dpi(hwnd).clamp(48, 480) as u32;
 
     // 界面字体：控件里有大量中文（字体名本身可能就是中文），
     // 默认的「MS Sans Serif」位图字体在中文 + 高 DPI 下又糊又难认。
-    a.config.ui_font = gfx::make_font(15, FW_NORMAL, &wide("Microsoft YaHei UI"));
-    a.config.bold_font = gfx::make_font(15, FW_BOLD, &wide("Microsoft YaHei UI"));
+    // 四类字体（界面 / 粗体 / 列表每行 / 预览）一起按 DPI 建好。
+    a.config.rebuild_scaled_fonts("Microsoft YaHei UI");
     let ui = a.config.ui_font;
 
     // 系统色刷（跟随主题）
@@ -940,6 +1144,7 @@ unsafe fn create_children(a: &mut App, hwnd: HWND) {
     }
 
     // ---- 左列（字体列表 / 预览）
+    // 这里的矩形只是**占位**：建完控件立刻由 `layout_children` 按客户区重算一遍。
     let lc = RECT { left: PAD, top: PAD, right: PAD + LIST_W, bottom: PAD + 20 };
     // 数量要等字体枚举完才知道，先建出来占位，后面 `SetWindowTextW` 补上
     a.config.lbl_font_title = make_child(
@@ -953,7 +1158,9 @@ unsafe fn create_children(a: &mut App, hwnd: HWND) {
         ui,
     );
     let lp = RECT { left: PAD, top: PAD + 20, right: PAD + LIST_W, bottom: PAD + 40 };
-    make_child(hwnd, "STATIC", 0, "预览：", WS_CHILD | WS_VISIBLE, 0, &lp, ui);
+    // 句柄必须留：DPI 变了要重发 `WM_SETFONT`，丢了这个就它一个还是旧字号。
+    a.config.lbl_preview =
+        make_child(hwnd, "STATIC", 0, "预览：", WS_CHILD | WS_VISIBLE, 0, &lp, ui);
 
     let ll = RECT { left: PAD, top: PAD + 26, right: PAD + LIST_W, bottom: PAD + 300 };
     let list = make_child(
@@ -975,7 +1182,7 @@ unsafe fn create_children(a: &mut App, hwnd: HWND) {
     );
     a.config.list = list;
     // owner-draw 固定行高：0 表示「所有行同一高度」
-    SendMessageW(list, LB_SETITEMHEIGHT, 0, ITEM_H as LPARAM);
+    SendMessageW(list, LB_SETITEMHEIGHT, 0, a.config.sp(ITEM_H) as LPARAM);
 
     let lb = RECT { left: PAD, top: PAD, right: PAD + BTN_W_FONT_DEFAULT, bottom: PAD + BTN_H };
     a.config.btn_font_default = make_child(
@@ -990,7 +1197,8 @@ unsafe fn create_children(a: &mut App, hwnd: HWND) {
     );
 
     // ---- 设置区：表格说几行就几行，坐标由 `slots()` 算
-    for (i, s) in slots(cw, ch).iter().enumerate() {
+    let k = a.config.scale();
+    for (i, s) in slots(cw, ch, k).iter().enumerate() {
         let id = ID_SETTINGS_BASE + i as i32;
         let (class, style) = match s.role {
             Role::Check => ("BUTTON", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32),
@@ -1022,12 +1230,13 @@ unsafe fn create_children(a: &mut App, hwnd: HWND) {
 
     // ---- 灌字体列表
     a.config.items = enumerate_cjk_fonts();
+    let item_px = a.config.sp(ITEM_PX);
     for face in &a.config.items {
         let w = wide(face);
         SendMessageW(list, LB_ADDSTRING, 0, w.as_ptr() as LPARAM);
-        a.config.item_fonts.push(gfx::make_font(ITEM_PX, FW_NORMAL, &w));
+        a.config.item_fonts.push(gfx::make_font(item_px, FW_NORMAL, &w));
     }
-    SendMessageW(list, LB_SETITEMHEIGHT, 0, ITEM_H as LPARAM);
+    SendMessageW(list, LB_SETITEMHEIGHT, 0, a.config.sp(ITEM_H) as LPARAM);
     // 数量现在才准
     let title = wide(&format!("字体：仅列含中文的字体，共 {} 个", a.config.items.len()));
     SetWindowTextW(a.config.lbl_font_title, title.as_ptr());
@@ -1098,7 +1307,9 @@ unsafe fn on_setting_click(a: &mut App, id: i32) -> bool {
         Role::Radio => on_menu(a, c.cmd),
         Role::NumDown | Role::NumUp | Role::ColorNext | Role::Menu => on_menu(a, c.cmd),
         Role::Close => {
-            DestroyWindow(a.config.hwnd);
+            let hwnd = a.config.hwnd;
+            a.config.free_resources();
+            DestroyWindow(hwnd);
             return true;
         }
         _ => {}
@@ -1267,6 +1478,85 @@ pub fn ctl_count(a: &App) -> usize {
     a.config.ctls.len()
 }
 
+/// **仅供 `--clicktest` / `--probe`**：模拟「把面板拖到一块 DPI 不同的屏上」。
+///
+/// 真机上验这一步要两块 DPI 不同的显示器，自动化做不到；但 `WM_DPICHANGED`
+/// 的语义就是「系统告诉你新 DPI + 一个新窗口矩形」，所以可以自己发一条。
+/// 关键是**走真正的窗口过程**（`config_proc` → 重建字体 → 换挡布局），
+/// 而不是去调布局函数 —— 后者已经被单元级断言覆盖，这里要验的是接线。
+///
+/// 建议矩形按**实测边框**反推：`客户区 = CLIENT_W×k` 是系统真换屏时会给出的值
+/// （它按逻辑尺寸不变来算），但边框那几像素只有量了才知道 ——
+/// 这里并没有真的换屏，显示器还是原来那块，自己拿 96 dpi 去推边框会差 20 多 px，
+/// 于是「客户区本该 800 宽」变成 794，所有等比断言跟着一起假红。
+///
+/// 返回换挡后的客户区尺寸 `(w, h)`；窗口没开时返回 `None`。
+pub fn test_dpi_change(a: &mut App, pct: u32) -> Option<(i32, i32)> {
+    let hwnd = a.config.hwnd;
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut win: RECT = unsafe { zeroed() };
+    let mut cli: RECT = unsafe { zeroed() };
+    unsafe {
+        if GetWindowRect(hwnd, &mut win) == 0 || GetClientRect(hwnd, &mut cli) == 0 {
+            return None;
+        }
+    }
+    // 边框 / 标题栏占掉的物理像素：窗口尺寸减客户区尺寸
+    let fx = (win.right - win.left) - cli.right;
+    let fy = (win.bottom - win.top) - cli.bottom;
+    let k = pct.clamp(48, 480) as f32 / 100.0;
+    let ww = (CLIENT_W as f32 * k).round() as i32 + fx;
+    let wh = (CLIENT_H as f32 * k).round() as i32 + fy;
+    // 建议矩形保持左上角不动（挪位会看起来像面板自己漂移了）
+    let rc = RECT {
+        left: win.left,
+        top: win.top,
+        right: win.left + ww,
+        bottom: win.top + wh,
+    };
+    // wParam = MAKELONG(新DPI, 新DPI)，高字 / 低字都是 96 基准的原始值
+    let raw = raw_dpi(pct) as usize;
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_DPICHANGED,
+            raw | (raw << 16),
+            &rc as *const RECT as LPARAM,
+        );
+    }
+    test_client(a)
+}
+
+/// **仅供自检**：面板当前 DPI 百分比（100 = 96 dpi）。
+pub fn test_dpi(a: &App) -> u32 {
+    a.config.dpi
+}
+
+/// **仅供自检**：面板客户区尺寸。
+pub fn test_client(a: &App) -> Option<(i32, i32)> {
+    let hwnd = a.config.hwnd;
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut rc: RECT = unsafe { zeroed() };
+    if unsafe { GetClientRect(hwnd, &mut rc) } == 0 {
+        return None;
+    }
+    Some((rc.right, rc.bottom))
+}
+
+/// **仅供自检**：设置区每个控件当前的矩形（客户端坐标，物理像素）。
+pub fn test_ctl_rects(a: &App) -> Vec<RECT> {
+    a.config
+        .ctls
+        .iter()
+        .filter(|c| !c.hwnd.is_null())
+        .map(|c| c.rc)
+        .collect()
+}
+
 /// **仅供自检**：`cmd` 对应的那个单选项此刻是否被选中（读的是 `cfg`，不是控件）。
 pub fn radio_selected(a: &App, cmd: u32) -> bool {
     read_radio(a, cmd)
@@ -1318,15 +1608,44 @@ pub fn swatch_rect(a: &App, cmd: u32) -> Option<RECT> {
 ///
 /// 返回 `None` = 最下面一行会被窗口底边切掉。面板没有滚动条，切掉就是看不见 ——
 /// 而「加了两个控件之后最后一行跑出窗口」是这张表最容易犯的错，所以在自检里钉死。
-pub fn plan_margin_at_min() -> Option<i32> {
-    let all = slots(MIN_TRACK_W, MIN_TRACK_H);
-    let bottom = all.iter().map(|s| s.rc.bottom).max().unwrap_or(0);
-    let margin = MIN_TRACK_H - PAD - bottom;
-    if margin >= 0 {
-        Some(margin)
-    } else {
-        None
-    }
+/// **仅供自检**：在最窄宽度下把所有行排完，客户区**至少**需要多高。
+///
+/// `MIN_TRACK_H` 是写死的，而表格是流式的 —— 每往 `table()` 里加一行设置，
+/// 需要的就多一截。硬编码常量的失败模式是「界面上最后一行被切掉」，而它
+/// 不会报错、不崩、probe 也过，只能靠肉眼看出来。
+/// 把需求高度算出来交给断言，加行的人就会被逼着同步常量。
+pub fn plan_min_height() -> i32 {
+    let all = slots(MIN_TRACK_W, MIN_TRACK_H, 1.0);
+    PAD + all.iter().map(|s| s.rc.bottom).max().unwrap_or(0)
+}
+
+/// **仅供自检**：当前最小窗口高度比需求高多少（负数 = 排不下）。
+pub fn plan_height_slack() -> i32 {
+    MIN_TRACK_H - plan_min_height()
+}
+
+/// **仅供自检**：把 `MIN_TRACK_H` 念出来，方便和 `plan_min_height()` 对照。
+pub fn min_track_h() -> i32 {
+    MIN_TRACK_H
+}
+
+/// **仅供自检**：按给定 UI 倍率 k（1.0 = 100%）排一遍，返回每个控件的矩形。
+///
+/// 客户区按「最小客户区 × k」给 —— 这正是跨屏拖动后窗口该有的样子
+/// （系统建议的矩形保持逻辑尺寸不变）。断言拿它验两件事：
+/// 放大后**每个矩形恰好等比**（只缩终点不解分段的写法会在这里露馅），
+/// 且**仍然没有交叠**（格子不会互相压住）。
+pub fn plan_rects_at(k: f32) -> Vec<RECT> {
+    let cw = (MIN_TRACK_W as f32 * k).round() as i32;
+    let ch = (MIN_TRACK_H as f32 * k).round() as i32;
+    slots(cw, ch, k).into_iter().map(|s| s.rc).collect()
+}
+
+/// **仅供自检**：按给定 UI 倍率排完之后，客户区至少需要多高（物理像素）。
+pub fn plan_need_height_at(k: f32) -> i32 {
+    let rc = plan_rects_at(k);
+    let bottom = rc.iter().map(|r| r.bottom).max().unwrap_or(0);
+    bottom + (PAD as f32 * k).round() as i32
 }
 
 /// **仅供自检**：布局里有没有两格**矩形交叠**。
@@ -1337,7 +1656,21 @@ pub fn plan_margin_at_min() -> Option<i32> {
 /// （写这条断言之前，上面那个 bug 是靠手动打印坐标才发现的。教训：能自动查的
 /// 事情不要靠眼睛。）
 pub fn plan_overlaps() -> Option<String> {
-    let all = slots(CLIENT_W, CLIENT_H);
+    overlaps_in(&slots(CLIENT_W, CLIENT_H, 1.0))
+}
+
+/// **仅供自检**：按给定 UI 倍率检查矩形交叠。
+///
+/// 缩放本身不该制造交叠 —— 但「只缩终点、不缩分段」这种写法（比如标签宽
+/// 74 逻辑、按钮宽 26 逻辑，最后只把整格宽度乘 2）会让两者在 200% 屏上
+/// 压到一起，而 100% 下完全正常。所以每个倍率都得排一遍。
+pub fn plan_overlaps_at(k: f32) -> Option<String> {
+    let cw = (MIN_TRACK_W as f32 * k).round() as i32;
+    let ch = (MIN_TRACK_H as f32 * k).round() as i32;
+    overlaps_in(&slots(cw, ch, k))
+}
+
+fn overlaps_in(all: &[Slot]) -> Option<String> {
     let name = |s: &Slot| -> String {
         match s.role {
             Role::Sec => format!("标题「{}」", s.text),
@@ -1507,11 +1840,11 @@ unsafe fn draw_item(c: &ConfigUi, dis: *const DRAWITEMSTRUCT) {
     );
 
     let w = wide(face);
-    // 行高 26、字号 18 时上留 4px 大致垂直居中；给裁剪矩形是防超长字体名溢出到邻行
+    // 行高 / 字号都随 DPI 变，内边距也必须跟着变；给裁剪矩形是防超长字体名溢出到邻行
     ExtTextOutW(
         dc,
-        d.rcItem.left + 8,
-        d.rcItem.top + 4,
+        d.rcItem.left + c.sp(8),
+        d.rcItem.top + c.sp(4),
         0,
         &d.rcItem,
         w.as_ptr(),
@@ -1538,14 +1871,15 @@ unsafe fn paint(a: &mut App, hwnd: HWND) {
         match c.role {
             Role::Sec => {
                 let old_f = SelectObject(dc, app.config.bold_font as HGDIOBJ);
-                text_out(dc, c.rc.left, c.rc.top + 2, c.text);
+                let sh = app.config.sp(SEC_H);
+                text_out(dc, c.rc.left, c.rc.top + app.config.sp(2), c.text);
                 // 标题下面一条细线，把分组切开
                 if !app.config.frame_brush.is_null() {
                     let line = RECT {
                         left: c.rc.left,
-                        top: c.rc.top + SEC_H - 4,
+                        top: c.rc.top + sh - app.config.sp(4),
                         right: c.rc.right,
-                        bottom: c.rc.top + SEC_H - 3,
+                        bottom: c.rc.top + sh - app.config.sp(3),
                     };
                     FillRect(dc, &line, app.config.frame_brush);
                 }
@@ -1586,14 +1920,20 @@ unsafe fn paint(a: &mut App, hwnd: HWND) {
         let mut tm: TEXTMETRICW = zeroed();
         GetTextMetricsW(dc, &mut tm);
         let step = ((tm.tmHeight + tm.tmExternalLeading) as i32)
-            .clamp(PREVIEW_PX + 6, (PREVIEW_H - 26) / 2);
+            .clamp(app.config.sp(PREVIEW_PX) + app.config.sp(6), app.config.sp(PREVIEW_H - 26) / 2);
         SelectObject(dc, old2);
 
         for (i, (line, big)) in PREVIEW_LINES.iter().enumerate() {
             let f = if *big { pv } else { ui };
             let old_f = SelectObject(dc, f as HGDIOBJ);
             // 真要越界由 `text_out_clip` 兜住 —— 预览框必须像视口，不能像漏勺
-            text_out_clip(dc, r.left + 6, r.top + 4 + step * i as i32, line, &r);
+            text_out_clip(
+                dc,
+                r.left + app.config.sp(6),
+                r.top + app.config.sp(4) + step * i as i32,
+                line,
+                &r,
+            );
             SelectObject(dc, old_f);
         }
     }
@@ -1624,14 +1964,24 @@ unsafe extern "system" fn config_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let Some(a) = crate::app::app_ready() else {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    };
+    match crate::app::with_app(|a| config_proc_inner(a, hwnd, msg, wparam, lparam)) {
+        Some(r) => r,
+        None => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn config_proc_inner(
+    a: &mut App,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
-        WM_CREATE => {
-            create_children(a, hwnd);
-            0
-        }
+        // 子控件由 `open()` 在 `CreateWindowExW` 返回后显式创建。
+        // 建窗是在 `with_app` 闸门内进行的，嵌套的 WM_CREATE 会被闸门挡掉；
+        // 若在这里再建一遍，正常打开时会出现两套控件。
+        WM_CREATE => 0,
 
         WM_SIZE => {
             let mut rc: RECT = zeroed();
@@ -1641,8 +1991,68 @@ unsafe extern "system" fn config_proc(
         }
 
         WM_GETMINMAXINFO => {
-            let mm = &mut *(lparam as *mut MinMaxInfo);
-            mm.pt_min_track = POINT { x: MIN_TRACK_W, y: MIN_TRACK_H };
+            // 常量是**逻辑**客户区尺寸，系统要的是**含标题栏与边框的物理**
+            // 跟踪尺寸。三步都不能省：先乘 UI 倍率，再按窗口所在屏的 DPI
+            // 换成窗口尺寸。少任一步，用户都能把窗口缩到比规格更小，
+            // 而自检按客户区算、看不出来。
+            //
+            // 优先按窗口所在屏的 DPI 换算：per-monitor aware 进程里，
+            // 200% 屏的标题栏比 96 基准高出一倍，拿 96 的结果当上界
+            // 会少留一截。
+            let (ww, wh) = window_size_for_client(
+                MIN_TRACK_W,
+                MIN_TRACK_H,
+                a.config.scale(),
+                raw_dpi(a.config.dpi.max(48)),
+            );
+            let mm = unsafe { &mut *(lparam as *mut MinMaxInfo) };
+            mm.pt_min_track = POINT { x: ww, y: wh };
+            0
+        }
+
+        // 跨屏拖动：系统换发新 DPI，界面必须**整体换挡**（字号 / 行高 / 间距一起）。
+        //
+        // 不做这件事的后果不是「有点糊」：本进程是 per-monitor aware，
+        // 系统不做 DPI 虚拟化 —— 从 100% 屏拖到 200% 屏，窗口面积翻四倍，
+        // 而所有物理像素常量不动，界面就缩成左上角一小块，右边三分之二
+        // 是空白。反过来（200% → 100%）更糟：控件被窗口边缘直接切掉。
+        WM_DPICHANGED => {
+            // wParam 低字是 96 基准的原始 DPI（150% 屏 = 144），统一换成百分数。
+            let pct = crate::ffi::dpi_pct((wparam & 0xFFFF) as i32) as u32;
+            if a.config.dpi != pct {
+                a.config.dpi = pct;
+                // 字体是按字号建的，GDI 对象不可变 —— 只能整批重建，
+                // 再把新字体 `WM_SETFONT` 回每个子控件（旧句柄已销毁）。
+                let face = String::from(a.font_face());
+                a.config.rebuild_scaled_fonts(&face);
+                a.config.retag_fonts();
+            }
+            // 采纳系统建议的矩形：它是按「保持逻辑尺寸不变」算出来的，
+            // 正好等于「客户区还是 CLIENT_W × CLIENT_H 个逻辑像素」。
+            let rc = unsafe { &*(lparam as *const RECT) };
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    rc.left,
+                    rc.top,
+                    (rc.right - rc.left).max(1),
+                    (rc.bottom - rc.top).max(1),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                // ⚠️ 不能指望 `SetWindowPos` 带出的 `WM_SIZE` 去重排：
+                // 它是**同步**嵌在这里发出来的，而 `with_app` 重入闸门此刻正
+                // 处于占用状态（我们就在闸门里面），那条 WM_SIZE 会被交回
+                // `DefWindowProc` 直接丢掉 —— 症状是窗口放大了、控件还留在
+                // 旧位置（100% → 200% 时挤在左上角八分之一里）。
+                // 与 `create_children` 里「显式建子控件」是同一个原因。
+                let mut cli: RECT = zeroed();
+                if GetClientRect(hwnd, &mut cli) != 0 {
+                    layout_children(&mut a.config, cli.right, cli.bottom);
+                }
+                // 分组标题 / 色块 / 预览区是父窗口自己画的，不重画会留在旧位置。
+                InvalidateRect(hwnd, null(), 1);
+            }
             0
         }
 
@@ -1664,7 +2074,9 @@ unsafe extern "system" fn config_proc(
         WM_MEASUREITEM => {
             let m = &mut *(lparam as *mut MEASUREITEMSTRUCT);
             if m.CtlType == ODT_LISTBOX && m.CtlID as i32 == ID_FONT_LIST {
-                m.itemHeight = ITEM_H as u32;
+                // 行高是物理像素，必须跟着 DPI 放大 —— 否则 200% 屏上是
+                // 「字号 36px、行高 26px」，每行的字都压住下一行。
+                m.itemHeight = a.config.sp(ITEM_H).max(1) as u32;
                 return 1; // TRUE：已处理
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1700,13 +2112,18 @@ unsafe extern "system" fn config_proc(
         }
 
         WM_CLOSE => {
+            a.config.free_resources();
             DestroyWindow(hwnd);
             0
         }
 
         WM_DESTROY => {
             // ⚠️ 这里**不能** PostQuitMessage —— 这是设置面板，不是主窗口。
-            a.config.free_resources();
+            // 正常关闭路径已在 WM_CLOSE / close() 里释放；这里兜底处理
+            // 由父窗口销毁等外部路径，重复调用是幂等的。
+            if a.config.hwnd == hwnd {
+                a.config.free_resources();
+            }
             0
         }
 

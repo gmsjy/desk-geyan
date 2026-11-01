@@ -44,6 +44,9 @@ pub const WM_DISPLAYCHANGE: u32 = 0x007E;
 pub const WM_NCHITTEST: u32 = 0x0084;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_WINDOWPOSCHANGED: u32 = 0x0047;
+/// 每显示器 DPI 感知的窗口被拖到另一块（DPI 不同的）屏上时收到。
+/// wParam 低字 = X 轴 DPI，高字 = Y 轴 DPI。
+pub const WM_DPICHANGED: u32 = 0x02E0;
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
 pub const WM_EXITSIZEMOVE: u32 = 0x0232;
 pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
@@ -162,6 +165,7 @@ pub const VK_M: u32 = 0x4D;
 pub const VK_P: u32 = 0x50;
 pub const VK_R: u32 = 0x52;
 pub const VK_S: u32 = 0x53;
+pub const VK_SPACE: u32 = 0x20;
 pub const VK_T: u32 = 0x54;
 pub const VK_V: u32 = 0x56;
 pub const VK_X: u32 = 0x58;

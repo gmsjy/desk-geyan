@@ -1,6 +1,6 @@
 //! 格言库。
 //!
-//! **内置库**是一部经典中文格言集（317 条，分四节：经典格言 · 诗词名句 ·
+//! **内置库**是一部经典中文格言集（455 条，分四节：经典格言 · 诗词名句 ·
 //! 谚语俗语 · 名人名言），存放在与 `desk-geyan.exe` **同目录**的
 //! `quotes-builtin.txt` 里（定位规则见 `builtin_file`）—— **不编进二进制**，
 //! 免得程序本体被几百条文案撑大。启动 / 重载时读盘，改完即生效。
@@ -43,6 +43,9 @@ impl Quote {
 
 /// 内置库文件名。发布时与 `desk-geyan.exe` **同目录**（发布包是平铺的）。
 pub const BUILTIN_FILE: &str = "quotes-builtin.txt";
+
+/// 收藏夹分组文件名（`quotes/favorites.txt` 的单一真相源）。
+pub const FAVORITES_FILE: &str = "favorites.txt";
 
 /// 上溯层数上限。4 层已覆盖 `target/debug/deps/` 这种最深的开发布局。
 const WALK_UP_MAX: usize = 5;
@@ -114,7 +117,8 @@ fn strip_bom(s: &str) -> &str {
 /// `pub(crate)`：收藏夹（`favorites.rs`）要复用同一个解析器 ——
 /// 「写出去的行能被读回来」必须是同一个函数保证的，各写一份必走偏。
 pub(crate) fn read_external(path: &std::path::Path) -> std::io::Result<Vec<Quote>> {
-    let text = std::fs::read_to_string(path)?;
+    let bytes = std::fs::read(path)?;
+    let text = decode_text(&bytes)?;
     let mut list = Vec::new();
     for raw in strip_bom(&text).lines() {
         let line = raw.trim();
@@ -124,6 +128,27 @@ pub(crate) fn read_external(path: &std::path::Path) -> std::io::Result<Vec<Quote
         list.push(parse_line(line));
     }
     Ok(list)
+}
+
+/// 把词库字节解成字符串。
+///
+/// 先按 UTF-8（标准路径，也是文档推荐的编码）；失败再按系统 ANSI 代码页
+/// 解一次 —— 中文 Windows 记事本「另存为」默认是 ANSI(GBK)，而
+/// `read_to_string` 对这种文件会直接失败，结果整个文件被跳过。
+/// 用户看到的只有「我写了词库但一条都没生效」，而且文件本身完全正常。
+///
+/// 两种都解不开才报错（真正的二进制垃圾 / 加密文件）。
+fn decode_text(bytes: &[u8]) -> std::io::Result<String> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return Ok(s.to_string());
+    }
+    if let Some(s) = crate::ffi::ansi_to_string(bytes) {
+        return Ok(s);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "既不是 UTF-8 也不是系统 ANSI 编码（请另存为 UTF-8）",
+    ))
 }
 
 /// 一组外部格言：`(组名, 条目)`。组名取文件名（不含目录），
@@ -219,6 +244,21 @@ pub fn library_from(dir: &std::path::Path) -> Vec<Quote> {
     let mut list = interleave(&load_groups(dir));
     list.extend(load_builtin());
     list
+}
+
+/// 按播放源加载：全部 / 仅收藏夹。
+///
+/// 「仅收藏夹」在收藏为空时回退到内置库。返回空库会让二十多处 `list[qi]`
+/// 直接崩，而显示一块空白又违背「什么都不画、什么也不说」的红线。
+pub fn library_for(dir: &std::path::Path, fav_only: bool) -> Vec<Quote> {
+    if fav_only {
+        let favs = read_external(&dir.join("quotes").join(FAVORITES_FILE)).unwrap_or_default();
+        if !favs.is_empty() {
+            return favs;
+        }
+        return load_builtin();
+    }
+    library_from(dir)
 }
 
 /// 内置库条数。测试断言总条数时用，免得把「内置多少条」这个会过期的魔数写进测试。

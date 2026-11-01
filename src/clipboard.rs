@@ -96,20 +96,35 @@ pub fn get_text(hwnd: ffi::HWND) -> Option<String> {
             ffi::CloseClipboard();
             return None;
         }
+        // 剪贴板数据来自**任意其他进程**，不能假定它一定有 NUL 结尾。
+        // 先取 GlobalSize 划出可用字节数，只在边界内找终止符。
+        let bytes = ffi::GlobalSize(hmem);
+        let cap = bytes / 2;
+        if cap == 0 {
+            ffi::CloseClipboard();
+            return None;
+        }
         let src = ffi::GlobalLock(hmem);
         if src.is_null() {
             ffi::CloseClipboard();
             return None;
         }
-        // 自己找 NUL：GlobalSize 要再导入一个函数，而字符串结尾本来就是 NUL 终止的
-        let mut len = 0usize;
         let p = src as *const u16;
-        while *p.add(len) != 0 {
-            len += 1;
-        }
-        let s = String::from_utf16_lossy(slice::from_raw_parts(p, len));
+        let units = slice::from_raw_parts(p, cap);
+        let len = units.iter().position(|&c| c == 0);
+        let out = len.map(|n| String::from_utf16_lossy(&units[..n]));
         ffi::GlobalUnlock(hmem);
         ffi::CloseClipboard();
-        Some(s)
+        out
     }
+}
+
+/// 剪贴板是否**声明**含有 `CF_UNICODETEXT`。
+///
+/// 与 `get_text()` 的差别是「声明」与「真能读出来」：本函数为 `true` 而
+/// `get_text()` 返回 `None`，说明格式挂在那里但内容读不出来（`GlobalLock`
+/// 失败、或句柄长度为 0）—— 那是 `clipboard` 模块自己的缺陷，不该被自检
+/// 当成「剪贴板里本来就没有文本」静默跳过。
+pub fn has_text() -> bool {
+    unsafe { ffi::IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 }
 }

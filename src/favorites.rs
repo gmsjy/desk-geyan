@@ -28,7 +28,7 @@ use crate::quotes::{self, Quote};
 /// 收藏夹文件名。放在 `quotes/` 目录下，于是它自动成为分组机制里的**一组**，
 /// 和用户的 `01_乡村振兴.txt` 们按 round-robin 轮流出现 —— 「加入播放」
 /// 不需要任何额外机制，分组轮播本身就干这个。
-pub const FILE: &str = "favorites.txt";
+pub const FILE: &str = quotes::FAVORITES_FILE;
 
 /// 收藏夹完整路径：`<data_dir>/quotes/favorites.txt`。
 pub fn path(dir: &Path) -> PathBuf {

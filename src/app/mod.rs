@@ -20,6 +20,7 @@
 //!   `DestroyWindow` / `ShowWindow` 会**同步重入** wndproc，Mutex 必自锁。
 //! * `cfg.x/y` 是**目标位置**，不是窗口实际位置；客户区↔屏幕换算必须读 `win_rect()`。
 
+mod diagnostics;
 mod frame;
 mod input;
 mod render;
@@ -28,6 +29,7 @@ mod window;
 
 // 兄弟模块之间靠 `use super::*` 互见，所以把各子模块的面汇总到这里。
 // 注意 glob **不会链式传递**：`verify/` 下的子文件由 `verify/mod.rs` 自己再导出。
+pub(crate) use diagnostics::export as export_diagnostics;
 pub(crate) use frame::*;
 pub(crate) use input::*;
 pub(crate) use render::*;
@@ -68,6 +70,28 @@ pub(crate) const TEXT_CLASS: &str = "DeskGeyanText";
 pub(crate) const TIMER_ID: usize = 1;
 
 pub(crate) const TIMER_MS: u32 = 40;
+
+/// 消息泵自身的失败码（`GetMessageW` 返回 -1）。0 = 正常。
+///
+/// `GetMessageW` 只有三种返回：>0 有消息、0 `WM_QUIT`、**-1 出错**。
+/// 出错时既不能吞掉继续循环（那是 100% CPU 空转），也不该无声 `break`
+/// —— 挂件会凭空消失，用户和我们都拿不到任何线索。记下 `GetLastError`
+/// 再退，诊断报告里能看到它。
+pub(crate) static PUMP_ERR: AtomicU32 = AtomicU32::new(0);
+
+/// 单实例互斥体创建失败码（0 = 成功）。失败时保护失效但仍会启动 ——
+/// 这条只用来解释「为什么同时出现了两个挂件」。
+pub(crate) static SINGLE_ERR: AtomicU32 = AtomicU32::new(0);
+
+/// 单实例互斥体失败码（0 = 正常）
+pub(crate) fn single_err() -> u32 {
+    SINGLE_ERR.load(Ordering::Relaxed)
+}
+
+/// 消息泵失败码（0 = 正常退出）
+pub(crate) fn pump_err() -> u32 {
+    PUMP_ERR.load(Ordering::Relaxed)
+}
 
 /// `panel_proc` 收到的消息计数（`--dragbench` / `--memtest` 用）。
 ///
@@ -253,6 +277,24 @@ pub(crate) const MI_SHRINK_FIT: u32 = 75;
 /// 打开设置面板（字体列表等）
 pub(crate) const MI_CONFIG: u32 = 76;
 
+/// 字号是否跟随所在显示器的 DPI（高 DPI 屏上物理尺寸一致）
+pub(crate) const MI_DPI: u32 = 77;
+
+/// 适应当前屏幕：把窗口缩进工作区、字号同比缩、回到该屏右上角
+pub(crate) const MI_FIT: u32 = 78;
+
+/// 暂停 / 继续轮播（保留当前句）
+pub(crate) const MI_PAUSE: u32 = 79;
+
+/// 仅播放收藏夹（收藏为空时回退内置库）
+pub(crate) const MI_FAV_ONLY: u32 = 80;
+
+/// 备份配置 / 收藏到数据目录
+pub(crate) const MI_BACKUP: u32 = 81;
+
+/// 导出纯文本诊断报告
+pub(crate) const MI_DIAG: u32 = 82;
+
 /// 时间日期块拖动命中的最小判定范围（避免块很小时抓不住）
 pub(crate) const CLOCK_MIN_GRAB: i32 = 28;
 
@@ -279,6 +321,40 @@ pub(crate) const CLOCK_MIN_GRAB: i32 = 28;
 
 thread_local! {
     static APP_PTR: Cell<*mut App> = const { Cell::new(null_mut()) };
+    /// 是否已经有一层代码持有 `&mut App`。
+    ///
+    /// Win32 的 `TrackPopupMenu` / `DestroyWindow` / `ShowWindow` 会在同一线程
+    /// 同步重入窗口过程。若这时再构造一个 `&mut App`，同一对象就同时存在两个
+    /// 可变引用 —— 这是 UB，不是「单线程所以没事」。优化器据此把状态读提升成
+    /// 常量，项目已经真实踩到过。
+    ///
+    /// 这里把重入的消息交回 `DefWindowProcW`：外层操作完成后会主动补一帧 /
+    /// 落一次几何；嵌套消息不需要、也不允许碰应用状态。这样整个进程里
+    /// 任何时刻最多只有一个 `&mut App`。
+    static APP_BUSY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 独占访问 `App`。已经有外层访问时返回 `None`，绝不构造第二个可变引用。
+///
+/// 闭包退出时立即释放闸门；`panic` 展开也会释放。重入的窗口消息走
+/// `DefWindowProcW`，由外层动作结束后统一刷新。
+pub(crate) fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP_BUSY.with(|busy| {
+        if busy.get() {
+            return None;
+        }
+        busy.set(true);
+        struct Gate;
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                APP_BUSY.with(|b| b.set(false));
+            }
+        }
+        let _gate = Gate;
+        let p = app_ptr_raw();
+        assert!(!p.is_null(), "APP_PTR 未初始化：调用 with_app 前必须先 bootstrap");
+        Some(f(unsafe { &mut *p }))
+    })
 }
 
 /// 存下 `App` 的地址（`Box::into_raw` 出来的那个），之后 `app()` 才拿得到。
@@ -295,22 +371,17 @@ fn app_ptr_raw() -> *mut App {
     APP_PTR.with(|c| c.get())
 }
 
-pub(crate) fn app() -> &'static mut App {
-    let p = app_ptr_raw();
-    // 进程里所有入口都先经过 `bootstrap`（那里 set），所以非空是既定事实。
-    // 真为空说明有人漏了初始化 —— 直接解引用会崩在 Windows 异常里，
-    // 不如在这里炸出一句能定位的话。
-    assert!(!p.is_null(), "APP_PTR 未初始化：调用 app() 前必须先 bootstrap");
-    unsafe { &mut *p }
-}
 
-pub(crate) fn app_ready() -> Option<&'static mut App> {
+/// **仅供 CLI 验证程序**：验证入口独占进程，自己先建 App、再 pump 消息。
+///
+/// 生产窗口过程与消息泵一律走 `with_app`，不会调用这里。验证代码持有这个引用
+/// 期间会主动泵消息，因此它仍属于「诊断专用」的裸指针访问 —— 不在主程序路径上。
+///
+/// 新代码不要使用；验证入口的长期方向是拆成短作用域 `with_app`。
+pub(crate) unsafe fn app() -> &'static mut App {
     let p = app_ptr_raw();
-    if p.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *p })
-    }
+    assert!(!p.is_null(), "APP_PTR 未初始化：调用 app() 前必须先 bootstrap");
+    &mut *p
 }
 
 /// 本模块的 `HINSTANCE`。建窗口时要它 —— 设置面板（`config_ui`）在另一个模块里，
@@ -322,7 +393,7 @@ pub(crate) fn module_handle() -> *mut c_void {
 
 // ---------------------------------------------------------------- 状态
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Glass {
     /// Acrylic 成功，底板交给 DWM 画
     Acrylic,
@@ -343,8 +414,14 @@ pub(crate) struct App {
     m: f32,
     /// 当前格言宽度（px）
     cur_w: i32,
-    /// 动效相位（秒）
+    /// 当前这句已停留的秒数（dwell 计时器）。换句 / 切动效时归零。
+    ///
+    /// **与呼吸相位分开**：旧实现两者共用一个 `phase`，于是呼吸模式下
+    /// 换句把相位归零 = 亮度从曲线谷底重跳一次；而呼吸模式下不累计 dwell
+    /// = 永远不换句（455 条库里只有第一条会被看到）。
     phase: f32,
+    /// 呼吸相位（秒，只在 `Anim::Breathe` 下推进）。`quote_mod` 用它算 k。
+    pulse: f32,
     /// 文字整体 alpha 系数（淡入淡出 / 呼吸）
     /// 换句过渡状态机（纯逻辑在 `transition.rs`）。
     ///
@@ -405,8 +482,10 @@ pub(crate) struct App {
     ///
     /// `dx/dy` 进指纹是因为夹取会回写它们；`font_epoch` 见 `rebuild_fonts`
     /// 的递增 —— 换字体/字号/开关/换句都要让它涨一次，否则量的是旧尺寸。
+    /// **时钟刻度也必须在内**：`ClockBox` 缓存的不只是几何，还带着已经格式化好的
+    /// 时间/日期字符串；漏掉它就会出现「定时器在跳、画面上的时间永远不动」。
     clock_cached: Option<Box<ClockBox>>,
-    clock_norm_key: (i32, i32, i32, i32, i32, u32, u32, u32, i32, i32, u64),
+    clock_norm_key: (u64, i32, i32, i32, i32, i32, u32, u32, u32, i32, i32, u64),
     /// 主时钟最后出帧时的「时间戳」（时/分/秒），静态画面下用它决定要不要重画
     clock_stamp: u64,
     /// 跑马灯首帧：格言应当已经在带内，而不是让用户先看一段空白
@@ -526,13 +605,18 @@ pub(crate) enum MoveWay {
 impl App {
     fn new() -> Option<App> {
         let cfg = Config::load();
-        let fonts = Fonts::build(&cfg.font, cfg.scale, cfg.clock_scale, cfg.quote_scale);
+        let fonts = Fonts::build(
+            &cfg.font,
+            cfg.eff_scale_pct(),
+            cfg.clock_scale,
+            cfg.quote_scale,
+        );
         let frame = Frame::new(cfg.w, cfg.h);
         // 分隔线画刷：走**主色通道**、强度 0x50。
         // 旧值 0x505050 是三通道同强度，在只读 byte0 的旧实现里恰好等于 0x50；
         // 换到「通道即语义」的新布局就必须只说一个通道，否则会被判成三色叠加。
         let brush = unsafe { CreateSolidBrush(gfx::ch_dim(0x50)) };
-        let list = quotes::library();
+        let list = quotes::library_for(&data_dir(), cfg.fav_only);
         if list.is_empty() {
             return None;
         }
@@ -545,6 +629,7 @@ impl App {
             m: 0.0,
             cur_w: 0,
             phase: 0.0,
+            pulse: 0.0,
             // 减动开关：系统级的（WinRT UISettings）要引 windows crate，暂不接；
             // env 覆盖给便携用户和自检用（见 transition::Transition::new）。
             trans: transition::Transition::new(std::env::var("DG_NO_TRANSITION").is_ok()),
@@ -572,6 +657,7 @@ impl App {
             // 空缓存 + 不可能的指纹，保证首次一定量一次
             clock_cached: None,
             clock_norm_key: (
+                u64::MAX,
                 i32::MIN,
                 i32::MIN,
                 i32::MIN,
@@ -615,6 +701,108 @@ impl App {
         self.cfg.mode == Mode::Glass || self.cfg.layout_mode
     }
 
+    /// **生效动效的唯一出口**：竖版降级为静态 + 「放不下转跑马灯」两件事都算进去。
+    ///
+    /// 以前这套判定被抄了四份（`step` / `needs_frame` / `build_frame` / `quote_mod`），
+    /// 而 `Config::eff_anim()` 只做了第一件 —— 名字像唯一真相，实际不是。
+    /// 后果是 `quote_mod` 在「呼吸 + 放不下」时给整条跑马灯乘了一个冻结的
+    /// 呼吸系数（实测亮度差 35 级），以及这次一并修掉的空转问题。
+    /// 现在四处都读这一个方法，加第五种动效也不会再漏。
+    pub(crate) fn eff_anim(&self) -> Anim {
+        if self.force_marquee {
+            Anim::Marquee
+        } else {
+            self.cfg.eff_anim()
+        }
+    }
+
+    /// 跟随显示器 DPI。返回 true 表示真的变了（调用方据此重排 / 落盘）。
+    ///
+    /// **字号和窗口尺寸必须一起缩放**：字体按 DPI 放大而窗口不动，同一份版式
+    /// 会立刻挤爆（这正是「换个分辨率就排不下」的来源）。
+    pub(crate) fn apply_dpi(&mut self, dpi: i32) -> bool {
+        let dpi = dpi.clamp(48, 480);
+        if !self.cfg.dpi_auto {
+            self.cfg.dpi = 100;
+            return false;
+        }
+        let old = self.cfg.dpi.max(1);
+        if dpi == old {
+            return false;
+        }
+        let k = dpi as f32 / old as f32;
+        self.cfg.dpi = dpi;
+        self.cfg.dpi_known = true;
+        self.cfg.w = ((self.cfg.w as f32 * k).round() as i32).max(MIN_W);
+        self.cfg.h = ((self.cfg.h as f32 * k).round() as i32).max(MIN_H);
+        // 两种版式的尺寸记忆也是物理值，必须与当前窗口同步换挡；
+        // 否则在 150% 屏上切回另一版式，会拿到 100% 时记下的小尺寸。
+        for (w, h) in [
+            (&mut self.cfg.h_w, &mut self.cfg.h_h),
+            (&mut self.cfg.v_w, &mut self.cfg.v_h),
+        ] {
+            *w = ((*w as f32 * k).round() as i32).clamp(MIN_W, 4000);
+            *h = ((*h as f32 * k).round() as i32).clamp(MIN_H, 2000);
+        }
+        // 放大后可能超出工作区（尤其从 100% 屏拖到 200% 屏），先夹再重建
+        clamp_to_work_area(&mut self.cfg);
+        self.rebuild_fonts();
+        true
+    }
+
+    /// 按当前播放源重载词库，并尽量把正在显示的同一句找回来。
+    ///
+    /// 收藏 / 切换「仅收藏夹」都会改变候选集合；只重置 `qi=0` 会出现
+    /// 「收藏完画面自己跳了」。
+    pub(crate) fn reload_library(&mut self) {
+        let cur = self.list.get(self.qi).map(|q| q.display()).unwrap_or_default();
+        self.list = quotes::library_for(&data_dir(), self.cfg.fav_only);
+        if self.list.is_empty() {
+            self.list = quotes::load_builtin();
+        }
+        self.qi = keep_index(&cur, &self.list, self.qi);
+        self.qn = (self.qi + 1) % self.list.len();
+        self.cur_w = measure_quote(self, &self.list[self.qi]);
+        self.m = if self.primed { marquee_band_w(&self.cfg) } else { 0.0 };
+        self.trans.settle();
+    }
+
+    /// 开关「跟随屏幕 DPI」。两个方向都**同比缩放窗口**：
+    /// 字号变了而窗口不动，版式立刻挤爆（开）或缩成一小块（关）。
+    pub(crate) fn set_dpi_auto(&mut self, on: bool, dpi: i32) {
+        let old_eff = self.cfg.eff_scale_pct().max(1);
+        self.cfg.dpi_auto = on;
+        self.cfg.dpi = if on { dpi.clamp(48, 480) } else { 100 };
+        self.cfg.dpi_known = true;
+        let new_eff = self.cfg.eff_scale_pct().max(1);
+        let k = new_eff as f32 / old_eff as f32;
+        if (k - 1.0).abs() > 0.001 {
+            self.cfg.w = ((self.cfg.w as f32 * k).round() as i32).max(MIN_W);
+            self.cfg.h = ((self.cfg.h as f32 * k).round() as i32).max(MIN_H);
+        }
+        clamp_to_work_area(&mut self.cfg);
+        self.rebuild_fonts();
+    }
+
+    /// 适应当前屏幕：窗口缩进工作区 → 字号**同比**缩 → 回到该屏右上角。
+    ///
+    /// 「窗口被缩了但字号没缩」= 版式挤爆，所以两者必须同一个系数。
+    /// 这条菜单是给「换了分辨率 / 换了显示器」准备的：点一下，整套比例
+    /// 就按新屏重新落一遍，不用自己猜该设多少。
+    pub(crate) fn fit_to_screen(&mut self) {
+        let before_w = self.cfg.w.max(1);
+        clamp_to_work_area(&mut self.cfg);
+        let k = self.cfg.w as f32 / before_w as f32;
+        if k < 0.999 {
+            self.cfg.scale = ((self.cfg.scale as f32 * k).round() as i32).clamp(30, 600);
+            self.rebuild_fonts();
+        }
+        let (wa, _) = work_area_at(self.cfg.x, self.cfg.y, self.cfg.w);
+        self.cfg.x = wa.right - self.cfg.w - 24;
+        self.cfg.y = wa.top + 24;
+        clamp_to_work_area(&mut self.cfg);
+    }
+
     /// 底板的不透明度：整体不透明度 × 底板系数。
     ///
     /// **不再跟呼吸联动** —— 呼吸已收窄为只作用于格言通道，底板是静帧：
@@ -647,8 +835,11 @@ impl App {
         }
         if self.trans.is_active() {
             (self.trans.quote_k(), self.trans.slide_x())
-        } else if self.cfg.eff_anim() == Anim::Breathe {
-            (transition::breathe_k(self.phase), 0)
+        } else if self.eff_anim() == Anim::Breathe {
+            // 相位是**呼吸自己的时钟**（`pulse`），与 dwell 计时器分开：
+            // 以前两者共用一个 `phase`，换句时把 phase 归零会让亮度从
+            // 曲线起点重跳一次（每 4~10s 一次可见的亮度台阶）。
+            (transition::breathe_k(self.pulse), 0)
         } else {
             (1.0, 0)
         }
@@ -665,7 +856,7 @@ impl App {
         self.fonts.destroy();
         self.fonts = Fonts::build(
             &self.cfg.font,
-            self.cfg.scale,
+            self.cfg.eff_scale_pct(),
             self.cfg.clock_scale,
             self.cfg.quote_scale,
         );
@@ -761,8 +952,12 @@ pub(crate) fn run() -> i32 {
         }
         // 单实例：两个实例叠在一起只会互相打架
         let name = wide("Local\\DeskGeyan_SingleInstance");
-        let _m = CreateMutexW(null(), 0, name.as_ptr());
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        let m = CreateMutexW(null(), 0, name.as_ptr());
+        if m.is_null() {
+            // 创建失败（权限 / 句柄耗尽）：单实例保护失效，但这不该成为
+            // 「程序打不开」的理由 —— 记下来，照常启动。
+            SINGLE_ERR.store(GetLastError(), Ordering::Relaxed);
+        } else if GetLastError() == ERROR_ALREADY_EXISTS {
             return 0;
         }
 
@@ -773,6 +968,16 @@ pub(crate) fn run() -> i32 {
 
         // 首次运行：贴到**挂件所在屏**的工作区右上角（未放置时坐标是 0，即主屏）
         if !st.cfg.placed {
+            // 新装默认**跟随屏幕 DPI**：这台机器上没有「旧行为」要保护，
+            // 而 150% / 200% 屏上不跟的话第一眼就明显偏小。
+            // 窗口按同一系数放大 —— 字号涨了窗口不涨，版式会立刻挤爆。
+            st.cfg.dpi_auto = true;
+            let dpi = crate::ffi::dpi_pct(crate::ffi::dpi_for_system().unwrap_or(96));
+            st.cfg.dpi = dpi;
+            st.cfg.dpi_known = true;
+            let k = dpi as f32 / 100.0;
+            st.cfg.w = ((st.cfg.w as f32 * k).round() as i32).max(MIN_W);
+            st.cfg.h = ((st.cfg.h as f32 * k).round() as i32).max(MIN_H);
             let (wa, _) = work_area_at(st.cfg.x, st.cfg.y, st.cfg.w);
             st.cfg.x = wa.right - st.cfg.w - 24;
             st.cfg.y = wa.top + 24;
@@ -782,24 +987,57 @@ pub(crate) fn run() -> i32 {
 
         let boxed = Box::new(st);
         app_ptr_set(Box::into_raw(boxed));
-        let a = app();
 
-        if !bootstrap(a) {
+        if !with_app(|a| bootstrap(a)).unwrap_or(false) {
             return 2;
         }
 
-        // 诊断用：`DG_OPEN_CONFIG=1` 时启动即把设置面板打开。
-        // 与 `DG_MOVE` / `DG_LEGACY_DRAG` 同类 —— 只为让「打开设置窗」这件事
-        // 在无人值守的脚本里可复现（截屏 / 回归），不设时零影响。
-        if std::env::var("DG_OPEN_CONFIG").is_ok() {
-            config_ui::open(a);
-        }
+        with_app(|a| {
+            // 窗口建出来了 ⇒ 现在能问「挂件实际落在哪块屏」的 DPI。
+            // 首次运行上面用的是系统 DPI，这里按真实所在屏校正一次
+            // （多屏 DPI 不同时，这一步才是对的）。
+            let dpi = window_dpi(a.text);
+            if !a.cfg.dpi_known {
+                // 旧配置迁移：`w/h` 已经是保存时的物理值，没有对应的 DPI 可用于
+                // 再次换算。只接管当前 DPI、不缩放尺寸，下一次启动起走正常往返。
+                a.cfg.dpi = dpi.clamp(48, 480);
+                a.cfg.dpi_known = true;
+                a.rebuild_fonts();
+                apply_geometry(a, true, true);
+                render_and_present(a);
+                a.cfg.save();
+            } else if a.apply_dpi(dpi) {
+                apply_geometry(a, true, true);
+                render_and_present(a);
+                a.cfg.save();
+            }
+
+            // 诊断用：`DG_OPEN_CONFIG=1` 时启动即把设置面板打开。
+            // 与 `DG_MOVE` / `DG_LEGACY_DRAG` 同类 —— 只为让「打开设置窗」这件事
+            // 在无人值守的脚本里可复现（截屏 / 回归），不设时零影响。
+            if std::env::var("DG_OPEN_CONFIG").is_ok() {
+                config_ui::open(a);
+            }
+        });
 
         // ---- 消息泵
+        // 不在这里持 `&mut App`：每条消息由窗口过程独占取得，处理完立即释放。
         let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        loop {
+            match GetMessageW(&mut msg, null_mut(), 0, 0) {
+                // WM_QUIT：正常收尾
+                0 => break,
+                // -1：泵出错（无效窗口句柄等）。记下原因再退，
+                // 别让「挂件突然没了」变成一件查不动的事。
+                -1 => {
+                    PUMP_ERR.store(GetLastError(), Ordering::Relaxed);
+                    break;
+                }
+                _ => {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
         }
         0
     }

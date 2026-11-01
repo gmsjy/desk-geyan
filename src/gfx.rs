@@ -57,10 +57,11 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{HWND, POINT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
-    GetTextExtentExPointW, GetTextExtentPoint32W, IntersectClipRect, ReleaseDC, RestoreDC, SaveDC,
+    GetTextExtentExPointW, GetTextExtentPoint32W, GetTextMetricsW, IntersectClipRect, ReleaseDC,
+    RestoreDC, SaveDC,
     PolyTextOutW, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, TextOutW,
     BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, POLYTEXTW,
-    HDC, HFONT, HGDIOBJ, HBITMAP,
+    HDC, HFONT, HGDIOBJ, HBITMAP, TEXTMETRICW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow;
 
@@ -80,12 +81,27 @@ pub struct Fonts {
     pub date: HFONT,
     pub quote: HFONT,
     pub hint: HFONT,
+    /// **固定 13px** 的一句提示字体（「窗口装不下 · 请放大窗口或降低字号」）。
+    ///
+    /// 它不能复用 `hint`：`hint` 跟着 `scale` 走，而这句话恰恰要在
+    /// 「字号已经大到装不下」时说 —— 300% 下 `hint` 是 36px，整句 600 多 px，
+    /// 比版心还宽。旧实现在绘制函数里每帧 `make_font(13, …)` + `DeleteObject`，
+    /// 一条退化提示要付一次建字体的代价；这里建一次、随 `Fonts` 一起销毁。
+    pub hint_fixed: HFONT,
     /// 格言缩字回退的两档：85% / 70%（100% 就是 `quote` 本身）。
     /// 缩字档**必须重新建字体对象再量**，不能按比例缩 `adv` ——
     /// 不同字号的 GDI 取整不一样，估算出来的宽度和实际画出来的对不上。
     pub quote_fit: [HFONT; 2],
-    /// 竖排旋转字体（`lfEscapement = 900`），给 `——` / `……` 用
-    pub quote_rot: HFONT,
+    /// 竖排旋转字体（`lfEscapement = 900`），给 `——` / `……` 用。
+    ///
+    /// **按缩字档各建一支**，和 `quote` / `quote_fit` 一一对应。
+    /// 早先只有一支（100% 字号），于是竖版走缩字回退后，正文缩到 85%/70%
+    /// 而 `——` `……` 仍是原字号：一条横贯整列的破折号压在缩小的字堆里，
+    /// 既盖住相邻字，又让「缩了字」看起来只缩了一半。
+    /// 而且 `draw_glyphs` 的合批是按字体分组的 —— 字体对不上倒不会错位
+    /// （每组各自提交），错的只是**大小**，所以只在竖版 + 长句 + 缩字时可见，
+    /// 平时根本碰不到。
+    pub quote_rot: [HFONT; 3],
 }
 
 /// 缩字回退的候选档（百分比）。老板定的下限是 70%。
@@ -102,11 +118,27 @@ impl Fonts {
             date: make_font(s(16, clock_ratio), FW_NORMAL, &f),
             quote: make_font(quote_px, FW_NORMAL, &f),
             hint: make_font(s(12, 100), FW_NORMAL, &f),
+            hint_fixed: make_font(13, FW_NORMAL, &f),
             quote_fit: [
                 make_font((quote_px * QUOTE_SHRINK_STEPS[1] / 100).max(6), FW_NORMAL, &f),
                 make_font((quote_px * QUOTE_SHRINK_STEPS[2] / 100).max(6), FW_NORMAL, &f),
             ],
-            quote_rot: make_font_ex(quote_px, FW_NORMAL, &f, 900),
+            // 旋转字必须**逐档**建：三档字号各一支，顺序与 `QUOTE_SHRINK_STEPS` 对齐。
+            quote_rot: [
+                make_font_ex(quote_px, FW_NORMAL, &f, 900),
+                make_font_ex(
+                    (quote_px * QUOTE_SHRINK_STEPS[1] / 100).max(6),
+                    FW_NORMAL,
+                    &f,
+                    900,
+                ),
+                make_font_ex(
+                    (quote_px * QUOTE_SHRINK_STEPS[2] / 100).max(6),
+                    FW_NORMAL,
+                    &f,
+                    900,
+                ),
+            ],
             face: f,
         }
     }
@@ -120,6 +152,15 @@ impl Fonts {
         }
     }
 
+    /// 取缩字档对应的**旋转**字体（`——` / `……` 专用）。
+    ///
+    /// 必须和 `quote_at(k)` 用同一个 `k` —— 两者大小不一致时，竖版里
+    /// 那条破折号会比周围的字大一圈。`k` 越界时夹到最后一档，不回 `null`：
+    /// `draw_glyphs` 拿到 null 会退回正文字体，那等于把破折号**横着**画在竖排里。
+    pub fn quote_rot_at(&self, k: usize) -> HFONT {
+        self.quote_rot[k.min(self.quote_rot.len() - 1)]
+    }
+
     pub fn destroy(&self) {
         unsafe {
             // ⚠️ 新增句柄必须加进这个数组。漏了的话 memtest 的 GDI 计数会涨，
@@ -130,9 +171,12 @@ impl Fonts {
                 self.date,
                 self.quote,
                 self.hint,
+                self.hint_fixed,
                 self.quote_fit[0],
                 self.quote_fit[1],
-                self.quote_rot,
+                self.quote_rot[0],
+                self.quote_rot[1],
+                self.quote_rot[2],
             ];
             for h in all {
                 if !h.is_null() {
@@ -168,6 +212,37 @@ pub fn make_font_ex(px: i32, weight: i32, face: &[u16], escapement: i32) -> HFON
             FF_DONTCARE,
             face.as_ptr(),
         )
+    }
+}
+
+/// **仅供自检**：一支字体真正落到 GDI 里的**字符格高**（`tmHeight`）。
+///
+/// `CreateFontW` 的 `-px` 只是**申请值**：同号字号在不同 facename 下，
+/// 实际 em 框和行距并不相同，只有读回来才知道画出来多大。
+///
+/// 用它来验「旋转字体和正文字体是不是同一号字」—— `lfEscapement`
+/// 只改**输出方向**、不改字号，所以两档相等是硬约束。竖版缩字回退时
+/// 这层关系一旦断开，`——` `……` 就会比周围的字大一圈（盖住上下两个字），
+/// 而画面不报错、不崩，只能靠断言看出来。
+pub fn font_height(hf: HFONT) -> i32 {
+    if hf.is_null() {
+        return 0;
+    }
+    unsafe {
+        let dc = CreateCompatibleDC(null_mut());
+        if dc.is_null() {
+            return 0;
+        }
+        let old = SelectObject(dc, hf as HGDIOBJ);
+        let mut tm: TEXTMETRICW = zeroed();
+        let ok = GetTextMetricsW(dc, &mut tm) != 0;
+        SelectObject(dc, old);
+        DeleteDC(dc);
+        if ok {
+            tm.tmHeight as i32
+        } else {
+            0
+        }
     }
 }
 
@@ -676,8 +751,19 @@ impl Frame {
 /// 竖版绘制本就按字分段，按列换灰度零额外提交，且 `shad` 位图仍是
 /// 阴影缩放的唯一真相源（`shadow_mask()` 断言直接读它）。
 ///
-/// 容量 16：竖版主文 4~12 列 + 出处 1 条，富余。
-pub const MAX_BANDS: usize = 16;
+/// 容量：竖版主文列数 + 出处 1 条。
+///
+/// 早先写的是 16（按「竖版 4~12 列」估的），但列数**不是**由文本长度单方面
+/// 决定的：窗口能拉多宽就有多少列。4000×80 的极端比例能排出 100 列 ——
+/// 超出容量的列在过渡里查不到带、系数退回 255（满亮），症状是右半边
+/// 「不淡入地闪一下」，只在特定窗口比例下复现。
+///
+/// 现在两边对齐：排版层按 `layout::MAX_COLS`（127）截断并给省略号，
+/// 这里留 +1 给出处带。两个常量由 `--selftest` 钉在一起。
+/// 即便如此仍不能假设一定装得下（比如将来列带再多一类），
+/// `frame_mod` 在超容量时会**整体退化**成通带并记一次
+/// `BAND_FALLBACK`，不会出现「一半列渐变一半满亮」。
+pub const MAX_BANDS: usize = crate::layout::MAX_COLS + 1;
 
 #[derive(Clone, Copy)]
 pub struct Band {
@@ -917,8 +1003,8 @@ pub fn draw_glyphs(
                 SelectObject(hdc, want as HGDIOBJ);
                 SetTextColor(hdc, group_color(col_groups, gi, color));
                 buf.clear();
-                buf.push(g.ch);
-                TextOutW(hdc, ox + g.x, oy + g.y, buf.as_ptr(), 1);
+                buf.extend(g.ch.encode_utf16(&mut [0u16; 2]).iter().copied());
+                TextOutW(hdc, ox + g.x, oy + g.y, buf.as_ptr(), buf.len() as i32);
             }
         } else {
             // ---- 合批路径：**一次 `PolyTextOutW`** 提交所有段 ----
@@ -960,8 +1046,14 @@ pub fn draw_glyphs(
                     store.clear();
                     offs.clear();
                     for &(s, n) in &group {
-                        offs.push((store.len(), n));
-                        store.extend(glyphs[s..s + n].iter().map(|g| g.ch));
+                        let off = store.len();
+                        for g in &glyphs[s..s + n] {
+                            let mut pair = [0u16; 2];
+                            store.extend(g.ch.encode_utf16(&mut pair).iter().copied());
+                        }
+                        // `PolyTextOutW.n` 的单位是 UTF-16 code unit，不是字形数；
+                        // 非 BMP 字符会占 2 个单元。
+                        offs.push((off, store.len() - off));
                     }
                     let base = store.as_ptr();
                     pt.clear();

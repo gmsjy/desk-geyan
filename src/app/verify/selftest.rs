@@ -1,4 +1,4 @@
-//! `--selftest`：64 条自检，覆盖排版 / 绘制 / 动效 / 交互 / 配置。
+//! `--selftest`：78 条自检，覆盖排版 / 绘制 / 动效 / 交互 / 配置。
 //!
 //! 设计前提是「起点是常量」：`a.cfg` 钉成默认值，**格言库也必须钉死** ——
 //! 凡是被测结果依赖的用户态数据，都要一起钉住，否则断言会随机器而变。
@@ -58,7 +58,7 @@ pub(crate) fn selftest() -> i32 {
         ..Default::default()
     });
     a.fonts.destroy();
-    a.fonts = Fonts::build(&a.cfg.font, a.cfg.scale, a.cfg.clock_scale, a.cfg.quote_scale);
+    a.fonts = Fonts::build(&a.cfg.font, a.cfg.eff_scale_pct(), a.cfg.clock_scale, a.cfg.quote_scale);
     a.list = quotes::library();
     a.qi = 0;
     a.qn = 1 % a.list.len();
@@ -200,6 +200,13 @@ pub(crate) fn selftest() -> i32 {
             ok = false;
             why = format!("{} px 预乘非法", bad_px);
         }
+        // 呼吸也必须换句：旧实现这条分支只有一句 `phase += dt`——没有 dwell
+        // 计时、不调 `advance`，455 条格言库里只有第一条会被看到。
+        // 18 秒动画时间足够跨过最短 dwell（4s）好几轮。
+        if an == Anim::Breathe && rotations == 0 {
+            ok = false;
+            why = "18 秒内一次都没换句（呼吸不该冻结轮播）".into();
+        }
         if hard_cuts > 0 {
             ok = false;
             why = format!("{} 次换句是零帧硬切", hard_cuts);
@@ -214,6 +221,48 @@ pub(crate) fn selftest() -> i32 {
         ));
     }
     a.cfg.speed = 60;
+
+    // ---- 呼吸模式的两条硬约束（回归：两个都是实测出来的缺陷）
+    {
+        let saved = a.cfg.clone();
+
+        // ① 格言关掉时**一帧都不该出**：只剩时钟的画面逐位不变，
+        //    而呼吸每拍都标脏 ⇒ 25fps 空转，实测 5.47% CPU（静态同条件 0.98%）。
+        a.cfg.anim = Anim::Breathe;
+        a.cfg.seconds = false;
+        a.cfg.show_quote = false;
+        a.trans.settle();
+        a.pulse = 1.0;
+        a.clock_stamp = clock_stamp(&a.cfg); // 对齐时钟刻度，隔离出「动效」这一个变量
+        let breathe_frames = needs_frame(&a);
+
+        // ② 「呼吸 + 放不下转跑马灯」：整条跑马灯**不许**被呼吸系数压暗。
+        //    `quote_mod` 以前读 `cfg.eff_anim()`（不含 force_marquee），
+        //    于是跑马灯被乘上一个冻结的 k（实测与纯跑马灯差 1327 px / 最大 35 级）。
+        a.cfg.w = 240;
+        a.cfg.h = 100;
+        a.cfg.quote_scale = 300;
+        a.cfg.show_clock = false;
+        a.cfg.show_date = false;
+        a.cfg.show_quote = true;
+        a.rebuild_fonts();
+        let op = a.text_alpha();
+        build_frame(&mut a, op);
+        let forced = a.force_marquee;
+        let k = a.eff_quote_k();
+
+        a.cfg = saved;
+        a.rebuild_fonts();
+        a.trans.settle();
+        rows.push((
+            "呼吸·关格言不出帧 / 强制跑马灯不压暗",
+            !breathe_frames && forced && (k - 1.0).abs() < 1e-6,
+            format!(
+                "关格言后仍出帧={}（须 false）· 强制跑马灯={} · 跑马灯下 k={:.2}（须 1.00）",
+                breathe_frames, forced, k
+            ),
+        ));
+    }
 
     // 回到默认动效，后面的行继续沿用
     a.cfg.anim = Anim::Marquee;
@@ -435,7 +484,7 @@ pub(crate) fn selftest() -> i32 {
         let prep = |b: &mut App| {
             b.cfg = Config::default();
             b.fonts.destroy();
-            b.fonts = Fonts::build(&b.cfg.font, b.cfg.scale, b.cfg.clock_scale, b.cfg.quote_scale);
+            b.fonts = Fonts::build(&b.cfg.font, b.cfg.eff_scale_pct(), b.cfg.clock_scale, b.cfg.quote_scale);
             b.list = quotes::library();
             b.qi = 0;
             b.qn = 1 % b.list.len();
@@ -450,8 +499,9 @@ pub(crate) fn selftest() -> i32 {
                 b.cfg.anim = an;
                 b.trans.settle();
                 b.phase = 0.0;
+                b.pulse = 0.0;
                 if an == Anim::Breathe {
-                    b.phase = 1.3; // 呼吸相位推进过
+                    b.pulse = 1.3; // 呼吸相位推进过
                     if b.eff_quote_k() != 1.0 {
                         breathe_k_bad = true;
                     }
@@ -478,6 +528,7 @@ pub(crate) fn selftest() -> i32 {
                 b.cfg.anim = an;
                 b.trans.settle();
                 b.phase = 0.0;
+                b.pulse = 0.0;
                 // 启动首帧：静态/淡入/跑马灯必须满覆盖率（旧 Fade 首拍
                 // phase=0 ⇒ alpha=0 重爬一遍，就是这条断言要守的）；
                 // 呼吸的「首帧」= 呼吸曲线起点，本身有定义。
@@ -492,7 +543,7 @@ pub(crate) fn selftest() -> i32 {
             }
             // 对照：非减动的呼吸必须每帧都出（否则 needs_frame 的臂被改坏了）
             b.cfg.anim = Anim::Breathe;
-            b.phase = 0.7;
+            b.pulse = 0.7;
             let breathe_frames = needs_frame(&b);
             rows.push((
                 "PR1.1·启动首帧全亮度（旧 Fade 重爬回归）",
@@ -979,11 +1030,203 @@ pub(crate) fn selftest() -> i32 {
             ),
         ));
 
+        // ⑤ 暂停轮播：语义是「格言不再换、动效不再走，**时钟照常走**」。
+        //    两个方向都能写错：做成整体冻结，时钟就停死在某一秒（用户看到
+        //    一个坏掉的钟）；做成只挡换句，跑马灯照样滚、照样逐帧烧 CPU。
+        {
+            let paused_was = a.cfg.paused;
+            a.cfg.paused = true;
+            a.cfg.anim = Anim::Marquee;
+            a.primed = true;
+            a.hover_paused = false;
+            a.trans.settle();
+            a.dirty = true;
+            render_if_due(&mut a, true); // 清脏：环境切换不该算进「不出帧」
+            let (qi0, m0, r0) = (a.qi, a.m, a.renders);
+            let mut nf = 0usize;
+            for _ in 0..120 {
+                step(&mut a, 0.1);
+                if needs_frame(&a) {
+                    nf += 1;
+                }
+            }
+            rows.push((
+                "暂停轮播：不换句 / 跑马灯冻结 / 一帧不出",
+                a.qi == qi0 && a.m == m0 && a.renders == r0 && nf == 0 && !a.trans.is_active(),
+                format!(
+                    "12s 后 qi 漂移={} · m 增量={} · renders 增量={} · needs_frame 真 {} 拍",
+                    a.qi != qi0,
+                    a.m - m0,
+                    a.renders.wrapping_sub(r0),
+                    nf
+                ),
+            ));
+
+            // 暂停**不**冻时钟：打开时间显示，把缓存刻度拨到与当前不一致，
+            // 必须立刻要帧（否则用户会发现秒数停着不动）。
+            a.cfg.show_clock = true;
+            a.clock_stamp = clock_stamp(&a.cfg).wrapping_add(1);
+            let tick_ok = needs_frame(&a);
+            a.cfg.show_clock = clk_was;
+            a.clock_stamp = clock_stamp(&a.cfg);
+            rows.push((
+                "暂停轮播不冻时钟（刻度变即出帧）",
+                tick_ok,
+                format!("刻度不一致时 needs_frame={}", tick_ok),
+            ));
+            a.cfg.paused = paused_was;
+        }
+
         // 还原环境（后续断言 / 默认时钟显示要它）
         a.cfg.show_clock = clk_was;
         a.cfg.show_date = date_was;
         a.hover_paused = false;
         a.hover = transition::HoverState::default();
+    }
+
+    // ---- 「仅播放收藏夹」的两种边界。空收藏夹是危险输入：返回空库会让
+    // 下一拍 `next()` 撞上 `len()==0`（除零 / 越界 / 黑屏三选一）。
+    {
+        let base = std::env::temp_dir().join(format!("desk-geyan-favonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir_all(base.join("quotes"));
+
+        // ① 空收藏夹 → 回退内置库，绝不是空
+        let empty = quotes::library_for(&base, true);
+        // ② 有收藏 → 只取收藏，且与内置库无关
+        std::fs::write(base.join("quotes").join(favorites::FILE), "甲一 —— A\n甲二 —— B\n").unwrap();
+        let only = quotes::library_for(&base, true);
+        // ③ 关掉开关 → 回到完整库（内置 + 外部）
+        std::fs::write(base.join("quotes/01_g.txt"), "乙一 —— C\n").unwrap();
+        let full = quotes::library_for(&base, false);
+
+        let ok = empty.len() == quotes::builtin_len()
+            && !empty.is_empty()
+            && only.len() == 2
+            && full.len() > only.len();
+        rows.push((
+            "仅播放收藏夹（空则回退内置 · 开关可逆）",
+            ok,
+            format!(
+                "空收藏夹 → {} 条（内置 {}）· 有收藏 → {} 条 · 关闭开关 → {} 条",
+                empty.len(),
+                quotes::builtin_len(),
+                only.len(),
+                full.len()
+            ),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- 词库编码：中文 Windows 的记事本「另存为」默认是 ANSI(GBK)。
+    // `read_to_string` 读这种文件会直接失败，整个文件被静默跳过 ——
+    // 用户照着文档写了一整份词库，看到的是「一条都没生效」。
+    // 这里用**真实 GBK 字节**走一遍，验回退真的解得对。
+    {
+        let base = std::env::temp_dir().join(format!("desk-geyan-gbk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir_all(&base);
+
+        // 「国之器 —— 老子」的代码页 936 字节
+        let gbk: &[u8] = b"\xB9\xFA\xD6\xAE\xC6\xF7 \xA1\xAA\xA1\xAA \xC0\xCF\xD7\xD3\n";
+        std::fs::write(base.join("quotes.txt"), gbk).unwrap();
+        // 同一句的 UTF-8 版，用来确认标准路径没被改坏
+        std::fs::write(base.join("utf8.txt"), "国之器 —— 老子\n").unwrap();
+
+        let got_gbk = quotes::read_external(&base.join("quotes.txt"));
+        let got_utf8 = quotes::read_external(&base.join("utf8.txt"));
+        let acp = unsafe { crate::ffi::GetACP() };
+
+        let gbk_text = got_gbk
+            .as_ref()
+            .ok()
+            .and_then(|l| l.first())
+            .map(|q| q.text.clone())
+            .unwrap_or_default();
+        let utf8_text = got_utf8
+            .as_ref()
+            .ok()
+            .and_then(|l| l.first())
+            .map(|q| q.text.clone())
+            .unwrap_or_default();
+
+        // 非 936 的系统上，这批字节按当地代码页解出来当然不是汉字 ——
+        // 那时只验「UTF-8 正常」和「没崩」，不误判成失败。
+        let ok = if acp == 936 {
+            gbk_text.starts_with("国之器") && utf8_text.starts_with("国之器")
+        } else {
+            !utf8_text.is_empty()
+        };
+        rows.push((
+            "词库编码兼容（UTF-8 · 系统 ANSI/GBK）",
+            ok,
+            format!(
+                "代码页 {} · GBK →「{}」· UTF-8 →「{}」{}",
+                acp,
+                if gbk_text.is_empty() {
+                    "读取失败".to_string()
+                } else {
+                    gbk_text
+                },
+                if utf8_text.is_empty() {
+                    "读取失败".to_string()
+                } else {
+                    utf8_text
+                },
+                if acp == 936 {
+                    ""
+                } else {
+                    "（非中文代码页，只验 UTF-8）"
+                }
+            ),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- 竖版逐列渐变的**容量边界**。
+    //
+    // 排版层的列数上限由窗口宽度决定（`avail_w / col_pitch`），而渲染层的带表
+    // 是定长数组 —— 两者天生不对齐。容量原先写的是 16（按「竖版 4~12 列」估的），
+    // 而 4000×80 这种极端比例能把列数顶到几十：超出的列在过渡里查不到带、
+    // 系数退回 255（满亮），右半边会「不淡入地闪一下」。
+    //
+    // 这条断言做三件事：① 极端版面真的排一遍，量出列数；② 列数超上限时
+    // **截断并给省略号**（跟「窗口装不下」完全一样的收尾，不是静默丢列）；
+    // ③ 带表在超出容量时明确返回 false（而不是悄悄覆盖或越界）。
+    {
+        // 极端：最大窗宽 × 最小窗高 × 超长句。每列只装得下 3 个字，
+        // 600 字 → 200 列，必然撞上排版上限。
+        let text: Vec<char> = "国".repeat(600).chars().collect();
+        let adv = vec![20; text.len()];
+        let m = layout::Metrics::new(20, 20);
+        let q = layout::layout(&text, &adv, m, Orient::Vertical, (0, 0, 4000, 80), 0);
+        let cols = q.col_x.len();
+        // 撞上限时必须走和「窗口装不下」一样的收尾：截断 + 末字省略号
+        let capped = cols == layout::MAX_COLS && q.overflow && q.ellipsis;
+
+        // 带表容量：装满 MAX_BANDS 条之后必须开始拒绝
+        let mut t = gfx::BandTable::empty();
+        let mut accepted = 0usize;
+        for i in 0..(gfx::MAX_BANDS + 8) {
+            let x0 = i as i32 * 10;
+            if t.push(x0, x0 + 10, 100, 100) {
+                accepted += 1;
+            }
+        }
+
+        rows.push((
+            "竖版列数上限（超限截断给省略号 · 带表装得下）",
+            capped && accepted == gfx::MAX_BANDS,
+            format!(
+                "600 字 → {} 列（上限 {} + 出处 1 = 带容量 {}）· 省略号={} · 带表接受 {}/{} 条后拒绝",
+                cols,
+                layout::MAX_COLS,
+                gfx::MAX_BANDS,
+                q.ellipsis,
+                accepted,
+                gfx::MAX_BANDS + 8
+            ),
+        ));
     }
 
     rows.push((
@@ -1389,7 +1632,7 @@ pub(crate) fn selftest() -> i32 {
     // 顺带把「加了一行之后最下面一行跑出窗口」也钉死：面板没有滚动条，
     // 排不下就是看不见。判据直接问布局函数要余量，不是拿放大镜看截图。
     {
-        let expected: [u32; 40] = [
+        let expected: [u32; 42] = [
             MI_CLOCK,
             MI_DATE,
             MI_SECONDS,
@@ -1399,6 +1642,8 @@ pub(crate) fn selftest() -> i32 {
             MI_AUTOHIDE,
             MI_AUTOSTART,
             MI_LAYOUT,
+            MI_PAUSE,
+            MI_FAV_ONLY,
             MI_SHRINK_FIT,
             MI_GLASS,
             MI_TEXT,
@@ -1436,14 +1681,15 @@ pub(crate) fn selftest() -> i32 {
         uniq.sort_unstable();
         uniq.dedup();
         let same = got == expected.to_vec();
-        let margin = config_ui::plan_margin_at_min();
+        let need_h = config_ui::plan_min_height();
+        let slack = config_ui::plan_height_slack();
         let overlap = config_ui::plan_overlaps();
-        let ok = same && uniq.len() == got.len() && margin.is_some() && overlap.is_none();
+        let ok = same && uniq.len() == got.len() && slack >= 0 && overlap.is_none();
         rows.push((
             "设置面板·控件清单（表格即规格）",
             ok,
             format!(
-                "{} 条命令 · 无重复={} · 与期望清单一致={}{} · 最小窗口下底部余量 {}px · 无矩形交叠={}{}",
+                "{} 条命令 · 无重复={} · 与期望清单一致={}{} · 最小窗口高度余量 {:+}px（需要 {}px · 常量 {}px） · 无矩形交叠={}{}",
                 got.len(),
                 uniq.len() == got.len(),
                 same,
@@ -1460,12 +1706,66 @@ pub(crate) fn selftest() -> i32 {
                             .unwrap_or(got.len().min(expected.len()) + 1)
                     )
                 },
-                match margin {
-                    Some(m) => format!("{}", m),
-                    None => "排不下（最后一行会被切掉）".to_string(),
-                },
+                slack,
+                need_h,
+                config_ui::min_track_h(),
                 overlap.is_none(),
                 match &overlap {
+                    Some(m) => format!("（{}）", m),
+                    None => String::new(),
+                }
+            ),
+        ));
+    }
+
+    // ---- ⑥b 设置面板跨屏 DPI：整块界面必须等比换挡
+    //
+    // 面板是 per-monitor DPI aware 进程里的普通窗口，从 100% 屏拖到 150% 屏时
+    // 系统**不做**任何虚拟化放大。布局如果还按同一批物理像素算，界面就缩成
+    // 左上角一小块；只缩终点不缩分段的话，标签和按钮会互相压住。
+    // 这里把布局函数在两个倍率下各排一遍，两种情况都能挡住：
+    //   ① 每个矩形必须**等比**（±1px 取整）；
+    //   ② 放大后仍然装得下、仍然不交叠。
+    {
+        let base = config_ui::plan_rects_at(1.0);
+        let dbl = config_ui::plan_rects_at(2.0);
+        let n = base.len();
+        let same_len = n > 0 && dbl.len() == n;
+        let mut worst = 0i32;
+        let mut scaled_ok = same_len;
+        if same_len {
+            for (a, b) in base.iter().zip(dbl.iter()) {
+                for (bv, av) in [
+                    (b.left, a.left),
+                    (b.top, a.top),
+                    (b.right, a.right),
+                    (b.bottom, a.bottom),
+                ] {
+                    let d = (bv - av * 2).abs();
+                    worst = worst.max(d);
+                    if d > 1 {
+                        scaled_ok = false;
+                    }
+                }
+            }
+        }
+        // 150%：客户区高 640×1.5=960，需求高度也得跟着 ×1.5
+        let client150 = (config_ui::min_track_h() as f32 * 1.5).round() as i32;
+        let need150 = config_ui::plan_need_height_at(1.5);
+        let fit150 = need150 <= client150;
+        let ov150 = config_ui::plan_overlaps_at(1.5);
+        let ok = scaled_ok && fit150 && ov150.is_none();
+        rows.push((
+            "设置面板·跨屏 DPI 等比换挡",
+            ok,
+            format!(
+                "{} 个矩形 · 200% 下最大偏差 {}px（应 ≤1）· 150% 需要 {}px / 客户区 {}px · 无交叠={}{}",
+                n,
+                worst,
+                need150,
+                client150,
+                ov150.is_none(),
+                match &ov150 {
                     Some(m) => format!("（{}）", m),
                     None => String::new(),
                 }
@@ -1967,38 +2267,188 @@ pub(crate) fn selftest() -> i32 {
         }
     }
 
+    // ---- 备份：用户数据唯一的「回滚阀门」。这里要验的不是「复制了几个文件」，
+    // 而是两条承诺：① 同秒连按两次**不覆盖**前一次（目录名递增后缀）；
+    // ② 复制出来的字节和源文件**完全一致**（备份不可信就等于没有备份）。
+    {
+        let base = std::env::temp_dir().join(format!("desk-geyan-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir_all(base.join("quotes"));
+        std::fs::write(base.join("config.ini"), "font=SimSun\nscale=110\n").unwrap();
+        std::fs::write(base.join("quotes.txt"), "甲一 —— A\n").unwrap();
+        std::fs::write(base.join("quotes/02_b.txt"), "乙一 —— B\n").unwrap();
+        std::fs::write(base.join("quotes/favorites.txt"), "丙一 —— C\n").unwrap();
+
+        let first = crate::backup::backup(&base);
+        let second = crate::backup::backup(&base);
+
+        let (ok, detail) = match (&first, &second) {
+            (Ok(p1), Ok(p2)) => {
+                // ① 两次落在不同目录 —— 同一秒内连按也不许互相踩
+                let distinct = p1 != p2;
+                // ② 逐个文件逐字节比对
+                let mut same = 0usize;
+                let mut diff: Vec<String> = Vec::new();
+                for name in ["config.ini", "quotes.txt"] {
+                    let src = std::fs::read(base.join(name)).unwrap_or_default();
+                    let dst = std::fs::read(p1.join(name)).unwrap_or_default();
+                    if src == dst && !src.is_empty() {
+                        same += 1;
+                    } else {
+                        diff.push(name.to_string());
+                    }
+                }
+                for name in ["02_b.txt", "favorites.txt"] {
+                    let src = std::fs::read(base.join("quotes").join(name)).unwrap_or_default();
+                    let dst = std::fs::read(p1.join("quotes").join(name)).unwrap_or_default();
+                    if src == dst && !src.is_empty() {
+                        same += 1;
+                    } else {
+                        diff.push(format!("quotes/{}", name));
+                    }
+                }
+                let manifest = p1.join("BACKUP.txt").is_file();
+                let all_files = same == 4;
+                (
+                    distinct && all_files && manifest,
+                    format!(
+                        "两次备份 → {} / {}（须不同）· 逐字节一致 {}/4{} · BACKUP.txt={}",
+                        p1.file_name().unwrap_or_default().to_string_lossy(),
+                        p2.file_name().unwrap_or_default().to_string_lossy(),
+                        same,
+                        if diff.is_empty() {
+                            String::new()
+                        } else {
+                            format!("（不一致：{}）", diff.join("、"))
+                        },
+                        manifest
+                    ),
+                )
+            }
+            _ => (
+                false,
+                format!("备份失败：{:?}", first.err().or_else(|| second.err())),
+            ),
+        };
+        rows.push(("备份配置与收藏（不覆盖 · 逐字节一致）", ok, detail));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- 诊断报告：菜单项的典型失败方式是「写完是空文件」或「静默没写」，
+    // 两种都不会报错、不会崩，用户在需要它的那一刻才发现没有内容。
+    // 顺带钉一条隐私边界：报告里不许出现格言正文 —— 这份文件是拿来贴给别人的。
+    {
+        let dest = data_dir().join("diagnostics.txt");
+        let existed_before = dest.is_file();
+        let r = crate::app::diagnostics::export(&a);
+        let (ok, detail) = match r {
+            Ok(p) => {
+                let text = std::fs::read_to_string(&p).unwrap_or_default();
+                // 每一节都必须真的落地，缺一段说明某个取值路径坏了
+                let need = [
+                    "desk-geyan 诊断报告",
+                    "版本:",
+                    "窗口:",
+                    "DPI:",
+                    "外观:",
+                    "播放:",
+                    "全屏守卫:",
+                    "资源:",
+                    "错误码:",
+                    "开机自启:",
+                    "词库:",
+                ];
+                let missing: Vec<&str> = need
+                    .iter()
+                    .copied()
+                    .filter(|k| !text.contains(k))
+                    .collect();
+                // 隐私：当前句不许出现在报告里（太短的句子容易误判，跳过）
+                let cur = &a.list[a.qi].text;
+                let leak = cur.chars().count() >= 6 && text.contains(cur.as_str());
+                (
+                    missing.is_empty() && !leak && !text.is_empty(),
+                    format!(
+                        "{} 字节 · {} 节齐全={}{} · 泄漏当前句={}",
+                        text.len(),
+                        need.len() - missing.len(),
+                        missing.is_empty(),
+                        if missing.is_empty() {
+                            String::new()
+                        } else {
+                            format!("（缺少 {}）", missing.join("、"))
+                        },
+                        leak
+                    ),
+                )
+            }
+            Err(e) => (false, format!("导出失败：{}", e)),
+        };
+        rows.push(("诊断报告（各节齐全 · 不泄漏正文）", ok, detail));
+        if !existed_before {
+            let _ = std::fs::remove_file(&dest);
+        }
+    }
+
     // ---- 剪贴板往返。**测前读回、测后恢复** —— selftest 是用户会跑的东西，
-    // 不能把人家剪贴板里的内容吃掉。原内容非文本时恢复不了，
-    // 那一行的判据里如实排除，但在详情里说清楚。
+    // 不能把人家剪贴板里的内容吃掉。没有可读文本（空 / 图片 / 文件列表）时
+    // **完全跳过写入**：这三者在 API 层都表现为「无 CF_UNICODETEXT」，
+    // 而一旦 EmptyClipboard，后两种就永久丢失了。
     {
         let hwnd = a.panel;
         let before = clipboard::get_text(hwnd);
-        const PROBE_TEXT: &str = "桌面格言 · 剪贴板往返自检";
-        let wrote = clipboard::copy_text(hwnd, PROBE_TEXT);
-        let back = clipboard::get_text(hwnd);
-        let roundtrip = wrote && back.as_deref() == Some(PROBE_TEXT);
-        rows.push((
-            "剪贴板往返（写 → 读 → 逐字相等）",
-            roundtrip,
-            format!(
-                "写入 {} · 读回 {}",
-                if wrote { "成功" } else { "失败" },
-                match &back {
-                    Some(s) => format!("「{}」", s),
-                    None => "空 / 非文本".to_string(),
-                }
-            ),
-        ));
-        // 恢复
-        let (restored, note) = match &before {
-            Some(s) => (clipboard::copy_text(hwnd, s), "原内容为文本，已原样恢复"),
-            None => (true, "原内容非文本或为空，无法恢复（如实报告）"),
-        };
-        rows.push((
-            "剪贴板原内容恢复",
-            restored,
-            format!("{} · 恢复 {}", note, if restored { "完成" } else { "失败" }),
-        ));
+        if let Some(before_text) = before {
+            const PROBE_TEXT: &str = "桌面格言 · 剪贴板往返自检";
+            let wrote = clipboard::copy_text(hwnd, PROBE_TEXT);
+            let back = clipboard::get_text(hwnd);
+            let roundtrip = wrote && back.as_deref() == Some(PROBE_TEXT);
+            rows.push((
+                "剪贴板往返（写 → 读 → 逐字相等）",
+                roundtrip,
+                format!(
+                    "写入 {} · 读回 {}",
+                    if wrote { "成功" } else { "失败" },
+                    match &back {
+                        Some(s) => format!("「{}」", s),
+                        None => "空 / 非文本".to_string(),
+                    }
+                ),
+            ));
+            let restored = clipboard::copy_text(hwnd, &before_text);
+            rows.push((
+                "剪贴板原内容恢复",
+                restored,
+                format!(
+                    "原内容为文本，已原样恢复 · 恢复 {}",
+                    if restored { "完成" } else { "失败" }
+                ),
+            ));
+        } else if clipboard::has_text() {
+            // 格式挂在那里、内容却读不出来（GlobalLock 失败或长度为 0）。
+            // 这跟「剪贴板本来就是空的」是两件事：后者可以跳过，前者是缺陷。
+            rows.push((
+                "剪贴板往返（写 → 读 → 逐字相等）",
+                false,
+                "剪贴板声明含 CF_UNICODETEXT，但 get_text 读不出内容（读取路径有缺陷）"
+                    .to_string(),
+            ));
+            rows.push((
+                "剪贴板原内容恢复",
+                true,
+                "无需恢复：未执行任何剪贴板写入".to_string(),
+            ));
+        } else {
+            rows.push((
+                "剪贴板往返（写 → 读 → 逐字相等）",
+                true,
+                "跳过：当前剪贴板没有可读取的文本（不触碰图片 / 文件列表）".to_string(),
+            ));
+            rows.push((
+                "剪贴板原内容恢复",
+                true,
+                "无需恢复：未执行任何剪贴板写入".to_string(),
+            ));
+        }
     }
 
     // ================================================================
@@ -2148,6 +2598,45 @@ pub(crate) fn selftest() -> i32 {
             format!("关掉时 {}% · 打开时 {}%（250% 字号下）", off, on),
         ));
 
+        // ---- ③b 旋转字体必须跟着缩字档一起缩
+        //
+        // 竖版里 `——` / `……` 靠 `lfEscapement = 900` 画成竖的一条，用的是
+        // **另一支字体对象**。它曾经只有 100% 一支：正文缩到 85%/70% 之后，
+        // 破折号仍是原字号，横贯整列、压住上下两个字 —— 而且只在
+        // 「竖版 + 长句 + 缩字」三件事同时成立时出现，平时看不见。
+        //
+        // 判据是 GDI 读回来的 `tmHeight`（不是创建时传的 px —— 那只是申请值）。
+        // **不能要求严格相等**：带 `lfEscapement` 的字形取整方式不同，
+        // 实测同档旋转字恒定比正文高 1px（65/55/46 对 66/56/47）。
+        // 所以给「2px 或 5%」的容差 —— 而真出 bug 时差的是整套档位
+        // （100% 的 65 对上 70% 的 46，差 19px），照样一枪打死。
+        {
+            let th: Vec<(i32, i32)> = (0..gfx::QUOTE_SHRINK_STEPS.len())
+                .map(|k| {
+                    (
+                        gfx::font_height(a.fonts.quote_at(k)),
+                        gfx::font_height(a.fonts.quote_rot_at(k)),
+                    )
+                })
+                .collect();
+            let same = th
+                .iter()
+                .all(|&(t, r)| t > 0 && (t - r).abs() <= 2.max(t / 20));
+            // 三档之间真的递减，否则「缩字档」名存实亡
+            let shrink = th[0].0 > th[1].0 && th[1].0 > th[2].0;
+            rows.push((
+                "排版·旋转字体跟随缩字档",
+                same && shrink,
+                format!(
+                    "100%/85%/70% 正文 {:?} · 旋转 {:?} · 同档等高={} · 逐档递减={}",
+                    th.iter().map(|p| p.0).collect::<Vec<_>>(),
+                    th.iter().map(|p| p.1).collect::<Vec<_>>(),
+                    same,
+                    shrink
+                ),
+            ));
+        }
+
         // ---- ④ 竖版：主文竖排、列序自右向左、字形不越出窗口
         a.cfg = Config::default();
         a.cfg.set_orient(Orient::Vertical);
@@ -2209,7 +2698,7 @@ pub(crate) fn selftest() -> i32 {
             };
             ql.glyphs
                 .iter()
-                .position(|g| g.ch == 0xFF0C)
+                .position(|g| g.ch == '，')
                 .and_then(|i| (i > 0).then(|| (ql.glyphs[i], ql.glyphs[i - 1])))
                 .map(|(dot, prev)| step > 0 && dot.y < prev.y + step && dot.x > prev.x)
                 .unwrap_or(false)
@@ -2219,7 +2708,7 @@ pub(crate) fn selftest() -> i32 {
             comma_ok,
             format!(
                 "「，」共 {} 个字形",
-                ql.glyphs.iter().filter(|g| g.ch == 0xFF0C).count()
+                ql.glyphs.iter().filter(|g| g.ch == '，').count()
             ),
         ));
 
@@ -2244,7 +2733,7 @@ pub(crate) fn selftest() -> i32 {
             && ql
                 .glyphs
                 .iter()
-                .all(|g| g.ch != 0x2014 && g.ch != 0x9646); // —— 与「陆」都不在主文
+                .all(|g| g.ch != '—' && g.ch != '陆'); // —— 与「陆」都不在主文
         rows.push((
             "竖版·主文不带出处（署名归落款条）",
             attr_stripped,
@@ -2252,7 +2741,7 @@ pub(crate) fn selftest() -> i32 {
                 "正文 {} 字 / 画出 {} 字形 / 竖杠 {} 个",
                 want_chars,
                 ql.len(),
-                ql.glyphs.iter().filter(|g| g.ch == 0x2014).count()
+                ql.glyphs.iter().filter(|g| g.ch == '—').count()
             ),
         ));
         let breaks_ok = ql.col_ranges.len() == 2
@@ -2264,7 +2753,7 @@ pub(crate) fn selftest() -> i32 {
             "竖版·断句收在句读后（一句一列）",
             breaks_ok,
             format!(
-                "{} 列 · 列末字 {:04X?}",
+                "{} 列 · 列末字 {:?}",
                 ql.col_ranges.len(),
                 ql.col_ranges
                     .iter()
@@ -2427,6 +2916,122 @@ pub(crate) fn selftest() -> i32 {
             0
         });
         rows.push(("配置四端一致（orient / 字距 / 格言色）", rt_ok, rt_detail));
+
+        // ---- ① 配置写入的**原子性**：写一半断电 / 磁盘满会在旧实现里留下
+        // 一个截断的 config.ini，下次启动解析失败 → 位置、字体、DPI 全回默认。
+        // 现在走「临时文件 + sync + 改名」，这里验的是它的两个可观察后果：
+        //   · 写完不该残留 .tmp（残留说明改名失败过，且下次可能被误读）
+        //   · 落盘的字段能逐项读回（不是「文件存在」就算过）
+        {
+            let (mut atom_ok, mut atom_detail) = (false, String::new());
+            with_config_guard(|| {
+                let c = Config {
+                    x: 1234,
+                    y: 567,
+                    opacity: 187,
+                    font: "SimSun".to_string(),
+                    paused: true,
+                    fav_only: true,
+                    dpi: 144,
+                    orient: Orient::Vertical,
+                    ..Config::default()
+                };
+                c.save();
+
+                let err = config::last_save_err();
+                let tmp = Config::path().with_extension("ini.tmp");
+                let leftover = tmp.exists();
+                let back = Config::load();
+                let same = back.x == 1234
+                    && back.y == 567
+                    && back.opacity == 187
+                    && back.font == "SimSun"
+                    && back.paused
+                    && back.fav_only
+                    && back.dpi == 144
+                    && back.orient == Orient::Vertical;
+                atom_ok = err == 0 && !leftover && same;
+                atom_detail = format!(
+                    "错误码={} · .tmp 残留={} · 回读一致={}（x={} y={} 不透明度={} dpi={}）",
+                    err, leftover, same, back.x, back.y, back.opacity, back.dpi
+                );
+                0
+            });
+            rows.push(("配置原子写入（无 .tmp 残留 · 可原样读回）", atom_ok, atom_detail));
+        }
+
+        // ---- ② 写入**失败**必须留下痕迹。旧实现是 `let _ = fs::write(...)`，
+        // 磁盘满 / 只读目录 / 被杀毒锁住时全都不吭声 —— 用户改完设置重启发现
+        // 白改了，还以为程序没记住。这里把 `.tmp` 占成一个目录，让
+        // `File::create` 必然失败，再断言错误码非 0。
+        {
+            let tmp = Config::path().with_extension("ini.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_dir_all(&tmp);
+
+            let mut blocked = false;
+            let mut got = 0u32;
+            with_config_guard(|| {
+                blocked = std::fs::create_dir_all(&tmp).is_ok();
+                let c = Config {
+                    x: 4321, // 若真的写进去，guard 也会恢复
+                    ..Config::default()
+                };
+                c.save();
+                got = config::last_save_err();
+                0
+            });
+            let _ = std::fs::remove_dir_all(&tmp);
+
+            rows.push((
+                "配置写入失败会被记下来（不是静默的 ok）",
+                blocked && got != 0,
+                format!(
+                    "阻断手段生效={} · last_save_err={}（须非 0）",
+                    blocked, got
+                ),
+            ));
+        }
+
+        // ---- ⑥ DPI 单位换算：窗口 API 给 96 基准原始值，cfg.dpi 存百分数。
+        // 这条是实测抓到的缺陷：三处调用都直接把 144 当成「144%」存下去，
+        // 于是 150% 屏静默按 144% 排版、100% 屏按 96% —— 各差 4%，
+        // 肉眼看不出来，但「跟随 DPI」永远差一截，且窗口放大倍数不是 1.5。
+        {
+            let cases = [(96, 100), (120, 125), (144, 150), (192, 200), (288, 300)];
+            let mut bad = Vec::new();
+            for (raw, want) in cases {
+                let got = crate::ffi::dpi_pct(raw);
+                if got != want {
+                    bad.push(format!("{raw}→{got}（应 {want}）"));
+                }
+            }
+            // 换算完再经 eff_scale_pct 走一遍：scale=100 + 150% 屏 ⇒ 150%
+            let mut c = Config {
+                dpi_auto: true,
+                dpi: 150,
+                scale: 100,
+                ..Config::default()
+            };
+            let eff = c.eff_scale_pct();
+            if eff != 150 {
+                bad.push(format!("scale=100 + dpi=150 得 {eff}%（应 150%）"));
+            }
+            // 关掉跟随必须回到纯 scale，不留 4% 的尾巴
+            c.dpi_auto = false;
+            if c.eff_scale_pct() != 100 {
+                bad.push(format!("关掉跟随仍得 {}%（应 100%）", c.eff_scale_pct()));
+            }
+            rows.push((
+                "DPI 单位换算（原始 DPI → 百分比）",
+                bad.is_empty(),
+                if bad.is_empty() {
+                    "96→100 / 144→150 / 192→200 / 288→300 · 150% 屏 eff=150% · 关跟随回到 100%".into()
+                } else {
+                    bad.join(" · ")
+                },
+            ));
+        }
 
         // 恢复现场
         a.cfg = saved_cfg;

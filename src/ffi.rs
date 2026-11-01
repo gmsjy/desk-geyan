@@ -11,9 +11,10 @@
 //!   这个在 user32.lib 里有，正常链接即可。
 
 use std::ffi::c_void;
+use std::ptr::null_mut;
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::BOOL;
+use windows_sys::Win32::Foundation::{BOOL, RECT};
 /// 重新导出：剪贴板 / 注册表的自持 FFI 签名要出现在 `pub` 位置上，
 /// 私有 `use` 的类型不能写在 `pub fn` 的参数里（E0603）。
 pub use windows_sys::Win32::Foundation::HWND;
@@ -100,6 +101,69 @@ pub fn print_window(hwnd: HWND, hdc: HDC, flags: u32) -> bool {
     }
 }
 
+/// 原始 DPI → 百分比（96 = 100%）。
+///
+/// **单位只在这里换一次**。`GetDpiForWindow` / `GetDpiForSystem` /
+/// `WM_DPICHANGED` 给的都是 96 基准的原始值（150% 屏 = 144），而
+/// `Config::dpi` 存的是百分数（150）。两边不换算的话 150% 屏会静默按
+/// 144% 排版、100% 屏按 96% 排版 —— 各差 4%，肉眼看不出来，但
+/// 「跟随 DPI」这个功能就永远差一截，且缩放倍率不再是整数比。
+pub fn dpi_pct(raw: i32) -> i32 {
+    if raw <= 0 {
+        return 100;
+    }
+    ((raw as i64 * 100 / 96) as i32).clamp(48, 480)
+}
+
+type GetDpiForWindowFn = unsafe extern "system" fn(HWND) -> u32;
+
+/// `GetDpiForWindow` —— Win10 1607+ 才有，所以走运行时解析（同 PrintWindow 的理由）。
+///
+/// 返回 `None` 表示系统没有这个入口；调用方据此退回 96（=「不按 DPI 缩放」，
+/// 与旧行为完全一致）。**不要**用 `GetDeviceCaps(LOGPIXELSX)` 顶替：
+/// 后者对每个进程返回同一个值，在每显示器 DPI 的进程里是错的。
+pub fn dpi_for_window(hwnd: HWND) -> Option<i32> {
+    static CACHE: OnceLock<Option<GetDpiForWindowFn>> = OnceLock::new();
+    let f = *CACHE.get_or_init(|| unsafe {
+        let name = crate::util::wide("user32.dll");
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        GetProcAddress(module, c"GetDpiForWindow".as_ptr() as *const u8)
+            .map(|a| std::mem::transmute::<_, GetDpiForWindowFn>(a))
+    });
+    let dpi = match f {
+        Some(f) => unsafe { f(hwnd) },
+        None => 0,
+    };
+    (dpi > 0).then_some(dpi as i32)
+}
+
+/// `GetDpiForSystem`（Win10 1607+）：**还没有窗口时**的 DPI 来源。
+///
+/// 首次运行要按 DPI 定初始尺寸，而那时候窗口还没建出来。拿系统 DPI 是个
+/// 足够好的近似：新装第一眼落在主屏上的概率远大于别的屏，之后
+/// `window_dpi()` 会按**实际所在那块屏**再校正一次。
+pub fn dpi_for_system() -> Option<i32> {
+    type Fn = unsafe extern "system" fn() -> u32;
+    static CACHE: OnceLock<Option<Fn>> = OnceLock::new();
+    let f = *CACHE.get_or_init(|| unsafe {
+        let name = crate::util::wide("user32.dll");
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        GetProcAddress(module, c"GetDpiForSystem".as_ptr() as *const u8)
+            .map(|a| std::mem::transmute::<_, Fn>(a))
+    });
+    let dpi = match f {
+        Some(f) => unsafe { f() },
+        None => 0,
+    };
+    (dpi > 0).then_some(dpi as i32)
+}
+
 #[link(name = "user32")]
 extern "system" {
     /// 传入 `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`（= -4）
@@ -107,6 +171,40 @@ extern "system" {
 
     /// V2 不可用时的降级（Win7 / Win8.1）
     pub fn SetProcessDPIAware();
+}
+
+/// `AdjustWindowRectExForDpi`（Win10 1607+）：按**指定 DPI** 换算窗口与客户区。
+///
+/// 老版本 `AdjustWindowRectEx` 用的是系统 DPI，而本进程是 per-monitor aware ——
+/// 在 150% / 200% 屏上，标题栏和边框比 96 基准高出一截。拿 96 的结果当
+/// 「最小跟踪尺寸」交出去，用户仍然能把窗口缩到比规格更小：缩完最后一行的
+/// 勾选框就没了，而且自检按客户区算、看不出来。
+///
+/// 系统没有这个入口时返回 `None`，调用方退回 `AdjustWindowRectEx`
+/// （行为与旧版一致，不因为老系统而拒绝启动）。
+pub fn adjust_window_rect_for_dpi(
+    rc: &mut RECT,
+    style: u32,
+    ex_style: u32,
+    menu: BOOL,
+    dpi: u32,
+) -> Option<()> {
+    type Fn = unsafe extern "system" fn(*mut RECT, u32, BOOL, u32, u32) -> BOOL;
+    static CACHE: OnceLock<Option<Fn>> = OnceLock::new();
+    let f = *CACHE.get_or_init(|| unsafe {
+        let name = crate::util::wide("user32.dll");
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        GetProcAddress(module, c"AdjustWindowRectExForDpi".as_ptr() as *const u8)
+            .map(|a| std::mem::transmute::<_, Fn>(a))
+    });
+    let f = f?;
+    if unsafe { f(rc, style, menu, ex_style, dpi) } == 0 {
+        return None;
+    }
+    Some(())
 }
 
 /// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`
@@ -134,7 +232,49 @@ extern "system" {
     pub fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
     pub fn GlobalLock(hmem: *mut c_void) -> *mut c_void;
     pub fn GlobalUnlock(hmem: *mut c_void) -> BOOL;
+    pub fn GlobalSize(hmem: *mut c_void) -> usize;
     pub fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        s: *const u8,
+        cb: i32,
+        buf: *mut u16,
+        cch: i32,
+    ) -> i32;
+    /// 当前系统 ANSI 代码页（中文 Windows = 936）。自检用它决定
+    /// 「GBK 回退」这条断言能不能严格判（别的区域设置下当然解不出汉字）。
+    pub fn GetACP() -> u32;
+}
+
+/// 系统的 ANSI 代码页（中文 Windows 上就是 GBK/936）。
+const CP_ACP: u32 = 0;
+
+/// 按系统 ANSI 代码页把字节解成字符串。
+///
+/// **为什么需要它**：词库文档让用户「用记事本存一份 quotes.txt」，而中文
+/// Windows 的记事本「另存为」默认编码是 ANSI(GBK)。用 `read_to_string`
+/// 读这种文件会直接失败 —— 整个文件被静默跳过，用户看到的是「我明明写了，
+/// 一条都没生效」。这不是猜测：`--quotes` 的报错里「解析失败」这一档，
+/// 绝大多数就是这个原因。
+///
+/// 解不开（真正的二进制垃圾）返回 `None`，由调用方报错。
+pub fn ansi_to_string(bytes: &[u8]) -> Option<String> {
+    let cb = i32::try_from(bytes.len()).ok()?;
+    if cb == 0 {
+        return Some(String::new());
+    }
+    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), cb, null_mut(), 0) };
+    if n <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; n as usize];
+    let m = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), cb, buf.as_mut_ptr(), n) };
+    if m <= 0 {
+        return None;
+    }
+    buf.truncate(m as usize);
+    String::from_utf16(&buf).ok()
 }
 
 // ---------------------------------------------------------------- 注册表

@@ -3,7 +3,7 @@
 //! 每个入口都是**可独立运行的 CLI**（`--selftest` / `--probe` / `--dump` ...），
 //! 断言一律带可读的诊断串；新增断言必须先注毒变红才算数。
 //!
-//! 分三个文件：`selftest.rs`（64 条自检）、`bench.rs`（性能 / 拖动 / 内存标定）、
+//! 分三个文件：`selftest.rs`（78 条自检）、`bench.rs`（性能 / 拖动 / 内存标定）、
 //! 本文件（探测、单帧导出、穿透与收藏的端到端实测）。
 
 mod bench;
@@ -65,7 +65,7 @@ fn cfg_fingerprint(a: &App) -> String {
     let c = &a.cfg;
     format!(
         "clock={clock} date={date} quote={quote} shadow={shadow} sec={sec} top={top} \
-         autohide={autohide} layout={layout} shrink={shrink} mode={mode} anim={anim} \
+         autohide={autohide} layout={layout} paused={paused} fav={fav} shrink={shrink} mode={mode} anim={anim} \
          orient={orient} op={op} spd={spd} scale={scale} cs={cs} qs={qs} sp={sp} \
          col={col:06X} dcol={dcol:06X} qcol={qcol:06X} font={font}",
         clock = c.show_clock,
@@ -76,6 +76,8 @@ fn cfg_fingerprint(a: &App) -> String {
         top = c.always_on_top,
         autohide = c.auto_hide_fs,
         layout = c.layout_mode,
+        paused = c.paused,
+        fav = c.fav_only,
         shrink = c.shrink_fit,
         mode = c.mode.label(),
         anim = c.anim.key(),
@@ -567,7 +569,9 @@ fn probe_inner() -> i32 {
                 ("提示", a.fonts.hint),
                 ("格言85%", a.fonts.quote_fit[0]),
                 ("格言70%", a.fonts.quote_fit[1]),
-                ("竖排旋转", a.fonts.quote_rot),
+                ("竖排旋转100%", a.fonts.quote_rot[0]),
+                ("竖排旋转85%", a.fonts.quote_rot[1]),
+                ("竖排旋转70%", a.fonts.quote_rot[2]),
             ];
             let missing: Vec<&str> = hs
                 .iter()
@@ -922,6 +926,105 @@ fn probe_inner() -> i32 {
                     _ => (R::Info, "PrintWindow 不可用，未抓取".to_string()),
                 };
                 rows.push(("设置面板截图", kind, detail));
+            }
+
+            // ---- 设置面板跨屏 DPI：真发一条 WM_DPICHANGED，走完整条路径
+            //
+            // 自检里那条「跨屏 DPI 等比换挡」验的是布局函数（纯函数），
+            // 这一条验**接线**：窗口过程有没有接住这个状态、字体有没有按新字号
+            // 重建、控件有没有重新摆位、换回来能不能原样回去。
+            // 没有双屏也能测 —— 系统对它的定义就是「新 DPI + 一个建议矩形」。
+            //
+            // 基准取 **100%**（不是「打开时的 DPI」）：开发机上系统 DPI 可能是
+            // 125 / 150，拿它当基准的话 1.5 倍就变成 1.25 倍，判据得跟着飘。
+            // 固定成 100% 之外的两点（200% / 150%），倍率才是确定的。
+            {
+                let home = config_ui::test_dpi(a);
+                // GDI 计数：每换一次档都要「删旧字体 + 建新字体」，
+                // 漏删的话这里会一路涨上去（而面板一关就再也看不出来了）。
+                let gdi0 = crate::ffi::gui_resources().map(|r| r.0);
+                let base = config_ui::test_dpi_change(a, 100);
+                let base_rc = config_ui::test_ctl_rects(a);
+                let dbl = config_ui::test_dpi_change(a, 200);
+                let dbl_rc = config_ui::test_ctl_rects(a);
+                let _ = config_ui::test_dpi_change(a, 150);
+                let half_rc = config_ui::test_ctl_rects(a);
+                let back = config_ui::test_dpi_change(a, home);
+                let back_rc = config_ui::test_ctl_rects(a);
+
+                let n = base_rc.len();
+                let same_n = n > 0 && dbl_rc.len() == n && half_rc.len() == n;
+
+                // ① 客户区跟着倍率走（100% → 200% 恰好翻倍）
+                let mut worst_c = 0i32;
+                let mut grew = false;
+                if let (Some((w0, h0)), Some((w1, h1))) = (base, dbl) {
+                    worst_c = (w1 - 2 * w0).abs().max((h1 - 2 * h0).abs());
+                    grew = worst_c <= 2;
+                }
+
+                // ② 控件矩形等比：200% 恰好 2 倍、150% 恰好 1.5 倍（±1px 取整），
+                //    并且全部落在客户区内
+                let mut worst = 0i32;
+                let mut inner = true;
+                if same_n {
+                    let (cw, ch) = dbl.unwrap_or((0, 0));
+                    for i in 0..n {
+                        let (b, d, h) = (base_rc[i], dbl_rc[i], half_rc[i]);
+                        for (dv, hv, bv) in [
+                            (d.left, h.left, b.left),
+                            (d.top, h.top, b.top),
+                            (d.right, h.right, b.right),
+                            (d.bottom, h.bottom, b.bottom),
+                        ] {
+                            let e2 = (dv - bv * 2).abs();
+                            let e15 = (hv - (bv as f32 * 1.5).round() as i32).abs();
+                            worst = worst.max(e2).max(e15);
+                        }
+                        if d.left < 0 || d.top < 0 || d.right > cw || d.bottom > ch {
+                            inner = false;
+                        }
+                    }
+                }
+                let scaled = same_n && worst <= 1;
+
+                // ③ 回到出发时的 DPI，矩形必须与 100% 基准**成同一比例**，且
+                //    客户区回到出发时的尺寸 —— 缩放是可逆的，不是单向的
+                let mut worst_back = 0i32;
+                if same_n && back_rc.len() == n {
+                    let kr = home as f32 / 100.0;
+                    for i in 0..n {
+                        let (b, r) = (base_rc[i], back_rc[i]);
+                        for (rv, bv) in [
+                            (r.left, b.left),
+                            (r.top, b.top),
+                            (r.right, b.right),
+                            (r.bottom, b.bottom),
+                        ] {
+                            worst_back =
+                                worst_back.max((rv - (bv as f32 * kr).round() as i32).abs());
+                        }
+                    }
+                }
+                let restored = back.is_some() && back_rc.len() == n && worst_back <= 1;
+
+                let gdi1 = crate::ffi::gui_resources().map(|r| r.0);
+                let no_leak = match (gdi0, gdi1) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => true, // 老系统拿不到计数，不假装验过
+                };
+
+                let ok = grew && scaled && inner && restored && no_leak;
+                rows.push((
+                    "设置面板·跨屏 DPI（真发 WM_DPICHANGED）",
+                    if ok { R::Pass } else { R::Fail },
+                    format!(
+                        "基准 {:?}@100% → 200% {:?}（客户区偏差 {}px）→ 150% → 回 {}%{:?} · 控件 {} 个 · 矩形等比偏差 {}px · 全在客户区内={} · 复位偏差 {}px · GDI {}→{}",
+                        base, dbl, worst_c, home, back, n, worst, inner, worst_back,
+                        gdi0.map(|v| v as i64).unwrap_or(-1),
+                        gdi1.map(|v| v as i64).unwrap_or(-1)
+                    ),
+                ));
             }
 
             config_ui::close(a);

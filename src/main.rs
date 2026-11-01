@@ -3,6 +3,7 @@
 
 mod app;
 mod autostart;
+mod backup;
 mod bench;
 mod clipboard;
 mod config;

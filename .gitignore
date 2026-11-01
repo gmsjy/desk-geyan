@@ -3,3 +3,5 @@
 /target-shot
 /target-before
 /dist
+# 本地工作记录（会话记忆 / 待办），不进仓库
+/.workbuddy

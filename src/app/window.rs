@@ -77,14 +77,59 @@ pub(crate) fn work_area_at(x: i32, y: i32, w: i32) -> (RECT, RECT) {
     }
 }
 
+/// 把窗口尺寸夹进「挂件所在屏」的工作区，并把位置收回可视范围。
+///
+/// # 尺寸上限就是工作区（这次修的 P1-D）
+///
+/// 旧实现只夹**下界**（`MIN_W` / `MIN_H`），上界写的是 `wa.right.max(320)` ——
+/// 两个毛病叠在一起：
+///   * 它拿的是工作区的**绝对右坐标**而不是宽度。副屏在右边时（`wa.left=2560`）
+///     「最大宽度」变成 4480，而那块屏只有 1920 宽 —— 夹取形同虚设；
+///   * 缩放拖动（`Grab::Edge`）根本不走这里，只夹最小值。于是用户能把窗口
+///     拖成 2926px 宽（屏只有 2560），而 `clamp_keep_visible` 只保证 80px
+///     可见 ⇒ 右半边永远在屏外，且**立刻写进配置**，下次启动照样出来。
+///
+/// 超出时**按比例缩**而不是硬砍：硬砍会把版式比例拉歪（横版变竖条），
+/// 同比缩至少保住用户调出来的长宽比。
 pub(crate) fn clamp_to_work_area(cfg: &mut Config) {
     let (wa, _) = work_area_at(cfg.x, cfg.y, cfg.w);
-    cfg.w = cfg.w.clamp(MIN_W, wa.right.max(320));
-    cfg.h = cfg.h.clamp(MIN_H, wa.bottom.max(160));
+    let avail_w = (wa.right - wa.left).max(MIN_W);
+    let avail_h = (wa.bottom - wa.top).max(MIN_H);
+    if cfg.w > avail_w || cfg.h > avail_h {
+        let k = (avail_w as f32 / cfg.w.max(1) as f32)
+            .min(avail_h as f32 / cfg.h.max(1) as f32);
+        cfg.w = ((cfg.w as f32 * k).round() as i32).clamp(MIN_W, avail_w);
+        cfg.h = ((cfg.h as f32 * k).round() as i32).clamp(MIN_H, avail_h);
+    } else {
+        cfg.w = cfg.w.clamp(MIN_W, avail_w);
+        cfg.h = cfg.h.clamp(MIN_H, avail_h);
+    }
     // 至少留 80px 在屏幕内，避免用户把窗口拖到找不回来的地方
     let (x, y) = clamp_keep_visible(cfg.x, cfg.y, cfg.w);
     cfg.x = x;
     cfg.y = y;
+}
+
+/// 当前窗口能长到的最大尺寸（工作区大小）。缩放拖动与 `clamp_to_work_area`
+/// 共用这一份判据，免得「拖的时候能到 3000、重启后被夹回 2560」这种两套标准。
+pub(crate) fn resize_limits(cfg: &Config) -> (i32, i32) {
+    let (wa, _) = work_area_at(cfg.x, cfg.y, cfg.w);
+    (
+        (wa.right - wa.left).max(MIN_W),
+        (wa.bottom - wa.top).max(MIN_H),
+    )
+}
+
+/// 这个窗口所在显示器的 DPI **百分比**（100 = 100%）。
+///
+/// `GetDpiForWindow` 返回的是 96 基准的原始值（150% 屏 = 144），
+/// 经 `ffi::dpi_pct` 换成百分数 —— `cfg.dpi` 用的就是百分数。
+/// 拿不到就退回 96（= 100%，等价于「不缩放」，与旧行为一致）。
+pub(crate) fn window_dpi(hwnd: HWND) -> i32 {
+    if hwnd.is_null() {
+        return 100;
+    }
+    crate::ffi::dpi_pct(crate::ffi::dpi_for_window(hwnd).unwrap_or(96))
 }
 
 // ---------------------------------------------------------------- 建窗
@@ -365,8 +410,18 @@ pub(crate) fn request_move(a: &mut App, x: i32, y: i32) {
 /// 文字层分两种：
 /// * **只挪位置** → `UpdateLayeredWindow`。实测 ~91µs，比 `SetWindowPos` 的
 ///   ~206µs 快一倍多（理由见 `MoveWay`）。
-/// * **要改尺寸** → 退回 `SetWindowPos`。ULW 会把窗口尺寸一起定成帧缓冲的尺寸，
-///   而这时候帧缓冲还没按新尺寸重建，两边会打架；等下一帧重绘再把新尺寸提交上去。
+/// * **要改尺寸** → **这一拍什么都不做**，交给下一帧的 `present`。
+///
+/// # 为什么改尺寸时不能先 `SetWindowPos` 文字层
+///
+/// 分层窗口的像素归 DWM 持有，`SetWindowPos` 只能改**窗口**尺寸，改不了
+/// 那块表面 —— 于是从「改尺寸」到「下一帧画好」之间的那 8~40ms 里，
+/// 窗口已经是新尺寸、内容还是旧尺寸：新露出来的区域是空的，超出新边界的
+/// 部分被裁掉。用户看到的就是「一拖文字先没了」（老板报的就是这个）。
+///
+/// `UpdateLayeredWindow` 是**位置 + 尺寸 + 内容一起提交**的，所以正确顺序是
+/// 「先算好这一帧，再一次性交上去」—— 文字层永远不会出现「尺寸和内容对不上」
+/// 的中间态，代价只是拖动期间文字比边框慢一个 8ms 节拍（肉眼几乎不可见）。
 pub(crate) fn apply_geometry(a: &mut App, resize: bool, force: bool) {
     if !force && a.last_move.elapsed().as_millis() < a.move_throttle {
         return;
@@ -383,12 +438,20 @@ pub(crate) fn apply_geometry(a: &mut App, resize: bool, force: bool) {
         SetWindowPos(a.panel, null_mut(), x, y, dw, dh, flags);
         match a.move_way {
             MoveWay::Swp => {
+                // 只给 `--dragbench` 做 A/B：这条路会有上面说的「尺寸先变、
+                // 内容后到」的中间态，生产默认不走它。
                 SetWindowPos(a.text, null_mut(), x, y, dw, dh, flags);
             }
             MoveWay::Ulw => {
-                if resize {
-                    SetWindowPos(a.text, null_mut(), x, y, dw, dh, flags);
-                } else {
+                if !resize {
+                    let hwnd = a.text;
+                    a.frame.present(hwnd, x, y);
+                } else if a.frame.w == w && a.frame.h == h {
+                    // 帧缓冲**已经**就是目标尺寸（典型场景：只是挪位置、
+                    // 或上一帧刚按这个尺寸画过）⇒ 位置和尺寸可以一起提交，
+                    // 内容与窗口尺寸天然一致，不会出现「窗口变大、字还在原位」。
+                    // 只有「帧缓冲尺寸 ≠ 目标尺寸」时才是真的要先重画，
+                    // 那种情况留给下一帧的 `present`（见上文）。
                     let hwnd = a.text;
                     a.frame.present(hwnd, x, y);
                 }

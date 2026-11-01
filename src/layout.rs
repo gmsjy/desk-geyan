@@ -30,7 +30,11 @@ use crate::config::Orient;
 /// 一个字符画在哪。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Glyph {
-    pub ch: u16,
+    /// Unicode 标量值，而不是 UTF-16 code unit。
+    ///
+    /// 用 `u16` 会把非 BMP 字符（emoji、部分生僻字）的代理对拆成两个字形，
+    /// 竖排时各自 `TextOutW` 一次，结果两个都是无效半字。
+    pub ch: char,
     pub x: i32,
     pub y: i32,
     /// 需要旋转 90°（竖版下的 `——` 与 `……`）。阶段四才会真正用到。
@@ -254,36 +258,48 @@ const VERT_ROT: &[u16] = &[
     0x2026, // …
 ];
 
-const ELLIPSIS: u16 = 0x2026; // …
+const ELLIPSIS: char = '…';
 
-pub fn no_start(c: u16) -> bool {
-    NO_START.contains(&c)
+/// 竖版最多切几列。
+///
+/// **不是排版偏好，是渲染层的硬约束**：竖版入场/退场按列分带做渐变，
+/// 带表是定长数组（`gfx::MAX_BANDS`）。几何上能装多少列由窗口决定 ——
+/// 4000px 宽配最小字宽能装 170 多列 —— 而带表装不下的那部分列
+/// 会「查不到带 = 系数 255 = 满亮」，症状是过渡时右半边闪一下。
+///
+/// 所以在这里截断：触到上限与触到窗口右缘的处理完全一样（末字换省略号）。
+/// 127 + 1 条出处带 = `gfx::MAX_BANDS`；两者由 `--selftest` 的一条断言钉在一起，
+/// 只改一边会立刻红。
+pub const MAX_COLS: usize = 127;
+
+pub fn no_start(c: char) -> bool {
+    NO_START.contains(&(c as u16))
 }
 /// 句读收尾符：竖版断列优先收在它们**后面**（仿古排版「一句一列」的节奏）。
-pub fn clause_end(c: u16) -> bool {
+pub fn clause_end(c: char) -> bool {
     matches!(
         c,
-        0xFF0C | // ，
-        0x3002 | // 。
-        0x3001 | // 、
-        0xFF1B | // ；
-        0xFF1A | // ：
-        0xFF1F | // ？
-        0xFF01 | // ！
-        0x2026 | // …
-        0x300D | // 」
-        0x300F | // 』
-        0xFF09 // ）
+        '\u{FF0C}' | // ，
+        '\u{3002}' | // 。
+        '\u{3001}' | // 、
+        '\u{FF1B}' | // ；
+        '\u{FF1A}' | // ：
+        '\u{FF1F}' | // ？
+        '\u{FF01}' | // ！
+        '\u{2026}' | // …
+        '\u{300D}' | // 」
+        '\u{300F}' | // 』
+        '\u{FF09}' // ）
     )
 }
-pub fn no_end(c: u16) -> bool {
-    NO_END.contains(&c)
+pub fn no_end(c: char) -> bool {
+    NO_END.contains(&(c as u16))
 }
-pub fn is_vert_dot(c: u16) -> bool {
-    VERT_DOT.contains(&c)
+pub fn is_vert_dot(c: char) -> bool {
+    VERT_DOT.contains(&(c as u16))
 }
-fn is_vert_rot(c: u16) -> bool {
-    VERT_ROT.contains(&c)
+fn is_vert_rot(c: char) -> bool {
+    VERT_ROT.contains(&(c as u16))
 }
 
 // ---------------------------------------------------------------- 主入口
@@ -294,7 +310,7 @@ fn is_vert_rot(c: u16) -> bool {
 /// * `band` 是版心 `(左, 上, 右, 下)`，客户区坐标。
 /// * `spacing` 是字距（px），横版加在字与字之间，竖版加在格与格之间。
 pub fn layout(
-    chars: &[u16],
+    chars: &[char],
     adv: &[i32],
     m: Metrics,
     orient: Orient,
@@ -316,7 +332,7 @@ pub fn layout(
 // ---------------------------------------------------------------- 横版
 
 fn layout_h(
-    chars: &[u16],
+    chars: &[char],
     adv: &[i32],
     m: Metrics,
     band: (i32, i32, i32, i32),
@@ -429,7 +445,7 @@ fn layout_h(
 // ---------------------------------------------------------------- 竖版
 
 fn layout_v(
-    chars: &[u16],
+    chars: &[char],
     adv: &[i32],
     m: Metrics,
     band: (i32, i32, i32, i32),
@@ -484,7 +500,13 @@ fn layout_v(
     }
 
     // ---- ② 横向容量：列太多就只留最右边那几列
-    let max_cols = (avail_w / m.col_pitch.max(1)).max(1) as usize;
+    //
+    // 两道限制取小：窗口装得下几列（几何），以及 `MAX_COLS`（渲染层的带表
+    // 是定长数组）。后者不能省 —— 4000×80 这种比例下几何能装 170 多列，
+    // 而带表装不下时逐列渐变会静默失效（见 `gfx::MAX_BANDS`）。
+    // 触到 `MAX_COLS` 与触到窗口边缘的处理**完全一样**：截断 + 末字换省略号，
+    // 用户看到的是「太长了，后面省略」，而不是「后半截颜色不对」。
+    let max_cols = ((avail_w / m.col_pitch.max(1)).max(1) as usize).min(MAX_COLS);
     let truncated = cols.len() > max_cols;
     let used = cols.len().min(max_cols);
     let rows = cols.iter().take(used).map(|c| c.len()).max().unwrap_or(0) as i32;
@@ -605,8 +627,8 @@ mod tests {
     use super::*;
 
     /// 等宽假字：每个字步进 20px、字格 20px —— 测试只关心几何，不关心字形
-    fn uni(n: usize) -> (Vec<u16>, Vec<i32>) {
-        (vec![0x56FD; n], vec![20; n]) // 0x56FD = 国
+    fn uni(n: usize) -> (Vec<char>, Vec<i32>) {
+        (vec!['国'; n], vec![20; n])
     }
 
     fn metrics() -> Metrics {
@@ -648,18 +670,96 @@ mod tests {
         assert!(!q.glyphs.is_empty(), "版心再窄也要留下字形（省略号兜底）");
     }
 
+    // ------------------------------------------------------------
+    // 非 BMP：这些字在 UTF-16 里占**两个**单元，在 UTF-32 里只占一个。
+    //
+    // 旧实现把整条串当 `&[u16]` 逐单元处理，于是「𠀋」被当成两个字：
+    // 字形数量凭空翻倍，更糟的是步进数组（按 UTF-16 单元算）与字符数组
+    // （按标量算）从第一个非 BMP 字起就**错位一格** —— 后面每个字都拿到
+    // 邻居的宽度。症状是「某个字之后整行间距全乱」，且只在含生僻字/emoji
+    // 的句子上出现，肉眼极难归因。
+    //
+    // 类型换成 `char` 之后这类错位在编译期就不成立了（`char` 表达不了孤立
+    // 代理），但测试要钉住的是**行为**：一条串里有几个字，就出几个字形。
+    // ------------------------------------------------------------
+
+    #[test]
+    fn 非bmp字符按标量计数不被拆成两个字形() {
+        let text: Vec<char> = "𠀋国𠀋国".chars().collect();
+        assert_eq!(text.len(), 4, "4 个标量（UTF-16 长度是 6，这正是旧实现的错源）");
+        let adv = vec![20; text.len()];
+        let q = layout(&text, &adv, metrics(), Orient::Horizontal, band(), 0);
+        assert_eq!(q.glyphs.len(), 4, "4 个字就是 4 个字形，不是 6 个");
+        assert_eq!(q.glyphs[0].ch, '𠀋');
+        assert_eq!(q.glyphs[1].ch, '国');
+        assert_eq!(q.glyphs[2].ch, '𠀋');
+        // 步进没有错位：相邻字形 x 差恒为一个字宽（起点由居中算出，不假设 0）
+        let xs: Vec<i32> = q.glyphs.iter().map(|g| g.x).collect();
+        for w in xs.windows(2) {
+            assert_eq!(w[1] - w[0], 20, "步进错位，x 序列 {:?}", xs);
+        }
+    }
+
+    #[test]
+    fn 非bmp与等宽bmp的版面几何完全一致() {
+        // 这是比「数量对」更硬的判据：非 BMP 只影响编码长度，不影响版式。
+        // 只要有一个字被多算了一次，「𠀋国𠀋国𠀋」和「国国国国国」的坐标
+        // 就会从第一个非 BMP 字开始分叉。
+        let text: Vec<char> = "𠀋国𠀋国𠀋".chars().collect();
+        let ctrl: Vec<char> = "国".repeat(5).chars().collect();
+        let adv = vec![20; 5];
+        for orient in [Orient::Horizontal, Orient::Vertical] {
+            let a = layout(&text, &adv, metrics(), orient, (0, 0, 200, 60), 0);
+            let b = layout(&ctrl, &adv, metrics(), orient, (0, 0, 200, 60), 0);
+            assert_eq!(a.glyphs.len(), b.glyphs.len(), "{:?} 字形数分叉", orient);
+            assert_eq!(a.lanes, b.lanes, "{:?} 列/行数分叉", orient);
+            for (g1, g2) in a.glyphs.iter().zip(b.glyphs.iter()) {
+                assert_eq!(
+                    (g1.x, g1.y, g1.rot),
+                    (g2.x, g2.y, g2.rot),
+                    "{:?} 第 {} 个字坐标分叉",
+                    orient,
+                    g1.src
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 竖版非bmp字符同样按标量切列() {
+        let text: Vec<char> = "𠀋国𠀋国𠀋".chars().collect();
+        let adv = vec![20; text.len()];
+        let q = layout(&text, &adv, metrics(), Orient::Vertical, (0, 0, 200, 60), 0);
+        // 旧实现会给出 8 个字形（3 个非 BMP 各算两次）
+        assert_eq!(q.glyphs.len(), 5, "5 个字竖排也是 5 个字形");
+        for g in &q.glyphs {
+            assert!(g.y + metrics().char_h <= 60, "字形越过版心底缘: {:?}", g);
+        }
+    }
+
+    #[test]
+    fn 步进数组比字符数组短时返回空版面而不是越界() {
+        // 上游若误把 UTF-16 长度当标量长度传下来（`adv` 只有一半），
+        // 这里必须**安全退化**成空版面，而不是按错位的下标去读。
+        let text: Vec<char> = "𠀋国𠀋国".chars().collect();
+        let adv = vec![20; 3]; // 故意短于 chars
+        let q = layout(&text, &adv, metrics(), Orient::Horizontal, band(), 0);
+        assert!(q.glyphs.is_empty(), "长度不匹配时应放弃排版，不能带着错位下标硬排");
+        assert_eq!(q.shrink, 100);
+    }
+
     #[test]
     fn 行首禁则不被违反() {
         // 每行只能放 5 个字，第 6 个是「，」——它必须被挤在第 5 个后面，
         // 而不是掉到下一行开头。
         // 注意断言的是「**每行的第一个字**不是禁则字」，
         // 不是「禁则字不存在」—— 挤在行尾正是我们要的结果。
-        let mut ch = vec![0x56FD; 12];
-        ch[5] = 0xFF0C; // ，
-        ch[11] = 0xFF0C;
+        let mut ch = vec!['国'; 12];
+        ch[5] = '，';
+        ch[11] = '，';
         let adv = vec![20; 12];
         let q = layout(&ch, &adv, metrics(), Orient::Horizontal, (0, 0, 100, 200), 0);
-        let mut by_line: std::collections::BTreeMap<i32, u16> = Default::default();
+        let mut by_line: std::collections::BTreeMap<i32, char> = Default::default();
         for g in &q.glyphs {
             by_line.entry(g.y).or_insert(g.ch);
         }
@@ -671,8 +771,8 @@ mod tests {
 
     #[test]
     fn 行尾禁则被拉到下一行() {
-        let mut ch = vec![0x56FD; 10];
-        ch[4] = 0x300A; // 《  —— 恰好落在第 4 位（第 5 个字）
+        let mut ch = vec!['国'; 10];
+        ch[4] = '《'; // 恰好落在第 4 位（第 5 个字）
         let adv = vec![20; 10];
         let q = layout(&ch, &adv, metrics(), Orient::Horizontal, (0, 0, 100, 200), 0);
         // 没有任何一行是拿「《」收尾的
@@ -680,7 +780,7 @@ mod tests {
             let _ = g;
         }
         // 用行分组检查尾字
-        let mut by_line: std::collections::BTreeMap<i32, Vec<u16>> = Default::default();
+        let mut by_line: std::collections::BTreeMap<i32, Vec<char>> = Default::default();
         for g in &q.glyphs {
             by_line.entry(g.y).or_default().push(g.ch);
         }
@@ -714,8 +814,8 @@ mod tests {
 
     #[test]
     fn 竖版标点归位到右上() {
-        let mut ch = vec![0x56FD; 4];
-        ch[2] = 0xFF0C; // ，
+        let mut ch = vec!['国'; 4];
+        ch[2] = '，';
         let adv = vec![20; 4];
         let q = layout(&ch, &adv, metrics(), Orient::Vertical, band(), 0);
         let dot = q.glyphs[2];
@@ -737,13 +837,13 @@ mod tests {
         // 16 字对联：cap=9 的盲切是「箫鼓追随春社近，衣 / 冠简朴古风存。」
         // ——把「衣冠」劈开了；句读优先应当收在「，」后面 → [8, 8] 两列
         let text = "箫鼓追随春社近，衣冠简朴古风存。";
-        let ch: Vec<u16> = text.encode_utf16().collect();
+        let ch: Vec<char> = text.chars().collect();
         let adv = vec![20; ch.len()];
         let q = layout(&ch, &adv, metrics(), Orient::Vertical, band(), 0);
         assert_eq!(q.col_ranges.len(), 2, "应按句读断成两列");
         for (g0, g1) in &q.col_ranges {
             let last = q.glyphs[g1 - 1].ch;
-            assert!(clause_end(last), "列末字不是句读: {:04X}", last);
+            assert!(clause_end(last), "列末字不是句读: {:?}", last);
             assert!(!no_start(q.glyphs[*g0].ch), "列首出现禁则字");
         }
         assert_eq!(q.glyphs.len(), 16, "一个字都不许丢");
@@ -753,7 +853,7 @@ mod tests {
     fn 竖版长句超过句读窗口时退回满切() {
         // 句读离 cap 边界超过 3 格时按容量硬切（古人雕版同理），但不许丢字
         let text = "国之大道生生不息天下为公大同小异和而不同";
-        let ch: Vec<u16> = text.encode_utf16().collect();
+        let ch: Vec<char> = text.chars().collect();
         let adv = vec![20; ch.len()];
         let q = layout(&ch, &adv, metrics(), Orient::Vertical, band(), 0);
         assert_eq!(q.glyphs.len(), 20);
@@ -828,8 +928,8 @@ mod tests {
     #[test]
     fn 旋转字不参与合批() {
         // 竖版下 `——` 要换字体对象，和普通字不能塞进同一次调用
-        let mut ch = vec![0x56FD; 3];
-        ch[1] = 0x2014; // —
+        let mut ch = vec!['国'; 3];
+        ch[1] = '—';
         let adv = vec![20; 3];
         let q = layout(&ch, &adv, metrics(), Orient::Vertical, band(), 0);
         assert!(q.glyphs[1].rot);

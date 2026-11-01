@@ -15,10 +15,23 @@ use crate::config::{Anim, Config, Orient};
 use crate::gfx::{self, Fonts, Frame, QUOTE_SHRINK_STEPS};
 use crate::layout::{self, Metrics, QuoteLayout};
 use crate::quotes::Quote;
-use crate::consts::*;
 use crate::util::*;
 
 // ---------------------------------------------------------------- 渲染
+
+/// 逐列渐变因为列数超出带容量而降级成「整块一起过渡」的次数。
+///
+/// 这是**可观测的降级**，不是错误：排版层的列数上界由窗口宽度决定
+/// （`avail_w / col_pitch`），而带表是定长数组，两者天生不对齐。
+/// 与其让超出的列静默满亮（视觉上右半边闪一下），不如整块退化成通带，
+/// 并把次数记下来 —— 重现不了的问题，至少能从这里看出它发生过。
+pub(crate) static BAND_FALLBACK: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// 逐列渐变降级次数（0 = 从未发生）
+pub(crate) fn band_fallback() -> u32 {
+    BAND_FALLBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// 一帧的绘制输入。把 `App` 的字段拆开借，避免 `&mut frame` 和 `&fonts` 打架。
 struct RC<'a> {
@@ -114,30 +127,40 @@ fn frame_mod(a: &App, ql: &QuoteLayout, cb: &ClockBox, qk: f32) -> FrameMod {
     // （实测：比值全 1.000，出处只动了阴影没动颜色）。
     // 非错峰相位 `col_k == quote_k`，出处随整块 qk 走即可，不需要单独的带。
     let bands = if staggered {
-        let mut t = gfx::BandTable::empty();
-        if let Some(ac) = author {
-            t.push(
-                ac.x,
-                ac.x + cb.sig_w.max(1),
-                255,
-                (author_k * 255.0).round().clamp(0.0, 255.0) as u8,
-            );
+        // 列数 + 出处那条必须装得下。装不下就整体退化成通带：
+        // 逐列带只装进去一部分的话，落在外面的列 `get` 查不到带、
+        // 系数退回 255（满亮），于是过渡期间右半边会「不淡入地闪一下」——
+        // 比「整块一起淡入」难看得多，而且几乎不可能凭描述复现。
+        let need = ql.col_x.len() + usize::from(author.is_some());
+        if need > gfx::MAX_BANDS {
+            BAND_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            gfx::BandTable::uniform(qk_u8, 255)
+        } else {
+            let mut t = gfx::BandTable::empty();
+            if let Some(ac) = author {
+                t.push(
+                    ac.x,
+                    ac.x + cb.sig_w.max(1),
+                    255,
+                    (author_k * 255.0).round().clamp(0.0, 255.0) as u8,
+                );
+            }
+            for (i, &(g0, g1)) in ql.col_ranges.iter().enumerate() {
+                let k = a.trans.col_k(i, ncols);
+                let (bx0, bx1) = ql.col_x[i];
+                // 首列右缘 / 末列左缘扩到窗口边缘：阴影外溢 2px 也要落在某一列里
+                let (x0, x1) = if i == 0 {
+                    (bx0, a.cfg.w)
+                } else if i == ncols - 1 {
+                    (0, bx1)
+                } else {
+                    (bx0, bx1)
+                };
+                t.push(x0, x1, (k * 255.0).round().clamp(0.0, 255.0) as u8, 255);
+                col_grays.push((g0, g1, shadow_gray(k)));
+            }
+            t
         }
-        for (i, &(g0, g1)) in ql.col_ranges.iter().enumerate() {
-            let k = a.trans.col_k(i, ncols);
-            let (bx0, bx1) = ql.col_x[i];
-            // 首列右缘 / 末列左缘扩到窗口边缘：阴影外溢 2px 也要落在某一列里
-            let (x0, x1) = if i == 0 {
-                (bx0, a.cfg.w)
-            } else if i == ncols - 1 {
-                (0, bx1)
-            } else {
-                (bx0, bx1)
-            };
-            t.push(x0, x1, (k * 255.0).round().clamp(0.0, 255.0) as u8, 255);
-            col_grays.push((g0, g1, shadow_gray(k)));
-        }
-        t
     } else {
         gfx::BandTable::uniform(qk_u8, 255)
     };
@@ -180,6 +203,11 @@ pub(crate) fn mark_dirty(a: &mut App) {
 /// 画面按固定节拍出，且**最后一帧保证是最终状态**（`force`）。
 pub(crate) fn render_if_due(a: &mut App, force: bool) {
     if !a.dirty {
+        return;
+    }
+    // 不可见时消费掉脏标记但不画：恢复可见的路径会强制补一帧。
+    if !a.cfg.visible || a.fs_hidden {
+        a.dirty = false;
         return;
     }
     if !force && a.last_present.elapsed().as_millis() < DRAG_FRAME_MS {
@@ -258,11 +286,20 @@ pub(crate) fn build_frame_ex(a: &mut App, opacity: u8, no_batch: Option<bool>) {
     // 竖排字格 = 横竖混排的怪物），就地带省略号收尾。
     a.force_marquee =
         ql.overflow && a.cfg.show_quote && a.cfg.orient == Orient::Horizontal;
-    let eff_anim = if a.force_marquee {
-        Anim::Marquee
-    } else {
-        a.cfg.eff_anim()
-    };
+    // 生效动效**只从 `App::eff_anim()` 取**（它已含 force_marquee + 竖版降级）。
+    // 这里以前又内联判断了一遍，成了「同一概念第四份定义」。
+    let eff_anim = a.eff_anim();
+
+    // 首次进入跑马灯：把 `m` 贴到带左缘。
+    //
+    // `step` 里也有一段同样的初始化，但**拖动期间 `step` 不跑**（tick 在
+    // `grab != None` 时早退）—— 而「窗口缩小到放不下」正好可能发生在拖动中。
+    // 那时 `m` 还是 0，绘制端算出的 `x = br - 0 = br`：整串落在带右缘之外，
+    // 一帧空白。用户看到的就是「一缩，字先没了」。
+    if eff_anim == Anim::Marquee && !a.primed {
+        a.primed = true;
+        a.m = marquee_band_w(&a.cfg);
+    }
 
     // 记下这一帧用的是哪一刻的时钟 —— `needs_frame` 拿它判断下一拍要不要重绘
     a.clock_stamp = clock_stamp(&a.cfg);
@@ -349,7 +386,7 @@ pub(crate) fn build_frame_ex(a: &mut App, opacity: u8, no_batch: Option<bool>) {
 /// 阴影趟按它整体平移字形；`--selftest` 那条「阴影不越界」断言也读**同一个
 /// 函数** —— 两处各算一份迟早会走偏（这正是当年 `band_l` 那个坑的教训）。
 pub(crate) fn shadow_offset(cfg: &Config) -> i32 {
-    ((2.0 * cfg.scale as f32 / 100.0).round() as i32).max(0)
+    ((2.0 * cfg.eff_scale()).round() as i32).max(0)
 }
 
 /// 时间日期块的几何。
@@ -397,9 +434,9 @@ fn layout_clock_raw(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> Cloc
     if cfg.orient == Orient::Vertical {
         return layout_sign(cfg, fonts, dc, quote);
     }
-    let scale = cfg.scale as f32 / 100.0;
+    let scale = cfg.eff_scale();
     let (w, h) = (cfg.w, cfg.h);
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = cfg.pad();
 
     let time = if cfg.show_clock {
         Some(wide(&fmt_clock(&local_time(), cfg.seconds)))
@@ -480,15 +517,17 @@ fn layout_clock_raw(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> Cloc
 ///
 /// # 指纹必须覆盖全部输入
 ///
-/// `w/h`（夹取范围）、`scale`（默认位置）、`seconds`（字面量宽度）、
+/// 时钟刻度（格式化后的文本已经进入 `ClockBox`）、`w/h`（夹取范围）、
+/// `scale`（默认位置）、`seconds`（字面量宽度）、
 /// `show_clock`/`show_date`/`orient`（量什么）、`qi`（竖版出处列宽）、
 /// `clock_dx/dy`（夹取会回写它们）、`font_epoch`（字号/字体）。
 ///
-/// 换句走 `qi`、换字号走 `font_epoch` —— 两条自动覆盖，不必在每个
-/// 写配置的地方手工插一句作废。漏一项的表现是「改了没生效」，极难复现，
-/// 所以宁可多列几个分量。
+/// 换句走 `qi`、换字号走 `font_epoch`、走秒走 `clock_stamp` —— 三条自动覆盖，
+/// 不必在每个写配置的地方手工插一句作废。漏一项的表现是「改了没生效」，
+/// 极难复现，所以宁可多列几个分量。
 pub(crate) fn layout_clock(a: &mut App) -> ClockBox {
     let key = (
+        clock_stamp(&a.cfg),
         a.cfg.w,
         a.cfg.h,
         a.cfg.scale,
@@ -525,9 +564,8 @@ pub(crate) fn layout_clock(a: &mut App) -> ClockBox {
 /// 出处与日期走**日期色**通道，它们是落款，本来就该比主角弱一档。
 /// 两条通道都是现成的 ⇒ 不新增第四条掩码，`Frame` / `compose` 一行都不用动。
 fn layout_sign(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox {
-    let scale = cfg.scale as f32 / 100.0;
     let (w, h) = (cfg.w, cfg.h);
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = cfg.pad();
 
     // 右起第一列是时间（主色），然后出处、日期
     // 第三分量 = 是否出处列（过渡时随格言淡，PR3）
@@ -635,8 +673,7 @@ pub(crate) fn hug_sign(cfg: &Config, mut cb: ClockBox, ql: &QuoteLayout) -> Cloc
     if cfg.orient != Orient::Vertical || !cb.show || ql.is_empty() {
         return cb;
     }
-    let scale = cfg.scale as f32 / 100.0;
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = cfg.pad();
     let band = frame_band(cfg, &cb);
     // 主文右起贴 br ⇒ 主文块左缘 = br - ext_w（band 元组是 (bl, bt, br, bb)）
     let main_left = band.2 - ql.extent.0;
@@ -664,9 +701,8 @@ pub(crate) fn hug_sign(cfg: &Config, mut cb: ClockBox, ql: &QuoteLayout) -> Cloc
 /// ③ 整窗 —— 连堆叠都放不下（字号大到窗口装不下任何东西）：会与时钟重叠，
 ///    但用户至少**看得见字、知道是窗口太小**，而不是面对一片空白猜哪儿去了
 pub(crate) fn quote_band(cfg: &Config, cb: &ClockBox) -> (i32, i32, i32, i32) {
-    let scale = cfg.scale as f32 / 100.0;
     let (w, h) = (cfg.w, cfg.h);
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = cfg.pad();
     let full = (pad, pad, w - pad, h - pad);
     if !cb.show {
         return full;
@@ -684,9 +720,8 @@ pub(crate) fn quote_band(cfg: &Config, cb: &ClockBox) -> (i32, i32, i32, i32) {
 
 /// 竖版主文的版心：落款条右侧那一整片。
 fn quote_band_v(cfg: &Config, cb: &ClockBox) -> (i32, i32, i32, i32) {
-    let scale = cfg.scale as f32 / 100.0;
     let (w, h) = (cfg.w, cfg.h);
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = cfg.pad();
     let full = (pad, pad, w - pad, h - pad);
     if !cb.show {
         return full;
@@ -703,9 +738,8 @@ pub(crate) fn band_degenerate(cfg: &Config, cb: &ClockBox) -> bool {
     if !cb.show || cfg.orient == Orient::Vertical {
         return false;
     }
-    let scale = cfg.scale as f32 / 100.0;
     let (w, h) = (cfg.w, cfg.h);
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = cfg.pad();
     let right_l = pad + cb.w + 2 * pad;
     let stacked_top = cb.y + cb.h + pad / 2;
     !(w - pad - right_l >= MIN_QUOTE_BAND) && !(h - pad - stacked_top >= MIN_QUOTE_H)
@@ -755,7 +789,9 @@ fn layout_quote(
     text: &str,
 ) -> QuoteLayout {
     let s = wide(text);
-    let chars: Vec<u16> = s[..s.len() - 1].to_vec();
+    // 排版单位是 Unicode 标量值，不是 UTF-16 code unit：代理对必须留在同一个
+    // 字形里，否则竖排会把一个 emoji / 生僻字拆成两个无效半字。
+    let chars: Vec<char> = text.chars().collect();
     let spacing = cfg.quote_spacing();
     // 度量时字距必须是 0：`SetTextCharacterExtra` 会被 `GetTextExtentExPointW`
     // 计入且严格线性，字距由排版层自己加，混进度量会得到「末字多算一份」。
@@ -773,9 +809,19 @@ fn layout_quote(
     for (k, &pct) in QUOTE_SHRINK_STEPS.iter().enumerate().take(steps) {
         let font = fonts.quote_at(k);
         unsafe { SelectObject(dc, font as HGDIOBJ) };
-        let Some(adv) = gfx::char_advances(dc, &s) else {
+        let Some(raw_adv) = gfx::char_advances(dc, &s) else {
             break;
         };
+        // GDI 的累计宽度按 UTF-16 单元给出，把它聚合成每个标量值的步进。
+        let mut adv = Vec::with_capacity(chars.len());
+        let mut u = 0usize;
+        for c in &chars {
+            let n = c.len_utf16();
+            let end = (u + n).min(raw_adv.len());
+            let sum: i32 = raw_adv[u.min(end)..end].iter().sum();
+            adv.push(sum.max(0));
+            u = end;
+        }
         let (cw, ch) = gfx::measure_text(dc, &wide("国"));
         let m = Metrics::new(cw.max(1), ch.max(1));
         let mut ql = layout::layout(&chars, &adv, m, cfg.orient, band, spacing);
@@ -838,9 +884,9 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
     let cfg = rc.cfg;
     let shadow_pass = pass == Pass::Shadow;
     let (ox, oy) = pass.offset(cfg);
-    let scale = cfg.scale as f32 / 100.0;
+    let scale = cfg.eff_scale();
     let (w, h) = (cfg.w, cfg.h);
-    let pad = ((24.0 * scale).round() as i32).max(10);
+    let pad = cfg.pad();
 
     // ---- 时钟（横版：左上角的时间块；竖版：落款里走主色通道的那一列）
     if cfg.orient == Orient::Vertical {
@@ -896,15 +942,18 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
 
     // ---- 格言
     if cfg.show_quote {
-        let (bl, bt, br, bb) = match cfg.orient {
-            Orient::Vertical => quote_band_v(cfg, cb),
-            Orient::Horizontal => quote_band(cfg, cb),
-        };
-        // 版心退化 = 时钟/日期块已经把窗口吃光。这时**不能**把格言压在时钟上：
-        // 两块都会变得不可读，观感比「格言没了」更差。时钟是这块挂件的主职，
-        // 所以这时只画一句明确提示（下面那段），格言留到用户把窗口放大或把字号降回来。
+        // 版心**只从 `frame_band` 取**：这里以前自己内联了一遍同样的 match，
+        // 与排版时用的那份是两处定义 —— 加第三种朝向必漏一处。
+        let (bl, bt, br, bb) = frame_band(cfg, cb);
+        // 版心退化 = 时钟/日期块已经把窗口吃光。平时**不能**把格言压在时钟上：
+        // 两块都会变得不可读，观感比「格言没了」更差，所以只画一句提示。
+        //
+        // **布局模式下例外**：正在调尺寸的人全靠这句字判断「现在够不够放」，
+        // 这时候把它藏起来，观感就是「一拖就没了」（老板原话：调整时文字先看不见）。
+        // 提示照旧画，但字必须留着 —— 难看两秒钟 << 不知道自己在调什么。
         let degenerate = band_degenerate(cfg, cb);
-        if degenerate {
+        let hide_quote = degenerate && !cfg.layout_mode;
+        if hide_quote {
             // 有意什么都不画 —— 提示在下面统一画
         } else if matches!(rc.anim, Anim::Marquee) {
             // 跑马灯：整串滚动，排版表用不上，仍走整串绘制
@@ -913,7 +962,7 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
             unsafe { SelectObject(dc, rc.fonts.quote as HGDIOBJ) };
             unsafe { SetTextCharacterExtra(dc, cfg.quote_spacing()) };
             let (tw, th) = gfx::measure_text(dc, &s);
-            let gap = (130.0 * scale).round() as i32;
+            let gap = cfg.marquee_gap();
             let ty = (h - th) / 2 + oy;
             let x1 = (br as f32 - rc.m).round() as i32;
             let x2 = x1 + tw + gap;
@@ -956,7 +1005,9 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
                 None
             };
             let font = rc.fonts.quote_at(ql.font_tier());
-            let rot = rc.fonts.quote_rot;
+            // 旋转字必须跟着**同一档**字号走：竖版缩字回退之后正缩到 85%/70%，
+            // 破折号还按 100% 画就会大出一圈，把上下两个字盖住。
+            let rot = rc.fonts.quote_rot_at(ql.font_tier());
             let spacing = cfg.quote_spacing();
             // 滑入偏移**只加在格言上**：时钟/日期/底板是静帧，不跟着漂。
             // 偏移量由 `transition` 统一给，两趟同值（几何一致铁律）。
@@ -968,14 +1019,12 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
         // 那句提示必须说出来 —— 让用户对着一片叠着的字自己猜，
         // 正是这次要根除的毛病（旧实现是格言整条消失、零提示）。
         //
-        // 提示用**固定 13px** 的临时字体：这是一句给用户看的话，不该跟着 scale
-        // 一起放大到装不下（300% 下 hint 字体是 36px，整句要 600 多 px）。
-        //
-        // `!shadow_pass`：这是一句**界面提示**，不是版式内容，不带阴影
-        // （和下面布局模式那几条一个道理）。
+        // 提示用**固定 13px** 的字体：这是一句给用户看的话，不该跟着 scale
+        // 一起放大到装不下（300% 下 `hint` 是 36px，整句要 600 多 px）。
+        // 字体对象随 `Fonts` 建一次就够 —— 旧实现在这里每帧 `make_font` +
+        // `DeleteObject`，一句退化提示付一次建字体的代价。
         if degenerate && !shadow_pass {
-            let f = gfx::make_font(13, FW_NORMAL, &rc.fonts.face);
-            unsafe { SelectObject(dc, f as HGDIOBJ) };
+            unsafe { SelectObject(dc, rc.fonts.hint_fixed as HGDIOBJ) };
             let hint = wide("窗口装不下 · 请放大窗口或降低字号");
             let (hw, _) = gfx::measure_text(dc, &hint);
             // 提示要画在**主色通道**上、而且给满值：掩码强度就是那个字节的值，
@@ -984,7 +1033,6 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
             // 也不能顺手写成 `WHITE`：那是三条通道一起点亮，
             // 在「通道即语义」的新布局里，这一片像素会同时归属三种颜色。
             gfx::draw_text(dc, &hint, (w - hw).max(0) / 2, 2, gfx::CH_CLOCK);
-            unsafe { DeleteObject(f as HGDIOBJ) };
         }
     }
 

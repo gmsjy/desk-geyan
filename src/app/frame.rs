@@ -74,8 +74,12 @@ fn fullscreen_guard(a: &mut App, now: std::time::Instant) {
         return;
     }
     a.fs_last = now;
-    let st = crate::ffi::user_notification_state();
-    let fullscreen = st == Some(QUNS_RUNNING_D3D_FULL_SCREEN);
+    // 查询失败不等于「退出全屏」。若把 None 当成 false，窗口正因全屏藏着时
+    // 一次瞬态失败就会把它弹回来盖住游戏。保持上一次状态，等下一次轮询。
+    let Some(st) = crate::ffi::user_notification_state() else {
+        return;
+    };
+    let fullscreen = st == QUNS_RUNNING_D3D_FULL_SCREEN;
     a.fs_active = fullscreen;
     match fs_decide(fullscreen, a.fs_hidden, a.cfg.visible) {
         FsAction::Hide => {
@@ -119,6 +123,12 @@ pub(crate) fn tick(a: &mut App) {
     // 全屏检测放在 grab 早退**之前**：拖动中也可能撞上「用户切进了游戏」，
     // 那时候同样该藏。1Hz 节流在函数内部，不每拍都去问 shell。
     fullscreen_guard(a, now);
+    // 隐藏时不再推进动效，也不做悬停查询 / 出帧。以前这里只跳过了「窗口是否可见」
+    // 的绘制判断，跑马灯和呼吸仍会以 25fps 在后台生成整帧，纯属浪费。
+    // 恢复可见由 `set_visible` / `temp_hide` 主动补一帧。
+    if !a.cfg.visible || a.fs_hidden {
+        return;
+    }
     // 拖动期间一拍都不出：手的动作优先。
     //
     // 定时器 25Hz，跑马灯每拍是 ~780µs 的整帧重绘，而它跟鼠标消息抢的是
@@ -130,6 +140,11 @@ pub(crate) fn tick(a: &mut App) {
         // 鼠标事件来推动它了）。拖动期间定时器被收紧到 `DRAG_TICK_MS`，
         // 正好和位置节拍同频，这一拍就把欠的那一格落下去。
         apply_geometry(a, false, false);
+        // 尺寸的欠账也在这里还：缩放时文字层**不**在 `apply_geometry` 里改尺寸
+        // （那会让「窗口已变大、内容还是旧的」露一帧空白），改成下一帧
+        // `present` 一次性提交。用户按住不动时没有鼠标消息推动那一帧，
+        // 所以这一拍必须补一次 —— `dirty` 没置位时它是个空调用。
+        render_if_due(a, false);
         return;
     }
     // PR2 悬停暂停：光标停在挂件上 = 强阅读意图，冻结轮播/滚动。
@@ -161,19 +176,23 @@ pub(crate) fn tick(a: &mut App) {
 
 /// 只推进动效状态，不碰窗口。抽出来是为了让自检能脱离定时器跑动效。
 pub(crate) fn step(a: &mut App, dt: f32) {
-    let scale = a.cfg.scale as f32 / 100.0;
     let n = a.list.len();
     if n == 0 {
         return;
     }
+    // 用户暂停：只让时钟继续走。暂停命令里会落定正在飞的过渡，
+    // 所以这里不需要再处理 Leave/Gap/Arrive。
+    if a.cfg.paused {
+        if clock_stamp(&a.cfg) != a.clock_stamp {
+            mark_dirty(a);
+        }
+        render_if_due(a, false);
+        return;
+    }
 
-    // **生效动效**的唯一判定：竖版一律静态（跑马灯在竖排字格里没有意义），
-    // 格言放不下时横版转跑马灯。`needs_frame` 读的是同一个表达式。
-    let anim = if a.force_marquee {
-        Anim::Marquee
-    } else {
-        a.cfg.eff_anim()
-    };
+    // **生效动效**读 `App::eff_anim()`：竖版降级 + 「放不下转跑马灯」都在里面。
+    // 以前这段判定在四个地方各写一份，`quote_mod` 那份漏了 force_marquee。
+    let anim = a.eff_anim();
     match anim {
         Anim::Marquee => {
             // 跑马灯与过渡互斥：「放不下转跑马灯」可能把在飞的过渡半路截断，
@@ -194,7 +213,10 @@ pub(crate) fn step(a: &mut App, dt: f32) {
             } else {
                 a.m += a.cfg.speed as f32 * dt;
                 if a.m >= band_w + a.cur_w as f32 {
-                    let gap = 130.0 * scale;
+                    // 间隙与绘制端**同一个出口**（`Config::marquee_gap`）：
+                    // 以前这里按 f32 算、绘制端按 round 算，最多差 0.5px，
+                    // 每轮累积——表现为「偶尔跳一下字」。
+                    let gap = a.cfg.marquee_gap() as f32;
                     a.m -= a.cur_w as f32 + gap;
                     a.qi = a.qn;
                     a.qn = (a.qn + 1) % n;
@@ -202,7 +224,17 @@ pub(crate) fn step(a: &mut App, dt: f32) {
                 }
             }
         }
-        Anim::Static | Anim::Fade => {
+        // 静态 / 淡入淡出 / 呼吸：**三者共用同一套 dwell → 换句流程**。
+        //
+        // 呼吸以前的 `step` 只有一句 `a.phase += dt`：没有 dwell 计时、不调
+        // `advance`，于是 455 条格言库里只有第一条会被看到（实测 14 秒内
+        // 画面纹丝不动，而同一句在静态模式下早该换 3 次）。「呼吸」是
+        // **亮度**的动效，不该顺手把「换句」关掉。
+        Anim::Static | Anim::Fade | Anim::Breathe => {
+            // 呼吸相位独立推进：悬停暂停、过渡期间都照走（它是氛围，不是内容）
+            if anim == Anim::Breathe {
+                a.pulse += dt;
+            }
             // 过渡状态机先行：Leave/Gap/Arrive 期间 dwell 不累计。
             // `Swap` 在 Leave→Gap 的边界产出 —— 旧句 alpha 归 0 的同一拍换句，
             // 这是「无硬切」的机制保证（换句永远伴随一段过渡）。
@@ -229,11 +261,13 @@ pub(crate) fn step(a: &mut App, dt: f32) {
                     // 把同一句淡出去再淡进来，观感是「自己闪自己」（PR1.1）。
                     // 一句格言的 dwell 没有终点可言，就让它静静待着。
                     if n >= 2 && a.phase >= transition::dwell_secs(chars) {
-                        // Fade 是纯淡入淡出（无位移）；Static 横版滑入 0.5em。
+                        // Fade / Breathe 是纯淡入淡出（无位移）；Static 横版滑入 0.5em。
                         // **竖版恒 0**：竖排的阅读流向是自上而下、列自右向左，
                         // 横向滑入与字格方向不正交，会把列间节律打乱（PR1.1
                         // 修复实施偏差：原先只看 anim 不看 orient）。
-                        let slide = if anim == Anim::Fade || a.cfg.orient == Orient::Vertical {
+                        let slide = if matches!(anim, Anim::Fade | Anim::Breathe)
+                            || a.cfg.orient == Orient::Vertical
+                        {
                             0
                         } else {
                             transition::slide_px(a.cfg.quote_font_px())
@@ -243,12 +277,6 @@ pub(crate) fn step(a: &mut App, dt: f32) {
                     }
                 }
             }
-        }
-        Anim::Breathe => {
-            // 呼吸只推进相位时钟；k 由 `quote_mod` 在出帧时按 phase 现算。
-            // 它**只作用于格言通道**（见 quote_mod）—— 时钟/日期/底板
-            // 不再被绑架，毛玻璃也不再跟着起伏（那正是旧 P0 的一半）。
-            a.phase += dt;
         }
     }
 
@@ -268,10 +296,39 @@ pub(crate) fn clock_stamp(cfg: &Config) -> u64 {
         return 0; // 时间日期都没显示，这一格永远是常量
     }
     let t = crate::util::local_time();
-    if cfg.seconds {
-        ((t.wHour as u64) << 16) | ((t.wMinute as u64) << 8) | t.wSecond as u64
+    clock_stamp_parts(
+        t.wYear,
+        t.wMonth,
+        t.wDay,
+        t.wHour,
+        t.wMinute,
+        t.wSecond,
+        cfg,
+    )
+}
+
+/// `clock_stamp` 的纯函数核心，便于用固定时刻验证「日期变化也必须触发重绘」。
+fn clock_stamp_parts(
+    year: u16,
+    month: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    cfg: &Config,
+) -> u64 {
+    if !cfg.show_clock && !cfg.show_date {
+        return 0;
+    }
+    let date = ((year as u64) << 32) | ((month as u64) << 24) | ((day as u64) << 16);
+    if cfg.show_clock && cfg.seconds {
+        date | ((hour as u64) << 12) | ((minute as u64) << 6) | second as u64
+    } else if cfg.show_clock {
+        date | ((hour as u64) << 6) | minute as u64
     } else {
-        ((t.wHour as u64) << 8) | t.wMinute as u64
+        // 只显示日期时不能带时分秒，否则静态画面会每秒白重绘一次；
+        // 日月年已经在 date 里，午夜到来时仍会变化。
+        date
     }
 }
 
@@ -281,17 +338,20 @@ pub(crate) fn needs_frame(a: &App) -> bool {
     if clock_stamp(&a.cfg) != a.clock_stamp {
         return true;
     }
+    // 暂停轮播：画面上只剩时钟还会自己走；跑马灯/呼吸/过渡全部冻结。
+    if a.cfg.paused {
+        return false;
+    }
+    if !a.cfg.visible || a.fs_hidden {
+        return false;
+    }
     // 过渡进行中：相位时钟在走，每帧都要出（560ms 的窗口期，可接受）
     if a.trans.is_active() {
         return true;
     }
-    // 与 `step` 读**同一个**表达式：生效动效 + 「放不下转跑马灯」。
+    // 与 `step` 读**同一个**方法：生效动效 + 「放不下转跑马灯」。
     // 两处要是各写各的，就会出现「跑马灯在滚但不出帧」或「静态却每帧重绘」。
-    let anim = if a.force_marquee {
-        Anim::Marquee
-    } else {
-        a.cfg.eff_anim()
-    };
+    let anim = a.eff_anim();
     match anim {
         // 跑马灯只影响格言；格言关掉了就只剩时钟，和静态没区别。
         // **悬停暂停期间一帧不出**（PR2）：m 冻结了画面不变，再逐帧重绘
@@ -300,9 +360,12 @@ pub(crate) fn needs_frame(a: &App) -> bool {
         // 呼吸动的是格言通道的 k（时钟/日期/底板不动），必须逐帧出。
         // **减动模式下呼吸已降级为静态**（quote_mod 最早返回 1.0），
         // 再逐帧空转就是纯烧 CPU（PR1.1）。
+        // **格言关掉时也必须停**：只剩时钟的画面逐位不变，而 25fps 空转
+        // 实测 5.47% CPU（静态同条件是 0.98%）—— 这是「空转不出帧」铁律
+        // 在呼吸这条路上唯一的缺口，之前漏了 `show_quote`。
         // 呼吸**不冻结**于悬停（PR2，12.3#2）：呼吸是氛围不是阅读内容，
         // 冻了反而像坏了。
-        Anim::Breathe => !a.trans.reduced(),
+        Anim::Breathe => a.cfg.show_quote && !a.trans.reduced(),
         // 静态/淡入淡出：dwell 只用于计时换句；换句那一刻过渡会自己标脏，
         // 过渡结束（落定）后一拍都不多出 —— 空转不出帧铁律在这里守着
         Anim::Static | Anim::Fade => false,
@@ -319,8 +382,9 @@ pub(crate) fn measure_quote(a: &App, q: &Quote) -> i32 {
 /// 跑马灯滚动带的有效宽度（消掉左右内边距）。
 /// `step` 的轮转判定和 `rebuild_fonts` 的落点是同一把尺子，抽出来防止两处走偏。
 pub(crate) fn marquee_band_w(cfg: &Config) -> f32 {
-    let scale = cfg.scale as f32 / 100.0;
-    (cfg.w - 2 * ((24.0 * scale).round() as i32)).max(80) as f32
+    // 内边距必须走 `cfg.pad()` —— 以前这里写的是 `(24.0*scale).round()`，
+    // 漏了版心那侧的 `.max(10)`：scale < 42% 时带比版心宽 3px，起始位整体右偏。
+    (cfg.w - 2 * cfg.pad()).max(80) as f32
 }
 
 fn advance(a: &mut App) {
