@@ -41,6 +41,7 @@
 //! 唯一真正有用的形态，光看「SimSun」这几个字母分不出宋体长什么样。
 
 use std::mem::{size_of, zeroed};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::ptr::{null, null_mut};
 
 use crate::app::window_dpi;
@@ -61,10 +62,10 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
 use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect,
     GetCursorPos, GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadCursorW,
-    LoadIconW, MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SetWindowTextW, ShowWindow, WNDCLASSW,
+    MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
+    SetWindowTextW, ShowWindow, WNDCLASSW, HICON,
     // 控件专用常量（consts 未收录）仍走 windows_sys，单一来源：
     BM_CLICK, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
     BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, LBN_SELCHANGE, LB_ADDSTRING,
@@ -85,13 +86,13 @@ use crate::app::{
     MI_OP_UP, MI_ORIENT_BASE, MI_PAUSE, MI_FAV_ONLY, MI_PREV, MI_QUOTE, MI_QUOTE_COLOR,
     MI_QUOTE_DOWN, MI_QUOTE_UP, MI_RELOAD, MI_RESET, MI_SCALE_DOWN, MI_SCALE_UP, MI_SECONDS,
     MI_SHADOW, MI_SHRINK_FIT, MI_SPACING_DOWN, MI_SPACING_UP, MI_SPEED_DOWN, MI_SPEED_UP,
-    MI_TEXT, MI_TOGGLE, MI_TOPMOST, MI_ISLAND, MI_ISLAND_UNREAD, MI_DESK_FIT,
+    MI_TEXT, MI_TOGGLE, MI_TOPMOST, MI_VSTYLE_BASE, MI_ISLAND, MI_ISLAND_UNREAD, MI_DESK_FIT,
     MI_ISLAND_ACCENT_COLOR, MI_ISLAND_BODY_COLOR, MI_ISLAND_DOT_COLOR, MI_ISLAND_H_DOWN,
     MI_ISLAND_H_UP, MI_ISLAND_PEEK_DOWN, MI_ISLAND_PEEK_UP,
     MI_ISLAND_ITEM_BASE, MI_ISLAND_KEEP, MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP,
     MI_ISLAND_ROT_DOWN, MI_ISLAND_ROT_UP, MI_ISLAND_W_DOWN, MI_ISLAND_W_UP,
 };
-use crate::config::{self, Anim, Mode, Orient, FONT_PRESETS};
+use crate::config::{self, Anim, Mode, Orient, VStyle, FONT_PRESETS};
 use crate::consts::*;
 use crate::gfx;
 use crate::util::{fmt_color, wide};
@@ -154,7 +155,7 @@ const PREVIEW_H: i32 = 120;
 const BTN_H: i32 = 28;
 const BTN_W_FONT_DEFAULT: i32 = 200;
 const CLIENT_W: i32 = 800;
-const CLIENT_H: i32 = 640;
+const CLIENT_H: i32 = 664;
 /// 窗口**最小客户区**尺寸：比这个小，设置区就会排不下（最后一行被切掉，
 /// 数值行的 `[+]` 也会被挤出行外）—— 与其让用户看到半截界面，不如不许缩到那么小。
 ///
@@ -167,8 +168,10 @@ const MIN_TRACK_W: i32 = 780;
 /// 最小客户区高度。**加一行设置就要同步它** —— `--selftest` 的
 /// 「控件清单（表格即规格）」会算 `plan_min_height()` 并报余量，
 /// 排不下就是红的（面板没有滚动条，最后一行会被静默切掉）。
-/// 660 = 加灵动岛两行之后的需求 657 向上取整。
-const MIN_TRACK_H: i32 = 660;
+///
+/// 660 = 加灵动岛两行之后的需求 657 向上取整；竖排形态再占一行（+28），
+/// 取 688。实际值由 `--selftest` 的余量断言校准，不要手算后就不再跑它。
+const MIN_TRACK_H: i32 = 688;
 
 /// 判「字体含不含汉字」用的样本字。挑的都是最常用的字：一个字体连「永」
 /// （CJK 覆盖率的事实标准测试字）都没有，挂件上的中文必然糊成豆腐。
@@ -342,6 +345,11 @@ fn table(page: Page) -> Vec<W> {
             sec("版式"),
             rad(MI_ORIENT_BASE, "横版", 2),
             rad(MI_ORIENT_BASE + 1, "竖版（卷轴）", 3),
+            // 竖版形态：三套共用同一块画布，只换页头与对齐。横版下不起作用，
+            // 但**不置灰** —— 用户常常先选形态、再切竖版。
+            rad(MI_VSTYLE_BASE, "竖排·条幅", 2),
+            rad(MI_VSTYLE_BASE + 1, "竖排·极简", 2),
+            rad(MI_VSTYLE_BASE + 2, "竖排·栏头", 2),
             // ---- 动效
             sec("动效"),
             // 跑马灯占 3 格（比另外两个宽）：竖版下它的文字会变成
@@ -491,6 +499,20 @@ pub struct ConfigUi {
     sel_brush: HBRUSH,
     bg_brush: HBRUSH,
     frame_brush: HBRUSH,
+    /// **必须等窗口销毁之后才能删**的 GDI 对象。
+    ///
+    /// 两个来源：
+    /// 1. `WM_CTLCOLOR*` 把刷子交给系统后，系统会把它选进控件的 DC；此时
+    ///    `DeleteObject` 一律失败（`ERROR_INVALID_HANDLE`），每开关一次漏 3 个。
+    /// 2. `WM_SETICON` 设进去的图标，窗口销毁时**不会**替我们释放（文档明确
+    ///    由调用方负责），而图标里的位图/掩码是 GDI 对象。
+    ///
+    /// 所以顺序只能是：`DestroyWindow`（DC 与窗口引用随之消失）→ 再删。
+    pending: Vec<HGDIOBJ>,
+    /// 本窗口 `WM_SETICON` 设进去的图标。窗口销毁**不会**替我们释放它们
+    /// （文档明确由调用方负责），而每个 `LoadImageW` 都是一份新的位图副本。
+    /// 关闭时逐个 `DestroyIcon`，否则每开关一次面板漏两个图标。
+    icons: Vec<HICON>,
     /// 预览区矩形（客户端坐标）。布局时算出来，绘制时直接用 ——
     /// 两处各算一遍迟早会走偏。
     preview_rc: RECT,
@@ -520,6 +542,8 @@ impl Default for ConfigUi {
             sel_brush: null_mut(),
             bg_brush: null_mut(),
             frame_brush: null_mut(),
+            pending: Vec::new(),
+            icons: Vec::new(),
             preview_rc: unsafe { zeroed() },
             dpi: 100,
             page: Page::Widget,
@@ -569,6 +593,10 @@ impl ConfigUi {
 
     /// 释放所有 GDI 资源。**新增句柄必须加进来** —— 漏一个就是一次真实泄漏，
     /// 而 `--memtest` 只会报「GDI 对象数在涨」，不会告诉你是谁。
+    ///
+    /// 刷子**不在这里删**：`WM_CTLCOLOR*` 交给系统后会被选进控件 DC，窗口还活着时
+    /// `DeleteObject` 一律失败。它们被挪进 `pending`，等 `DestroyWindow` 之后由
+    /// `release_owned_after_destroy` 收尾。
     fn free_resources(&mut self) {
         unsafe {
             for h in self.item_fonts.drain(..) {
@@ -583,7 +611,8 @@ impl ConfigUi {
             }
             for b in [self.sel_brush, self.bg_brush, self.frame_brush] {
                 if !b.is_null() {
-                    DeleteObject(b as HGDIOBJ);
+                    // 推迟到窗口销毁之后：此刻它可能正被某个控件 DC 选中
+                    self.pending.push(b as HGDIOBJ);
                 }
             }
         }
@@ -601,6 +630,22 @@ impl ConfigUi {
         self.lbl_preview = null_mut();
         self.ctls.clear();
         self.items.clear();
+    }
+
+    /// `DestroyWindow` 之后调用：控件 DC 已随窗口释放、系统也不再持有这些刷子，
+    /// 这时 `DeleteObject` 才会成功。放在销毁之前删会**静默失败**
+    /// （`ERROR_INVALID_HANDLE`），每开关一次面板就漏 3 个 GDI 句柄。
+    fn release_owned_after_destroy(&mut self) {
+        unsafe {
+            for h in self.pending.drain(..) {
+                DeleteObject(h);
+            }
+            for ic in self.icons.drain(..) {
+                if !ic.is_null() {
+                    DestroyIcon(ic);
+                }
+            }
+        }
     }
 
     fn rebuild_preview_font(&mut self, face: &str) {
@@ -815,6 +860,9 @@ fn read_radio(a: &App, cmd: u32) -> bool {
     }
     if (MI_ORIENT_BASE..MI_ORIENT_BASE + 2).contains(&cmd) {
         return c.orient == Orient::all()[(cmd - MI_ORIENT_BASE) as usize];
+    }
+    if (MI_VSTYLE_BASE..MI_VSTYLE_BASE + 3).contains(&cmd) {
+        return c.v_style == VStyle::all()[(cmd - MI_VSTYLE_BASE) as usize];
     }
     if (MI_ANIM_BASE..MI_ANIM_BASE + 4).contains(&cmd) {
         return c.anim == Anim::all()[(cmd - MI_ANIM_BASE) as usize];
@@ -1148,18 +1196,29 @@ pub fn open(a: &mut App) {
     unsafe {
         let hinst = crate::app::module_handle();
         let cls = wide(CFG_CLASS);
-        let mut wc: WNDCLASSW = zeroed();
-        wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = Some(config_proc);
-        wc.hInstance = hinst;
-        wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW_RES);
-        wc.hIcon = LoadIconW(null_mut(), IDI_APPLICATION_RES);
-        // COLOR_WINDOW + 1：让系统按主题给底色（浅色主题白、深色主题深）。
-        // 静态文字控件自己的类刷子是 COLOR_BTNFACE，会在白底上留下灰块 ——
-        // 那一路由 `WM_CTLCOLORSTATIC` 处理（见 `config_proc`）。
-        wc.hbrBackground = (COLOR_WINDOW + 1) as HBRUSH;
-        wc.lpszClassName = cls.as_ptr();
-        RegisterClassW(&wc);
+        // 窗口类**只注册一次**。
+        //
+        // `RegisterClassW` 重入必然失败（类已存在），而 `wc.hIcon` 是
+        // `LoadImageW` 每次新建的一份图标 —— 重复走到这里就等于每开一次
+        // 设置面板漏掉一个图标（连同它里面的位图）。首次注册失败时把标志退回去，
+        // 下次还能再试。
+        static CLASS_REG: AtomicBool = AtomicBool::new(false);
+        if !CLASS_REG.load(Ordering::Relaxed) {
+            let mut wc: WNDCLASSW = zeroed();
+            wc.style = CS_HREDRAW | CS_VREDRAW;
+            wc.lpfnWndProc = Some(config_proc);
+            wc.hInstance = hinst;
+            wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW_RES);
+            wc.hIcon = crate::icon::app_icon(32, 32);
+            // COLOR_WINDOW + 1：让系统按主题给底色（浅色主题白、深色主题深）。
+            // 静态文字控件自己的类刷子是 COLOR_BTNFACE，会在白底上留下灰块 ——
+            // 那一路由 `WM_CTLCOLORSTATIC` 处理（见 `config_proc`）。
+            wc.hbrBackground = (COLOR_WINDOW + 1) as HBRUSH;
+            wc.lpszClassName = cls.as_ptr();
+            if RegisterClassW(&wc) != 0 {
+                CLASS_REG.store(true, Ordering::Relaxed);
+            }
+        }
 
         // 窗口尺寸由客户区反推（含标题栏与边框）。
         // 建窗前不知道窗口会落在哪块屏，先按**系统 DPI** 估一版；
@@ -1209,9 +1268,11 @@ pub fn open(a: &mut App) {
                 layout_children(&mut a.config, cli.right, cli.bottom);
             }
         }
-        let icon = LoadIconW(null_mut(), IDI_APPLICATION_RES);
-        SendMessageW(h, WM_SETICON, 0, icon as LPARAM); // ICON_SMALL
-        SendMessageW(h, WM_SETICON, 1, icon as LPARAM); // ICON_BIG
+        let (icon_small, icon_big) = crate::icon::window_icons();
+        a.config.icons.push(icon_small);
+        a.config.icons.push(icon_big);
+        SendMessageW(h, WM_SETICON, 0, icon_small as LPARAM); // ICON_SMALL
+        SendMessageW(h, WM_SETICON, 1, icon_big as LPARAM); // ICON_BIG
         ShowWindow(h, SW_SHOWNORMAL);
         SetForegroundWindow(h);
     }
@@ -1227,6 +1288,7 @@ pub fn close(a: &mut App) {
     // 显式释放；`free_resources` 会先清空句柄，销毁用保存下来的局部值。
     a.config.free_resources();
     unsafe { DestroyWindow(hwnd) };
+    a.config.release_owned_after_destroy();
 }
 
 /// 把窗口摆到「光标所在那块屏」的**底部居中**。
@@ -2433,6 +2495,7 @@ unsafe fn config_proc_inner(
         WM_CLOSE => {
             a.config.free_resources();
             DestroyWindow(hwnd);
+            a.config.release_owned_after_destroy();
             0
         }
 
@@ -2442,6 +2505,8 @@ unsafe fn config_proc_inner(
             // 由父窗口销毁等外部路径，重复调用是幂等的。
             if a.config.hwnd == hwnd {
                 a.config.free_resources();
+                // 走到这里窗口已经在销毁中，被推迟的刷子/图标可以收了
+                a.config.release_owned_after_destroy();
             }
             0
         }

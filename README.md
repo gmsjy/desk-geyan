@@ -13,7 +13,7 @@ Rust + 纯 Win32（`windows-sys`，无 GUI 框架）实现的两个桌面小工�
 | **位置** | 桌面右上角（可拖） | 屏幕顶部居中 |
 | **本体** | 毛玻璃底板 + 逐像素 alpha 文字层（两个窗口） | 单个分层窗口，胶囊自绘 |
 | **显示** | 时钟 · 日期 · 格言 | 时钟 · 绿点 · CPU · 内存 · 电池 · 消息 · 媒体 |
-| **形态** | 横版 / 竖版卷轴，四档动效 | 收起 34px / 拉长 / 展开 420×136 |
+| **形态** | 横版 / 竖版卷轴（条幅 · 极简 · 栏头），四档动效 | 收起 34px / 拉长 / 展开 420×136 |
 | **交互** | 全局热键 + 托盘 + 设置面板 | 悬停展开（唯一需要鼠标的地方） |
 | **穿透** | 始终穿透，布局模式下临时放行 | 始终穿透 |
 | **配置** | `%APPDATA%\DeskGeyan\config.ini` | 同一个文件，`island_*` 一组键 |
@@ -32,9 +32,23 @@ Rust + 纯 Win32（`windows-sys`，无 GUI 框架）实现的两个桌面小工�
 
 ![毛玻璃 · 竖版卷轴](shots/2_glass_vertical.png)
 
-竖版卷轴式：主文**竖排列自右向左**（条幅的读法），左侧三列是落款 ——
-自右向左为**时间**（主色）→ **出处** → **日期**（日期色）。
-竖排的句读点号挪到本格右上角，`——` 旋转 90° 后就是中列那根竖线。
+竖版卷轴式：**页头横排在顶上**（时间 + 日期，日期保留「星期三」），
+下方主文**竖排列自右向左**（条幅的读法），署名用小字接在正文末列下方。
+时间在**三种形态里一律横排** —— 不再逐字竖排；句读点号挪到本格右上角，
+`——` 旋转 90° 后就是正文旁边那根竖线。
+
+竖版有三种形态，托盘菜单「版式 → 竖排」里切换，默认是 B 极简：
+
+![三种竖版形态](docs/mock/vstyle_compare.png)
+
+| 形态 | 页头 | 界栏 | 署名 |
+| --- | --- | --- | --- |
+| A 条幅 `banner` | 时间、日期都居中 | 有 | 正文末列下方 |
+| B 极简 `minimal`（默认） | 时间左对齐、日期随行 | 无 | 正文末列下方 |
+| C 栏头 `head` | 时间左、日期右 | 有 | 正文左侧一列 |
+
+三种形态共用同一块画布，切换不动窗口尺寸。署名放不下时（窗口太矮 / 字号太大）
+会**横向让到正文块左侧**，而不是凭空消失 —— 消失容易被当成「这句没有出处」。
 
 ### 桌面格言：纯文字（`Ctrl+Alt+T`）
 
@@ -68,6 +82,13 @@ Rust + 纯 Win32（`windows-sys`，无 GUI 框架）实现的两个桌面小工�
 
 挂件本体点不到、托盘菜单一项项点又太碎，所以全部配置收进**两页**：
 左栏换字体，右栏上页是挂件、下页是灵动岛。改哪一项都**立即生效**，没有「确定」按钮。
+
+**数理公式** —— 内置一个 LaTeX 子集排版器：上下标、分式、根号、求和上下限、
+伸缩定界符 `\left(…\right)`、省略号、希腊字母、矢量箭头，覆盖高中物理 / 数学。
+公式写在格言里的 `$...$` 之间，与普通文案同库共存：横版内联排、竖版整块转 90°，
+缩字阶梯 / 溢出截断 / 逐列渐显全部沿用原有那一套。内置库末尾有一节 14 条公式格言；
+`assets/quotes-math-sample.txt` 是给用户抄的示例。选型与踩坑见
+[docs/公式排版.md](docs/公式排版.md)。
 
 ---
 
@@ -310,15 +331,18 @@ desk-geyan.exe                            # 正常启动
 desk-geyan.exe --autostart on|off|query   # 开机自启的查询 / 设置
 
 # 自检与行为探测：都不常驻、跑完即退，零副作用（配置先快照再原样写回）
---selftest     # 渲染管线 + 动效状态机 + 排版 + 设置面板控件清单（66 条命令）
+--selftest     # 渲染管线 + 动效状态机 + 排版 + 竖排三形态 + 设置面板控件清单（85 条断言）
 --islandtest   # 灵动岛 25 步：窗口生命周期 / 形状 / 分页 / 消息管道 / 通知与媒体
 --probe        # 读回窗口样式与可见性，验证「不干扰桌面」三道闸
 --clicktest    # 鼠标穿透的**行为**实测（真实光标，不读样式位）
 --dragtest     # 把「按下→移动→松开」灌进真窗口过程，验证拖动链路
---quotes       # 格言库真加载一遍：BOM / 注释漏入 / 分隔符残留 / 重复
+--icontest     # PE 资源图标：16/24/32/48 四档能否取出、尺寸是否精确、是不是系统默认图标
+--quotes       # 格言库真加载一遍：BOM / 注释漏入 / 分隔符残留 / 重复 / 公式标记配对
 --favtest      # 收藏当前句：真的按一次 Ctrl+Alt+F，验剪贴板 / 收藏夹 / 幂等
 --notifprobe   # 读一条系统通知（打印 handler / 标题 / 正文），不写配置
 --mediaprobe   # 问一次媒体会话（app / 标题 / 是否在播），不写配置
+--math         # 数理公式子集样张 → PNG（见 docs/公式排版.md）
+--mathquote    # 含公式的一句话走**真实渲染路径**，横竖各出一张 PNG + 耗时读数
 
 # 性能标定
 --perf         # 各档吞吐上限（µs/条）+ 空转出帧数
@@ -373,8 +397,9 @@ desk-geyan.exe --cfgshot shots/
 | `clock_dx` `clock_dy` | 时间日期块偏移 | `0` `0` |
 | `visible` | 启动时是否显示 | `true` |
 | `auto_hide_fs` | 全屏应用运行时自动隐藏 | `true` |
-| `orient` | `horizontal` / `vertical` | `horizontal` |
-| `letter_spacing` | 格言字距 `0-8` | `0` |
+| `orient` | `horizontal` / `vertical`（竖版卷轴式） | `horizontal` |
+| `v_style` | 竖版形态：`banner` / `minimal` / `head`（也认 `a` `b` `c` 与「条幅/极简/栏头」） | `minimal` |
+| `letter_spacing` | 格言字距 `0-8`（相对值，按整体字号缩放） | `0` |
 | `shrink_fit` | 放不下时允许缩字号回退（100% → 85% → 70%） | `true` |
 | `dpi_auto` | 字号跟随所在显示器 DPI，窗口同比缩放 | 新装 `true` |
 | `h_w` `h_h` `v_w` `v_h` | 两种版式各自的尺寸记忆 | 620×176 / 300×660 |
@@ -627,6 +652,21 @@ order by n."Order" desc limit 1
     改成遍历同类窗口 + 比 PID。**判据要指向"我自己的那个"，不是"长得像的那个"。**
 17. **`--islandtest` 断言「时钟逐位不动」却两次读墙钟** —— 跨过秒进位就假红（1/10 概率）。
     采信前先比 `clock_stamp`，变了就整套重来。**断言的时机是断言的一部分。**
+18. **手写 `.res` 的两个坑，报错都只说「文件损坏」** —— 为了不引入 crate、不依赖 `rc.exe`，
+    图标资源是 `build.rs` 直接写二进制。两个地方都触发同一句 `LNK1136: invalid or corrupt file`，
+    而报错里没有任何线索：① 整数资源 ID 要写成 `0x0000ffff | (id << 16)`，
+    **低字是 0xffff 标记、ID 在高字**（`RT_ICON 3` ⇒ 字节 `ff ff 03 00`）；
+    ② 文件头的 `DataSize` 必须填 **0**，填真实长度同样报损坏。
+    两处都是靠「用 `rc.exe` 编一份同名产物、逐字节 diff」才定位的。
+19. **ICO 里的小尺寸不要用 PNG 压缩** —— Pillow 保存 ICO 会把每一项都写成 PNG。
+    256px 用 PNG 是官方建议，但 **16/20/24 这类托盘尺寸用 PNG 会不显示或糊成一团**：
+    正确口径是「256 用 PNG，其余用 BMP（DIB）」。另外小尺寸不能靠大图缩放 ——
+    52×52 缩到 16 只剩灰点，所以 `assets/desk-geyan.ico` 里 16/20/24 三档是手绘简化稿。
+20. **`WM_SETICON` 设进去的图标，窗口不负责释放** —— 每次 `LoadImageW` 都是一份新位图，
+    文档明确由调用方 `DestroyIcon`。加上 `RegisterClassW` 每轮重入失败却又重取了一次
+    `wc.hIcon`，设置面板开关一次就漏 9 个 GDI 句柄。**凡是"我建的对象交给系统保管"，
+    都要问一句"谁负责删"。** 顺带一条：交给 `WM_CTLCOLOR*` 的刷子在窗口存活期间
+    `DeleteObject` 一律失败（`ERROR_INVALID_HANDLE`），只能等 `DestroyWindow` 之后收尾。
 
 ---
 
@@ -635,8 +675,7 @@ order by n."Order" desc limit 1
 ```
 src/
   main.rs        入口 + 各 --xxx 验证入口的分派
-  app/           应用主体（原 app.rs，9151 行拆成 8 个模块）
-    mod.rs       App 状态 + 建窗引导 + 进程入口 + 模块间共享面
+  app/           应用主体（原 app.rs，9151 行拆成 8 个模块）    mod.rs       App 状态 + 建窗引导 + 进程入口 + 模块间共享面
     window.rs    Win32 窗口层：创建 / Acrylic / 穿透 / 几何 / 可见性
     render.rs    帧构建与绘制：三通道掩码 → 合批 → ULW 上屏
     frame.rs     帧调度：tick / step / needs_frame / 全屏守卫
@@ -651,10 +690,11 @@ src/
     ease.rs      缓动
     feed.rs      系统通知（winsqlite3）与媒体（WinRT SMTC）两条数据源
   layout.rs      **纯函数排版引擎**：折行 + 避头尾 + 缩字回退 + 竖版列切分与标点归位
-  transition.rs  **纯逻辑换句动效状态机**：顺序相位 + 缓动 + 分通道 alpha 系数
-  gfx.rs         渲染核心：DIB / 一趟画三条掩码通道 / 预乘合成 / PolyTextOutW 合批 / ULW
-  config_ui.rs   **设置面板**：表格驱动的两页布局 + 字体枚举 + owner-draw 字体列表
-  quotes.rs      格言库加载：内置库读同目录文件 + 外部多文件分组（round-robin）+ 自检
+  transition.rs  **纯逻辑换句动效状态机**：顺序相位 + 缓动 + 分通道 alpha 系数（不碰 GDI）
+  tex.rs         **纯函数公式排版**：LaTeX 子集 → 盒子树 → 定位表（上下标/分式/根号/求和/矢量/定界符/省略号）
+  gfx.rs         渲染核心：DIB / 一趟画三条掩码通道 / 预乘合成 / PolyTextOutW 逐段合批 / ULW
+  config_ui.rs   **设置面板**：表格驱动的两页布局 + 系统字体枚举 + owner-draw 字体列表
+  quotes.rs      格言库加载：内置库读同目录文件 + 外部多文件分组（round-robin）+ --quotes 自检
   favorites.rs   收藏夹：当前句子 → quotes/favorites.txt（独立一组，查重幂等）
   autostart.rs   开机自启：Run 键读写 + 备份/恢复决策（纯函数可测）
   config.rs      配置读写 + 预设（字体 / 颜色 / 字号档位）
@@ -663,6 +703,8 @@ src/
   consts.rs      Win32 常量（自持，不依赖 crate 的常量导出）
   util.rs        宽字符串 / 时间格式化 / 颜色解析
   png.rs         极简 PNG 写出（stored deflate，零依赖），只给 --dump 用
+  icon.rs        应用图标：从 PE 资源按像素尺寸取 HICON，取不到退回系统默认
+build.rs         把 assets/desk-geyan.ico 手写成 .res 编进 PE 资源（不引入 crate、不调 rc.exe）
 assets/quotes-builtin.txt    内置格言库 455 条（**随包平铺发布，必须与 exe 同目录**）
                              查找顺序是「exe 同目录」优先于「上一级 assets/」。开发时若
                              target/release/ 里也躺着一份旧副本，改 assets/ 不会生效
@@ -671,6 +713,9 @@ docs/申论写作素材.md          同一批素材的可检索版
 tools/pack_release.py        打包 + 新用户视角自检（空目录解压 + 空 DG_DATA_DIR）
 tools/island_live_test.py    灵动岛真机测试（屏幕合成口径：洋红底 + 绝对颜色找连通块）
 tools/glass_shot.py          效果图抓屏脚本（毛玻璃是 DWM 合成的，--dump 抓不到）
+tools/make_ico.py            从多尺寸 PNG 生成 assets/desk-geyan.ico（<256 用 BMP，256 用 PNG）
+tools/pack_release.py        发布包打包
+assets/desk-geyan.ico        应用图标源文件：10 档尺寸，16/20/24 是**单独手绘**的简化版
 ```
 
 ## 环境要求

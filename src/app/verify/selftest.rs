@@ -1,4 +1,4 @@
-//! `--selftest`：78 条自检，覆盖排版 / 绘制 / 动效 / 交互 / 配置。
+//! `--selftest`：84 条自检，覆盖排版 / 绘制 / 动效 / 交互 / 配置。
 //!
 //! 设计前提是「起点是常量」：`a.cfg` 钉成默认值，**格言库也必须钉死** ——
 //! 凡是被测结果依赖的用户态数据，都要一起钉住，否则断言会随机器而变。
@@ -7,7 +7,7 @@ use super::*;
 
 use crate::{autostart, clipboard, favorites, transition};
 use crate::bench::with_config_guard;
-use crate::config::{self, Anim, Config, Orient};
+use crate::config::{self, Anim, Config, Orient, VStyle};
 use crate::config_ui;
 use crate::gfx::{self, Fonts};
 use crate::layout;
@@ -625,7 +625,12 @@ pub(crate) fn selftest() -> i32 {
         // ⇒ 至少 2 列（ncols=1 时错峰退化为整块渐显，断言对象直接消失）；
         // 带出处才能验「出处随格言」。不钉的话谁在前面改 qi，这里就跟着抖。
         if let Some(i) = (0..a.list.len())
-            .filter(|&i| !a.list[i].author.is_empty())
+            // **排除含公式的句子**：以下几组断言量的是「纯文字竖版」的
+            // 列距 / 瓦片 / 错峰规律，公式句走的是 `layout_rich`，
+            // 列的语义不同（公式整块占位）。公式句自己的守卫在 `--mathquote`。
+            // 不排除的话，谁往词库里加一条长公式，这里就会跟着红 ——
+            // 红的原因还跟被验的东西毫无关系。
+            .filter(|&i| !a.list[i].author.is_empty() && !a.list[i].has_math())
             .max_by_key(|&i| a.list[i].display().chars().count())
         {
             a.qi = i;
@@ -738,8 +743,11 @@ pub(crate) fn selftest() -> i32 {
         // 会右移贴主文，拿 layout_sign 的原位取样就是 0 px（真管线和
         // 自检走同一个 hug_sign，不许各推一遍）。
         let cb0 = layout_clock(&mut a);
+        // `layout_clock` 原样（`place_sign` 之前）有没有造出署名 —— 下面用它
+        // 区分「按设计让位」和「压根没生成」。`cb0` 等下要 move 进 `place_sign`。
+        let had_sig = !cb0.sig.is_empty();
         let ql0 = frame_layout(&a, &cb0);
-        let cb = hug_sign(&a.cfg, cb0, &ql0);
+        let cb = place_sign(&a.cfg, cb0, &ql0);
         let ql = frame_layout(&a, &cb);
         let ncol = ql.col_ranges.len();
 
@@ -830,84 +838,135 @@ pub(crate) fn selftest() -> i32 {
             ),
         ));
 
-        // ⑦ 出处随格言：出处列 alpha ≈ 最左列 k；日期列逐位不动。
+        // ⑦ 出处随格言：署名区 alpha ≈ 最左列 k；页头日期逐位不动。
+        //
+        //    竖排版式的日期从「落款块里的一列」搬到了**页头横排**，于是
+        //    date 通道上现在只有两块墨：页头日期 + 署名。两块都按矩形圈定
+        //    （不能只按 x 分 —— B 极简的日期偏上、署名居中偏下，x 区间是重叠的），
+        //    落在署名矩形里的验「跟着淡」，落在别处的验「纹丝不动」。
+        //
+        //    **署名可能合法地不存在**：这句是「带出处且最长」的 36 字，竖版
+        //    按列自适应会把它撑满整块版心，署名没地方落脚就按设计让位
+        //    （宁可不落名，也不叠在字上，见 `place_sign`）。所以页头日期那半
+        //    必须无条件验 —— 曾经把整段统计写在 `if let Some(作者列)` 里，
+        //    署名一让位、两个计数器就都是 0，红出来的信息还叫「日期 0 px」，
+        //    完全指错了方向。
         let author_col = cb.sig.iter().find(|c| c.is_author);
-        let date_col = cb.sig.iter().find(|c| !c.main_color && !c.is_author);
         let (mut au_ok, mut au_n, mut dt_ok, mut dt_n) = (true, 0usize, true, 0usize);
         let want_author = transition::column_k(ncol - 1, ncol, t_arrive) as f64;
-        if let (Some(ac), Some(dc)) = (author_col, date_col) {
-            for y in 0..fh {
-                for x in 0..fw {
-                    let i = (y * fw + x) as usize;
-                    if m1[i] < 128 || m0[i] > 0 || m2[i] > 0 {
-                        continue; // 只取纯日期通道像素
+        let (mut ax0, mut ax1, mut ay0, mut ay1) = (0i32, 0i32, 0i32, 0i32);
+        if let Some(ac) = author_col {
+            ax0 = ac.x;
+            ax1 = ac.x + cb.sig_w.max(1);
+            ay0 = ac.y;
+            ay1 = ac.y + ac.s.len() as i32 * cb.sig_cell.max(1); // 一个汉字一个 u16
+        }
+        for y in 0..fh {
+            for x in 0..fw {
+                let i = (y * fw + x) as usize;
+                if m1[i] < 128 || m0[i] > 0 || m2[i] > 0 {
+                    continue; // 只取纯日期通道像素
+                }
+                let a1 = (v1[i] >> 24) & 0xFF;
+                let a2 = (v2[i] >> 24) & 0xFF;
+                if a1 < 48 {
+                    continue;
+                }
+                if x >= ax0 && x < ax1 && y >= ay0 && y < ay1 {
+                    au_n += 1;
+                    let r = a2 as f64 / a1 as f64;
+                    if (r - want_author).abs() > 0.08 {
+                        au_ok = false;
                     }
-                    let a1 = (v1[i] >> 24) & 0xFF;
-                    let a2 = (v2[i] >> 24) & 0xFF;
-                    if a1 < 48 {
-                        continue;
-                    }
-                    if x >= ac.x && x < ac.x + cb.sig_w.max(1) {
-                        au_n += 1;
-                        let r = a2 as f64 / a1 as f64;
-                        if (r - want_author).abs() > 0.08 {
-                            au_ok = false;
-                        }
-                    } else if x >= dc.x && x < dc.x + cb.sig_w.max(1) {
-                        dt_n += 1;
-                        if (a2 as i32 - a1 as i32).abs() > 1 {
-                            dt_ok = false;
-                        }
+                } else {
+                    // 署名之外 = 页头日期（静帧）：换句过渡中必须逐位相同。
+                    dt_n += 1;
+                    if (a2 as i32 - a1 as i32).abs() > 1 {
+                        dt_ok = false;
                     }
                 }
             }
-        } else {
-            au_ok = false; // 没有出处列可验 = 环境不对，不许假绿
         }
+        // 署名在 = 两条都得成立；署名让位 = 日期那条仍得成立，但不许是
+        // 「压根没造出来」（那是 `layout_header_v` 的事，不是让位）。
+        let sig_ok = match author_col {
+            Some(_) => au_ok && au_n > 20,
+            None => had_sig,
+        };
         rows.push((
-            "PR3·出处随格言、日期列不动",
-            au_ok && dt_ok && au_n > 20 && dt_n > 20,
-            format!(
-                "出处 {} px 比值应≈{:.3} · 日期 {} px 逐位相同 · 出处动={} 日期动={}",
-                au_n, want_author, dt_n, !au_ok, !dt_ok
-            ),
+            "PR3·出处随格言、页头日期不动",
+            sig_ok && dt_ok && dt_n > 20,
+            if author_col.is_some() {
+                format!(
+                    "出处 {} px 比值应≈{:.3} · 页头日期 {} px 逐位相同 · 出处动={} 日期动={}",
+                    au_n, want_author, dt_n, !au_ok, !dt_ok
+                )
+            } else {
+                format!(
+                    "页头日期 {} px 逐位相同（日期动={}）· 署名按设计让位（版面占满）· 正文 {} 列",
+                    dt_n, !dt_ok, ncol
+                )
+            },
         ));
 
-        // ⑧ 竖版最右列完整可见（孤儿项：右缘墨迹被裁剪区切掉的回归守卫）。
-        //    判据两条：版心右缘 4px 内有格言墨（谁删了右列谁红）；
-        //    **瓦片右缘外也有墨** —— 列瓦片是半开区间 `[l, r)`（layout.rs），
-        //    首列右缘贴版心右缘 br，字形墨迹天然越过它 1px（默认字体实测
-        //    最右墨迹 x=br；`--dump` 实测 300×660 右缘曾被切 9px 的那次，
-        //    切的正是 x ≥ br 这几列）。任何静态裁剪区切在 br 都会先抹掉
-        //    这圈外溢 ⇒ 外溢窗口从 br 起算（含），注毒实测内测墨查不出裁剪。
-        //    U5 居中之后有效右缘 = band.2 - 居中偏移（读内核缓存，不自己推）。
-        let br = band.2 - a.v_center.get().1;
-        let mut edge_ink = 0usize;
-        let mut spill_ink = 0usize;
+        // ⑧ 竖版首列完整可见（孤儿项：右缘墨迹被裁剪区切掉的回归守卫）。
+        //
+        //    旧判据是「版心右缘外还有 1px 外溢墨」—— 它成立靠的是一个巧合：
+        //    竖版正文**右起**，首列字紧贴版心右缘，字形墨迹天然越过步进框
+        //    1~2px。现在 A/B 两形态改成按墨迹居中（`Align::Center`），首列
+        //    离版心右缘还有小半列，外溢窗口里永远是 0 px，那条判据就只会
+        //    恒红、再也不指示任何东西。
+        //
+        //    改成量的**几何**：首列每个字形连同字宽都必须落在版心内、
+        //    墨迹右缘不越出版心、且版心两边外侧不许有格言墨。版心外的墨
+        //    只可能来自两处 —— 排版越界，或有人又给静态内容加了一刀裁剪
+        //    （`with_clip` 会把越界的那部分削平，留下正好停在版心边上的
+        //    整齐断口）。两条路都在这三条判据里现形。
+        let (bl, br) = (band.0, band.2);
+        let mut out_ink = 0usize;
         let mut max_ink_x: i32 = -1;
         for y in 0..fh {
             for x in 0..fw {
-                if m2[(y * fw + x) as usize] > 0 && x > max_ink_x {
+                if m2[(y * fw + x) as usize] == 0 {
+                    continue;
+                }
+                if x > max_ink_x {
                     max_ink_x = x;
                 }
-            }
-            for x in (br - 4).max(0)..(br + 2).min(fw) {
-                if m2[(y * fw + x) as usize] > 0 {
-                    edge_ink += 1;
-                }
-            }
-            for x in br..((br + 3).min(fw)) {
-                if m2[(y * fw + x) as usize] > 0 {
-                    spill_ink += 1;
+                if x >= br || x < bl {
+                    out_ink += 1;
                 }
             }
         }
+        let mut col_in = true;
+        if let Some(&(g0, g1)) = ql.col_ranges.first() {
+            for g in &ql.glyphs[g0..g1] {
+                // 字形原点在版心内（墨迹越界由上面的 `out_ink` 兜）。
+                if g.x < bl || g.x >= br {
+                    col_in = false;
+                }
+            }
+        } else {
+            col_in = false; // 没有首列 = 环境不对，不许假绿
+        }
+        // 版心不许虚胖：正文块得**贴着版心中线**。A/B 走居中摆位，
+        // 左右留白本来就不相等（列内居中的 inset 偏在一侧），所以容差给一列；
+        // 真把版心算错（比如忘了减 pad）时，一侧留白会整块塌掉。
+        let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
+        for g in &ql.glyphs {
+            min_x = min_x.min(g.x);
+            max_x = max_x.max(g.x);
+        }
+        let left_gap = min_x - bl;
+        let right_gap = br - max_x;
+        let pitch = layout::Metrics::new(a.cfg.quote_font_px(), a.cfg.quote_font_px()).col_pitch;
+        let snug = max_x >= min_x && (left_gap - right_gap).abs() <= (pitch * 2).max(8);
         rows.push((
-            "PR3·竖版最右列完整可见（无静态裁剪区）",
-            edge_ink > 0 && spill_ink > 0,
+            "PR3·竖版首列完整可见（版心外无墨 · 无静态裁剪）",
+            col_in && out_ink == 0 && snug,
             format!(
-                "版心右缘 {} 附近 {} px + 外溢 {} px 格言墨 · 最右墨迹 x={} · 瓦片右缘 {:?}（外溢为 0 ⇒ 有裁剪区在切）",
-                br, edge_ink, spill_ink, max_ink_x, ql.col_x.first().copied(),
+                "首列字全在版心内={} · 版心外墨 {} px · 最右墨迹 x={}（版心右缘 {}）· 左右留白 {} / {}",
+                col_in, out_ink, max_ink_x, br, left_gap, right_gap
             ),
         ));
 
@@ -1216,10 +1275,13 @@ pub(crate) fn selftest() -> i32 {
     {
         // 极端：最大窗宽 × 最小窗高 × 超长句。每列只装得下 3 个字，
         // 600 字 → 200 列，必然撞上排版上限。
+        // 宽度必须留够：`max_cols = min(avail_w / col_pitch, MAX_COLS)`，
+        // 列距按 1.7 倍字宽算，4000px 只能排 117 列 —— 触不到 127 那道闸，
+        // 断言就退化成「量了个数」而不是「撞上限时的收尾」。
         let text: Vec<char> = "国".repeat(600).chars().collect();
         let adv = vec![20; text.len()];
         let m = layout::Metrics::new(20, 20);
-        let q = layout::layout(&text, &adv, m, Orient::Vertical, (0, 0, 4000, 80), 0);
+        let q = layout::layout(&text, &adv, m, Orient::Vertical, (0, 0, 6000, 80), 0);
         let cols = q.col_x.len();
         // 撞上限时必须走和「窗口装不下」一样的收尾：截断 + 末字省略号
         let capped = cols == layout::MAX_COLS && q.overflow && q.ellipsis;
@@ -1668,6 +1730,9 @@ pub(crate) fn selftest() -> i32 {
             MI_SHRINK_FIT,
             MI_ORIENT_BASE,
             MI_ORIENT_BASE + 1,
+            MI_VSTYLE_BASE,
+            MI_VSTYLE_BASE + 1,
+            MI_VSTYLE_BASE + 2,
             MI_ANIM_BASE,
             MI_ANIM_BASE + 1,
             MI_ANIM_BASE + 2,
@@ -2760,15 +2825,20 @@ pub(crate) fn selftest() -> i32 {
             (Some(f), Some(l)) => f.x >= l.x && f.y <= l.y,
             _ => false,
         };
+        // 竖排改版后 `sig` 只剩**署名一列**：时间与日期都搬到页头横排了，
+        // 不再是落款块里的三列（出处 + 日期两行）。这里顺带钉死这条语义，
+        // 免得谁把日期又塞回 `sig` 里、页头摆位悄悄退回旧样子。
+        let sig_ok = cb.sig.len() == 1 && cb.sig[0].is_author;
         rows.push((
             "竖版·主文竖排右起",
-            !ql.is_empty() && v_inside && right_first && cb.sig.len() == 3,
+            !ql.is_empty() && v_inside && right_first && sig_ok,
             format!(
-                "{}x{} · {} 列 / 落款 {} 列 / 全在窗内 {}",
+                "{}x{} · {} 列 / 落款 {} 列（署名={}）· 全在窗内 {}",
                 a.cfg.w,
                 a.cfg.h,
                 ql.lanes,
                 cb.sig.len(),
+                cb.sig.iter().any(|c| c.is_author),
                 v_inside
             ),
         ));
@@ -2779,6 +2849,43 @@ pub(crate) fn selftest() -> i32 {
                 "配置动效 {} → 生效 {}",
                 a.cfg.anim.label(),
                 a.cfg.eff_anim().label()
+            ),
+        ));
+
+        // 公式句也能转跑马灯。以前这里排除过 `has_math`，理由是「跑马灯画的
+        // 是 `display()` 原文，会露出 `$...$`」；现在跑马灯会给公式句排一张
+        // 定位表（`render::marquee_item`），排除就必须去掉 —— 否则窄窗口里
+        // 的长公式句只能被截断 + 省略号，永远滚不起来。
+        //
+        // 这里只验「排版确实溢出」：`force_marquee` 的置位在 `build_frame_ex`
+        // 里，要真窗口 + DC，自检不碰那一条。
+        let saved_qi = a.list[a.qi].clone();
+        a.cfg = Config::default();
+        a.cfg.set_orient(Orient::Horizontal);
+        a.cfg.anim = Anim::Marquee;
+        a.cfg.w = 420;
+        a.cfg.h = 130;
+        a.force_marquee = false;
+        a.list[a.qi] = Quote {
+            text: "自然对数的底 $e = \\lim_{n \\to \\infty}\\left(1 + \\frac{1}{n}\\right)^n$ 由欧拉给出"
+                .to_string(),
+            author: "欧拉".to_string(),
+        };
+        a.rebuild_fonts();
+        let cb = layout_clock(&mut a);
+        let ql = frame_layout(&a, &cb);
+        let math_scrolls = ql.overflow;
+        a.list[a.qi] = saved_qi;
+        rows.push((
+            "横版·长公式句溢出可转滚",
+            math_scrolls,
+            format!(
+                "{}x{} 里 {} 字形 + {} 公式块 → 溢出 {}",
+                a.cfg.w,
+                a.cfg.h,
+                ql.glyphs.len(),
+                ql.math.len(),
+                ql.overflow
             ),
         ));
 
@@ -2825,7 +2932,12 @@ pub(crate) fn selftest() -> i32 {
         a.cfg = Config::default();
         a.cfg.set_orient(Orient::Vertical);
         a.cfg.w = 1052;
-        a.cfg.h = 315;
+        // 高度要**恰好**让一列装得下一个分句（8 字）而装不下整句（16 字）：
+        // 断了才有一句一列可验。实测 1052 宽下页头只吃 55px（时间日期同行），
+        // 每格 30px ⇒ 373 给出 9 格的列高，列尾 3 格窗口正好罩住第 8 个字的「，」。
+        // 给到 520 就是 13 格 —— 第一列能塞 13 个字，断点落在「古」后面，
+        // 这条断言会红在一个跟断句逻辑毫无关系的地方。
+        a.cfg.h = 373;
         a.list[a.qi] = Quote {
             text: "箫鼓追随春社近，衣冠简朴古风存。".to_string(),
             author: "陆游".to_string(),
@@ -2866,31 +2978,282 @@ pub(crate) fn selftest() -> i32 {
                     .collect::<Vec<_>>()
             ),
         ));
-        // ③ 落款跟排的最终位置只能从 build_frame 读（hug 在里面做），
-        // clock_rect 就是落款条落定后的矩形 —— 读内核结果，不复制算法。
-        let op = a.text_alpha();
-        build_frame(&mut a, op);
-        let cr = a.clock_rect;
-        // 主文左缘读**真实字形最小 x**：U5 居中之后主文不再贴 br，
-        // 用 w-24-extent 推会偏一个居中偏移量（与 hug_sign 同一口径）。
-        let main_left = ql
-            .glyphs
-            .iter()
-            .map(|g| g.x)
-            .min()
-            .unwrap_or(a.cfg.w - 24);
-        let hug_ok = (cr.right - (main_left - 24)).abs() <= 2 && cr.left >= 24;
+        // ③ 署名跟排的最终位置只能从 `place_sign` 读 —— 真管线
+        // `build_frame` 里调的就是它，读内核结果，不复制算法。
+        //
+        // 竖排改版后署名的语义从「落款条」变成了**题跋**：A/B 接在末列
+        // 正下方（x 与正文块左缘对齐），C 栏头式挂在正文左侧（x 让开
+        // 一个 em + 列宽）。旧的「右缘贴主文左缘、以 clock_rect 为准」
+        // 是落款条时代的读法 —— 那时 `clock_rect` 就是落款条矩形，现在
+        // 它是页头时钟块，再拿它量署名只会量到天头。
+        //
+        // 换一条**短句**：题跋要有地方落脚，正文就必须不占满版面。长句在
+        // 竖版里会被拉伸到顶满整个版心（列数、列高按可用高度自适应），
+        // 底下一点余量都不剩 —— 那时 `place_sign` 按设计让署名让位
+        // （宁可不出名字，也不叠在字上），断言拿不到位置。
+        a.cfg.h = 520;
+        a.list[a.qi] = Quote {
+            text: "上善若水。".to_string(),
+            author: "老子".to_string(),
+        };
+        a.rebuild_fonts();
+        let cb0 = layout_clock(&mut a);
+        let ql0 = frame_layout(&a, &cb0);
+        let cb1 = place_sign(&a.cfg, cb0, &ql0);
+        let origin = crate::layout::content_origin(&ql0);
+        let body_bottom = origin.1 + ql0.extent.1;
+        let sig_ok = match cb1.sig.iter().find(|c| c.is_author) {
+            Some(c) => {
+                let below = c.y >= body_bottom; // 不压在正文上
+                let align_x = (c.x - origin.0).abs() <= 2; // 接在末列正下方
+                let rows_n = c.s.len() as i32;
+                let inside = c.x >= 0
+                    && c.y >= 0
+                    && c.x + cb1.sig_w.max(1) <= a.cfg.w
+                    && c.y + rows_n * cb1.sig_cell.max(1) <= a.cfg.h;
+                below && align_x && inside
+            }
+            None => false,
+        };
         rows.push((
-            "竖版·落款跟排（右缘贴主文左缘）",
-            hug_ok,
+            "竖版·署名跟排（题跋式接在末列下方）",
+            sig_ok,
             format!(
-                "落款右缘 {} · 主文左缘 {} · 期望贴在 {} · 落款左缘 {}（≥24）",
-                cr.right,
-                main_left,
-                main_left - 24,
-                cr.left
+                "署名 ({}, {}) · 正文 ({},{}) 尺寸 {:?} / 左缘差 {} px · 窗高 {} pad {} 格 {} · 列 {:?}",
+                cb1.sig.first().map(|c| c.x).unwrap_or(-1),
+                cb1.sig.first().map(|c| c.y).unwrap_or(-1),
+                origin.0,
+                origin.1,
+                ql0.extent,
+                cb1.sig
+                    .first()
+                    .map(|c| (c.x - origin.0).abs())
+                    .unwrap_or(-1),
+                a.cfg.h,
+                a.cfg.pad_v(),
+                cb1.sig_cell,
+                ql0.col_ranges.iter().map(|&(a, b)| b - a).collect::<Vec<_>>()
             ),
         ));
+
+        // ---- ④ 竖排改版的三条硬约束（2026-11-04 老板定）：
+        //      ① 三形态可切，**切了之后 `layout_clock` 的缓存必须失效**；
+        //      ② 时间在**所有**形态下都横排（逐字竖排那条路已经删干净了）；
+        //      ③ 日期降级先保星期（「11月4日 星期三」放不下才退到「11月4日」）。
+        //
+        // 三条都是「删掉某段代码就必然红」的写法，不是复述现状。
+        {
+            let saved = a.cfg.clone();
+            a.cfg.orient = Orient::Vertical;
+            a.cfg.w = 420;
+            a.cfg.h = 660;
+            a.cfg.show_clock = true;
+            a.cfg.show_date = true;
+            a.cfg.show_quote = true;
+            a.cfg.shadow = false;
+            a.rebuild_fonts();
+
+            // ① 缓存放失效。**必须先让缓存建立起来再切**：只在切完第一次读，
+            //    缓存里什么都没有，谁都能"过"。这里每一轮都在上一轮的基础
+            //    上换形态 —— 若指纹漏了 v_style，第二轮就会原样返回第一轮
+            //    的 `time_at`，三组几何立刻退化成一种。
+            /// 一种形态的页头几何：时间锚点、日期锚点、有没有界栏。
+            type Geo = ((i32, i32), (i32, i32), bool);
+            let mut geoms: Vec<Geo> = Vec::new();
+            let mut names = Vec::new();
+            for st in VStyle::all() {
+                a.cfg.v_style = st;
+                let cb = layout_clock(&mut a);
+                geoms.push((cb.time_at, cb.date_at, cb.rule.is_some()));
+                names.push(st.label());
+            }
+            let mut uniq = geoms.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            rows.push((
+                "竖排·切形态缓存必失效（时间/日期/界栏随之变）",
+                uniq.len() == geoms.len(),
+                format!(
+                    "{} 种形态 / {} 种几何 · {}",
+                    geoms.len(),
+                    uniq.len(),
+                    names
+                        .iter()
+                        .zip(&geoms)
+                        .map(|(n, g)| format!(
+                            "{}@({},{}){}",
+                            n,
+                            g.0 .0,
+                            g.0 .1,
+                            if g.2 { " 有界栏" } else { "" }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ),
+            ));
+
+            // ② 时间横排：量 CH_CLOCK 通道在**页头范围内**的墨迹包围盒。
+            //    "17:16:54" 横着排必然宽 > 高；逐字竖排则是高 > 宽。
+            //    上界取 `head_bottom`（界栏正好落在这一行，不能把它算进来）。
+            let mut horiz_ok = true;
+            let mut detail = Vec::new();
+            for st in VStyle::all() {
+                a.cfg.v_style = st;
+                let cb = layout_clock(&mut a);
+                let y_max = cb.head_bottom.clamp(0, a.cfg.h);
+                let op = a.text_alpha();
+                build_frame(&mut a, op);
+                let m0 = a.frame.channel_mask(0);
+                let (w, h) = (a.cfg.w, a.cfg.h);
+                let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+                for y in 0..y_max.min(h) {
+                    for x in 0..w {
+                        if m0[(y * w + x) as usize] >= 96 {
+                            x0 = x0.min(x);
+                            x1 = x1.max(x);
+                            y0 = y0.min(y);
+                            y1 = y1.max(y);
+                        }
+                    }
+                }
+                let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+                let ok = bw > 0 && bw >= bh * 2;
+                if !ok {
+                    horiz_ok = false;
+                }
+                detail.push(format!("{} {}x{}", st.label(), bw, bh));
+            }
+            rows.push((
+                "竖排·时间三形态一律横排（宽须 ≥ 2 倍高）",
+                horiz_ok,
+                detail.join(" · "),
+            ));
+
+            // ③ 日期降级先保星期：扫一串宽度，凡是**掉了星期**的，都得证明
+            //    「11月4日 星期三」那一档当时真的放不下 —— 否则就是降级链
+            //    把星期当成了第一个可牺牲的东西。
+            // 判据不靠「自己量一遍文本宽度」—— 那需要和排版层用同一个字体、
+            // 同一套 padding，复刻一遍就等于把被测逻辑抄了一份，抄错了还
+            // 一起错。这里只看**降级链的形态**：一路收窄，必须先丢年份、
+            // 再丢星期，绝不能反过来，也不能丢完又冒出来。
+            let mut order_ok = true;
+            let mut trails: Vec<String> = Vec::new();
+            let (mut saw_full, mut saw_no_year, mut saw_drop) = (false, false, false);
+            let mut dropped_at: Option<i32> = None;
+            for w in [460, 420, 360, 320, 280, 250, 220, 200, 180, 160, 140, 120, 100] {
+                a.cfg.w = w;
+                a.cfg.v_style = VStyle::Minimal;
+                let cb = layout_clock(&mut a);
+                let txt = cb
+                    .date
+                    .as_ref()
+                    .map(|s| String::from_utf16_lossy(s))
+                    .unwrap_or_default();
+                let has_week = txt.contains('星');
+                let has_year = txt.contains('年');
+                if txt.is_empty() {
+                    trails.push(format!("{}空", w)); // 连最短一档都放不下
+                    continue;
+                }
+                if !has_week {
+                    saw_drop = true;
+                    dropped_at = dropped_at.or(Some(w));
+                    trails.push(format!("{}✗", w));
+                } else {
+                    trails.push(format!("{}{}", w, if has_year { "✓年" } else { "✓" }));
+                    // 掉过星期之后又出现带星期的 = 降级不单调
+                    if dropped_at.is_some() {
+                        order_ok = false;
+                    }
+                    if has_year {
+                        saw_full = true;
+                    } else {
+                        saw_no_year = true;
+                    }
+                }
+            }
+            rows.push((
+                "竖排·日期降级（先丢年份 · 再丢星期 · 单调）",
+                order_ok && saw_full && saw_no_year && saw_drop,
+                format!(
+                    "各宽度：{} · 宽窗带年份={} 中档去年前保星期={} 窄窗丢星期={} 首丢于 {}px",
+                    trails.join(" "),
+                    saw_full,
+                    saw_no_year,
+                    saw_drop,
+                    dropped_at.unwrap_or(-1)
+                ),
+            ));
+
+            a.cfg = saved;
+            a.rebuild_fonts();
+        }
+
+        // （431×1084 @300%）。两个失败模式各一条断言：
+        //
+        // ① 落款三列曾被压到列距 49px / 字宽 48px = 1.02 倍，三列在屏幕上糊成
+        //    一条，分不出哪列是时间哪列是署名。现在列距有硬下限，放不下就减列。
+        // ② `pad()` 只跟字号走（300% ⇒ 72px），在 431 宽的条幅上吃掉 33% 宽度，
+        //    正文只剩一列半 + 省略号。竖版改用 `pad_v()`（按窗宽 8% 封顶）。
+        {
+            let saved = a.cfg.clone();
+            a.cfg.w = 431;
+            a.cfg.h = 1084;
+            a.cfg.scale = 300;
+            a.rebuild_fonts();
+            let cb_n = layout_clock(&mut a);
+            let ql_n = frame_layout(&a, &cb_n);
+            // 列距不许被挤扁。竖排改版后署名只剩一列，量不到「相邻两列」了，
+            // 改量**排版尺子**本身 —— 这条守的是 `Metrics::new` 里那个 1.70
+            // 倍列距（曾被改成 1.15，窄窗大字号下三列糊成一条黑）。
+            let m = layout::Metrics::new(a.cfg.quote_font_px(), a.cfg.quote_font_px());
+            let pitch = m.col_pitch;
+            let gap_ok = pitch as f32 >= m.char_w as f32 * 1.2;
+            // 正文不截断（有省略号 = 真的装不下）。列数不再是判据：列距
+            // 放宽到 1.70 倍之后，431 宽 @300% 就是一列，这是版面的必然结果。
+            let body_ok = !ql_n.overflow;
+            rows.push((
+                "竖版·窄窗大字号（列距 / 正文不截断）",
+                gap_ok && body_ok,
+                format!(
+                    "431x1084@300% · 列距 {}px / 字宽 {}px（须 ≥1.2 倍）· 正文 {} 列 · 截断={} · pad={}px",
+                    pitch, m.char_w, ql_n.lanes, ql_n.overflow, a.cfg.pad_v()
+                ),
+            ));
+            a.cfg = saved;
+            a.rebuild_fonts();
+        }
+
+        // ---- ③c 竖版落款列**不许越出窗口**。
+        // 落款是竖排的一条，高度 = 最长那列的格数 × 单元格。字号涨、窗口不涨时
+        // 它会先顶到窗口底（`--dump 600x1084@300%`：日期列写到最后只剩一个
+        // 「星」，星期几的其余字被窗口裁掉）。
+        {
+            let saved = a.cfg.clone();
+            let mut bad = Vec::new();
+            for (w, h, sc) in [(431, 1084, 300), (600, 1084, 300), (300, 660, 100)] {
+                a.cfg.w = w;
+                a.cfg.h = h;
+                a.cfg.scale = sc;
+                a.rebuild_fonts();
+                let cb_n = layout_clock(&mut a);
+                let bottom = cb_n.y + cb_n.h;
+                if cb_n.show && bottom > h {
+                    bad.push(format!("{w}x{h}@{sc}% 落款底 {bottom} > {h}"));
+                }
+            }
+            rows.push((
+                "竖版·落款列不越出窗口",
+                bad.is_empty(),
+                if bad.is_empty() {
+                    "431/600×1084@300% 与 300×660@100% 全部在窗内".into()
+                } else {
+                    bad.join(" · ")
+                },
+            ));
+            a.cfg = saved;
+            a.rebuild_fonts();
+        }
 
         // ---- ⑥ 合批绘制 vs 逐字绘制：**逐像素必须一模一样**。
         //

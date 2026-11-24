@@ -13,9 +13,9 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT,
 use windows_sys::Win32::Graphics::Gdi::{BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HGDIOBJ, PAINTSTRUCT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
-use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HCURSOR, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu};
+use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HCURSOR, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu};
 use crate::{autostart, clipboard, favorites, island};
-use crate::config::{self, Anim, Config, Mode, Orient};
+use crate::config::{self, Anim, Config, Mode, Orient, VStyle};
 use crate::config_ui;
 use crate::consts::*;
 use crate::util::*;
@@ -216,7 +216,7 @@ pub(crate) fn add_tray(a: &mut App) {
         nid.uID = 1;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION_RES);
+        nid.hIcon = crate::icon::app_icon(0, 0);
         let tip = wide("桌面格言 · 左键菜单 / Ctrl+Alt+M 换动效");
         for (i, c) in tip.iter().take(127).enumerate() {
             nid.szTip[i] = *c;
@@ -555,6 +555,25 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
             if new == Orient::Vertical && was_marquee {
                 toast(a, "竖版下跑马灯已降级为静态");
             }
+        }
+        // ---- 竖版形态（只换页头与对齐，窗口尺寸一律不动）
+        //
+        // 用 guard 而不是 `MI_VSTYLE_BASE..=MI_VSTYLE_BASE + 2`：模式里不许写
+        // 「常量 + 常数」这种表达式，只能写常量本身。
+        _ if (MI_VSTYLE_BASE..=MI_VSTYLE_BASE + 2).contains(&cmd) => {
+            let new = VStyle::all()[(cmd - MI_VSTYLE_BASE) as usize];
+            if new == a.cfg.v_style {
+                return;
+            }
+            a.cfg.v_style = new;
+            a.cfg.save();
+            render_and_present(a);
+            let tip = if a.cfg.orient == Orient::Vertical {
+                format!("竖排形态：{}", new.label())
+            } else {
+                format!("竖排形态：{}（切到竖版生效）", new.label())
+            };
+            toast(a, &tip);
         }
         MI_SHRINK_FIT => {
             a.cfg.shrink_fit = !a.cfg.shrink_fit;
@@ -1056,16 +1075,16 @@ pub(crate) fn hit_clock_client(a: &App, cx: i32, cy: i32) -> bool {
 /// 缓存挡掉。见 `layout_clock` 的文档：`--perf` 实测缩放拖动 1052µs/条
 /// 就是这么降到 ~300µs 的。
 pub(crate) fn normalize_clock_offset(a: &mut App) {
-    // 竖版下 `layout_sign` 的默认为「贴左侧、垂直居中」，与横版同一套夹取公式，
-    // 所以这里一行都不用分叉。
+    // 默认位置**由量几何的那一侧给出**（`ClockBox::dx0/dy0`）：横版是
+    // 「左侧垂直居中」，竖版页头是「贴天头」。以前这里自己再写一遍公式，
+    // 竖版页头改到顶部之后就必然对不上 —— 一处定义，两处使用。
     let cb = layout_clock(a);
     if !cb.show {
         return;
     }
 
-    let pad = a.cfg.pad();
     let (w, h) = (a.cfg.w, a.cfg.h);
-    let (x0, y0) = (pad, (h - cb.h) / 2);
+    let (x0, y0) = (cb.dx0, cb.dy0);
     let max_x = (w - cb.w).max(0);
     let max_y = (h - cb.h).max(0);
     let x = (x0 + a.cfg.clock_dx).clamp(0, max_x);

@@ -5,3 +5,6 @@
 /dist
 # 本地工作记录（会话记忆 / 待办），不进仓库
 /.workbuddy
+
+# 设计样机临时产物（tools/vertical_mock.py 的输出）
+/out

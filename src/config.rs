@@ -282,6 +282,70 @@ impl fmt::Display for Orient {
     }
 }
 
+/// 竖版形态：三套**共用同一套字格**（字距 1.10 em、列距 1.70 em、整块居中），
+/// 差别只在三处 —— 页头怎么排、正文怎么对齐、署名落在哪。
+///
+/// # 为什么是一个枚举而不是三个开关
+///
+/// 「时间在哪 / 有没有界栏 / 正文居中还是右起」这三件事在竖排里是**一个整体**：
+/// 抽成三个 bool 会产生 8 种组合，其中一半是排得出来但不好看的（比如「无界栏 +
+/// 正文右起 + 署名占左列」= 左边一大块空）。形态是设计师给的整套方案，
+/// 用户要的是「选一套」，不是「调三个旋钮」。
+///
+/// 时间在**所有**形态里都横排、都在**顶部** —— 逐字竖排的 `15:40:36` 会被读成
+/// 八拍，是「很难获取信息」的头号原因（2026-11-04 草案实测）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VStyle {
+    /// A 条幅：时间与日期居中压顶 + 一条界栏，正文居中，署名竖排在左下角。
+    /// 最像一幅立轴，任何句长都稳。
+    Banner,
+    /// B 极简（默认）：只有左上角两行小字（时间 / 日期），无界栏，
+    /// 正文居中，署名竖排在左下角。桌面上最安静的一套。
+    #[default]
+    Minimal,
+    /// C 栏头：时间与日期左右分列压顶 + 界栏，正文右起贴右缘（古法），
+    /// 署名竖排在左侧一列。信息分层最清楚。
+    Head,
+}
+
+impl VStyle {
+    /// 面板 / 菜单里的顺序：A、B、C
+    pub fn all() -> [VStyle; 3] {
+        [VStyle::Banner, VStyle::Minimal, VStyle::Head]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VStyle::Banner => "条幅",
+            VStyle::Minimal => "极简",
+            VStyle::Head => "栏头",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            VStyle::Banner => "banner",
+            VStyle::Minimal => "minimal",
+            VStyle::Head => "head",
+        }
+    }
+
+    /// 解析：认名字、也认设计稿上的 A/B/C（用户是照着草案选的）。
+    pub fn parse(s: &str) -> VStyle {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "a" | "banner" | "条幅" => VStyle::Banner,
+            "c" | "head" | "栏头" => VStyle::Head,
+            _ => VStyle::Minimal,
+        }
+    }
+}
+
+impl fmt::Display for VStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
 /// `quote_color` 的哨兵值：表示「跟随主色」。
 ///
 /// 用哨兵而不是 `Option<u32>`，是为了让**旧 ini（没有这个键）载入后行为逐像素不变** ——
@@ -379,6 +443,8 @@ pub struct Config {
     pub placed: bool,
     /// 版式：横排 / 竖排（形态 A 卷轴式）
     pub orient: Orient,
+    /// 竖版形态（A 条幅 / B 极简 / C 栏头）。横版下无意义。
+    pub v_style: VStyle,
     /// 格言字距（0..=8，按整体字号缩放后生效）。0 = 今天的样子
     pub letter_spacing: i32,
     /// 格言专用色。`COLOR_UNSET` = 跟随主色（默认，保证旧配置行为不变）
@@ -497,6 +563,8 @@ impl Default for Config {
             auto_hide_fs: true,
             placed: false,
             orient: Orient::Horizontal,
+            // 老板定的默认形态：B 极简（时间横排压顶、无界栏、正文居中）
+            v_style: VStyle::Minimal,
             letter_spacing: 0,
             quote_color: COLOR_UNSET,
             shrink_fit: true,
@@ -658,6 +726,23 @@ impl Config {
         ((24.0 * self.eff_scale()).round() as i32).max(10)
     }
 
+    /// **竖版专用**内边距：在 `pad()` 之上再按窗口宽封顶。
+    ///
+    /// 竖版是「窄而高」的条幅，而 `pad()` 只跟字号走。300% 字号 + 431 宽窗口
+    /// 时它的值是 72px，左右一共吃掉 144px —— 窗口宽度的 33%。剩下的宽度还要
+    /// 分给三列落款，正文最后只剩一列半，直接触发省略号（实测 `--dump
+    /// 431x1084@300%`：正文被砍到 17 字 + 「…」，用户报「很难获取信息」）。
+    ///
+    /// 封顶取窗口宽的 8%（下限仍是 10px）：字大窗窄时优先保正文，而不是保白。
+    /// 300×660 这类默认竖窗上 `pad()` 本身就是 24 = 300×8%，与旧行为逐像素相同；
+    /// 只有「字号涨了、窗口没涨」的极端组合才会被这只手压回来。
+    /// 横版不受影响 —— 2926×337 那种宽幅条上，24×scale 的边距本来就是版式
+    /// 的一部分，去掉反而贴边。
+    pub fn pad_v(&self) -> i32 {
+        let cap = ((self.w as f32) * 0.08).round() as i32;
+        self.pad().min(cap).max(10)
+    }
+
     /// 跑马灯两条格言之间的间隙（px）。同样是单一出口 ——
     /// 轮转判定（f32）与绘制间距（i32）以前各算一份，取整不同就会累积跳字。
     pub fn marquee_gap(&self) -> i32 {
@@ -791,6 +876,7 @@ impl Config {
              auto_hide_fs={}\n\
              placed={}\n\
              orient={}\n\
+             v_style={}\n\
              letter_spacing={}\n\
              quote_color={}\n\
              shrink_fit={}\n\
@@ -849,6 +935,7 @@ impl Config {
             self.auto_hide_fs,
             self.placed,
             self.orient.key(),
+            self.v_style.key(),
             self.letter_spacing,
             // 哨兵不能过 fmt_color（那是 6 位十六进制），只能原样写成 unset
             if self.quote_color == COLOR_UNSET {
@@ -982,6 +1069,9 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
         // 版式：走 set_orient 而不是裸赋值 —— 它会顺手把窗口尺寸换成新形态的默认值
         // （只在该形态还没被用户改过时），这正是 `--dump orient=vertical` 想要的。
         "orient" => cfg.set_orient(Orient::parse(v)),
+        // 竖版形态。**刻意不走 `set_orient` 那套尺寸迁移** —— 三种形态共用同一
+        // 块画布（只差页头与对齐），换形态不该把用户调好的窗口尺寸换掉。
+        "v_style" | "vstyle" | "style" => cfg.v_style = VStyle::parse(v),
         "letter_spacing" => cfg.letter_spacing = v.parse().unwrap_or(cfg.letter_spacing).clamp(0, 8),
         "quote_color" => {
             let t = v.trim();

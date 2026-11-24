@@ -25,15 +25,6 @@ pub fn fmt_date(t: &SYSTEMTIME) -> String {
     format!("{}年{}月{}日 星期{}", t.wYear, t.wMonth, t.wDay, w)
 }
 
-/// 竖版落款日期列的短格式（审查 U4）：去年份、「星期」缩成「周」。
-/// 竖排逐字一格里，「2026年10月15日 星期四」15 格太长；短格式 9 格，
-/// 年份在横版仍完整显示。
-pub fn fmt_date_short(t: &SYSTEMTIME) -> String {
-    const WEEK: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
-    let w = WEEK[(t.wDayOfWeek as usize).min(6)];
-    format!("{}月{}日 周{}", t.wMonth, t.wDay, w)
-}
-
 /// 字号换算的**唯一**实现（审查 P2-G）：基准 px × 整体缩放 × 相对倍率。
 ///
 /// 以前 `gfx::Fonts::build` 与 `config::quote_font_px` 各写一份同一公式，

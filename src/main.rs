@@ -12,10 +12,12 @@ mod consts;
 mod favorites;
 mod ffi;
 mod gfx;
+mod icon;
 mod island;
 mod layout;
 mod png;
 mod quotes;
+mod tex;
 mod transition;
 mod util;
 
@@ -41,6 +43,10 @@ fn main() {
     // 收藏当前句子：**真的按一次 Ctrl+Alt+F**，再验剪贴板 / 收藏夹 / 幂等
     if args.iter().any(|a| a == "--favtest") {
         std::process::exit(app::favtest());
+    }
+    // 图标资源：验 PE 里的 RT_GROUP_ICON 能取出、尺寸对、不是系统默认图标
+    if args.iter().any(|a| a == "--icontest") {
+        std::process::exit(app::icontest());
     }
     if args.iter().any(|a| a == "--quotes") {
         std::process::exit(quotes::audit());
@@ -134,6 +140,28 @@ fn main() {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         std::process::exit(app::dump(path, &overrides));
+    }
+    // --math [<png>]：把公式子集的样张画成图片（不启动挂件、不建窗口）。
+    // 纯粹是公式层的验证入口 —— 排版对不对，看图和读数比看代码快。
+    if let Some(i) = args.iter().position(|a| a == "--math") {
+        let path = args
+            .get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| "math.svg.png".to_string());
+        std::process::exit(app::mathdemo(&path));
+    }
+    // --mathquote "<一句话>" [前缀]：用真实渲染管线排一句带公式的格言，
+    // 横竖两种朝向各出一张 PNG。验的是「接线」，不是公式盒子本身。
+    if let Some(i) = args.iter().position(|a| a == "--mathquote") {
+        let text = args
+            .get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| "质能关系 $E = mc^2$ 说明质量就是能量".to_string());
+        let prefix = args
+            .get(i + 2)
+            .cloned()
+            .unwrap_or_else(|| "mathquote".to_string());
+        std::process::exit(app::mathquote(&text, &prefix));
     }
     std::process::exit(app::run());
 }

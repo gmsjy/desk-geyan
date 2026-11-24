@@ -24,6 +24,8 @@
 //! 那是「三趟各算一遍」的老坑（见 README 不变量 1）。
 
 use crate::config::Orient;
+use crate::quotes::Seg;
+use crate::tex::{MBox, Measure};
 
 // ---------------------------------------------------------------- 数据结构
 
@@ -56,6 +58,22 @@ pub struct Glyph {
     /// 每列一字，相邻**列**的字同 `y` 且 `src` 连续 —— 光看 `src` 会放行，
     /// 那是个画错位的真实缺陷。
     pub src: u32,
+    /// **在这里断开合批**：本字形必须自己起一段 `TextOutW`，不能并进前一段。
+    ///
+    /// # 为什么必须有这个字段（2026-11-03，公式接线时踩的坑）
+    ///
+    /// `runs()` 的合批前提是「段内 `x` 按步进相接」——它靠
+    /// 「同 `y` + 同字体 + `src` 连续」来推断，而这三条对**普通文字**
+    /// 是充分的：排版就是按步进往前推的。
+    ///
+    /// 公式块打破了这个前提：公式后面的第一个字，`src` 仍然连续、
+    /// `y` 仍然相同，但 `x` 隔了一个公式的宽度。合批于是把它当普通字
+    /// 交给 GDI 按步进推 —— 公式让出的空档被吃掉，后半句直接压到公式上。
+    /// 实测：`质能关系 $E = mc^2$ 说明质量就是能量` 横版，公式块
+    /// 217px 宽，`说明` 被拉回 200 多像素，正好盖住 `E = mc²`。
+    ///
+    /// 判据只有排版层知道（它才是挪过 x 的人），所以只能由它标出来。
+    pub brk: bool,
 }
 
 /// 一段文字的排版结果。**同一帧的三趟绘制共用同一份**。
@@ -80,6 +98,15 @@ pub struct QuoteLayout {
     /// 排版时列就是切分依据，范围精确到下标，不需要事后按 x 聚类
     /// （聚类会被点号的右移、列内居中的偏移糊弄错列）。
     pub col_ranges: Vec<(usize, usize)>,
+    /// **公式块**（横版内联 / 竖版整块旋转）。没有公式时为空。
+    ///
+    /// 为什么公式**不进** `glyphs`：`glyphs` 是「一个字 + 一个位置」，
+    /// 而公式里不但有字，还有分式横线、根号上横线、矢量箭头 ——
+    /// 它们不是字符，`TextOutW` 画不出来。硬塞进去要么给 `Glyph` 加三种
+    /// 图元变体（`runs()` 合批、竖版列切分、阴影趟全都要跟着改），
+    /// 要么在绘制趟里再判一次类型。分成两个列表最省事：文字照旧逐字合批，
+    /// 公式整块交给 `tex::draw` / `tex::draw_rot`。
+    pub math: Vec<MathBlock>,
     /// **竖版专用**：每列的 x 瓦片 `[左, 右)`，与 `col_ranges` 同序。
     /// 相邻瓦片在列间距中点相接、首列右缘与末列左缘各扩展到版心边缘 ——
     /// **无缝瓦片**：任何格言像素（含点号右移、阴影 2px 外溢）都落在某一列里，
@@ -93,7 +120,9 @@ impl QuoteLayout {
         self.glyphs.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.glyphs.is_empty()
+        // 公式块也是内容：只判 `glyphs` 会让「整句就是一个公式」的格言
+        // 被当成空表，一个字都不画（而且是静默的）。
+        self.glyphs.is_empty() && self.math.is_empty()
     }
     /// `shrink` 百分比 → 字体档下标（0/1/2 = 100/85/70）。
     /// 绘制方靠它去 `Fonts::quote_at` 取**同一档**字体 ——
@@ -152,6 +181,7 @@ impl QuoteLayout {
                 && g[j].src != u32::MAX
                 && g[j - 1].src != u32::MAX
                 && g[j].src == g[j - 1].src + 1
+                && !g[j].brk
                 && g[j].y == g[j - 1].y
             {
                 j += 1;
@@ -184,8 +214,16 @@ impl Metrics {
             char_w,
             char_h,
             line_h: ((char_h as f32) * 1.35).round() as i32,
-            cell_h: ((char_h as f32) * 1.05).round() as i32,
-            col_pitch: ((char_w as f32) * 1.15).round() as i32,
+            // 竖排两把尺子（2026-11-04 竖排改版，草案定稿）：
+            //
+            //   * 单元格 = 1.10 字高 —— 字与字之间留 1/10 的白，读起来是「一串」
+            //     而不是「一摞」；
+            //   * 列距 = **1.70 字宽** —— 旧值 1.15 只留 0.15 字宽的列间白，
+            //     两列几乎粘在一起（`--dump 431×660` 实测列间只剩 6px），
+            //     这是「很难获取信息」的头号来源。竖排的列距本来就该宽：
+            //     竖着读的时候，眼睛要靠列间白来定位下一列。
+            cell_h: ((char_h as f32) * 1.10).round() as i32,
+            col_pitch: ((char_w as f32) * 1.70).round() as i32,
         }
     }
 }
@@ -304,6 +342,20 @@ fn is_vert_rot(c: char) -> bool {
 
 // ---------------------------------------------------------------- 主入口
 
+/// 竖排版心内的**水平**摆法。
+///
+/// 竖排只有一个自由轴（横向）：列序固定自右向左，整块可以贴右缘、也可以居中。
+/// 传统立轴是「右起贴右缘」（`Right`，古法），而桌面挂件上居中更稳定 ——
+/// 句子只有一列时贴右缘看起来像「排版掉到一边去了」。
+///
+/// 横版不使用这个参数（横版的行是逐行居中的）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Align {
+    #[default]
+    Right,
+    Center,
+}
+
 /// 排一段文字。**纯函数**：同样的输入永远同样的输出，不碰任何全局状态。
 ///
 /// * `chars` 是逐字符的码点（不含结尾 NUL），`adv[i]` 是第 i 个字**不含字距**的步进。
@@ -334,6 +386,27 @@ pub fn layout_with_attr(
     spacing: i32,
     attr_from: Option<usize>,
 ) -> QuoteLayout {
+    layout_ex(chars, adv, m, orient, band, spacing, attr_from, Align::Right)
+}
+
+/// `layout` 的**带摆法**版本。竖版用它决定整块贴右还是居中。
+///
+/// 保留 `layout` 这个 6 参入口，是因为 `layout()` 的行为被几十条单元测试
+/// 逐像素钉着（含 `runs()` 合批、瓦片边界）—— 加一个默认参数不该让那些
+/// 结论全部重算一遍。
+///
+/// `attr_from`（横版出处分界）与 `align`（竖版摆法）是两条正交的轴：
+/// 前者只在横版被 `layout_h` 读，后者只在竖版被 `layout_v` 读。
+pub fn layout_ex(
+    chars: &[char],
+    adv: &[i32],
+    m: Metrics,
+    orient: Orient,
+    band: (i32, i32, i32, i32),
+    spacing: i32,
+    attr_from: Option<usize>,
+    align: Align,
+) -> QuoteLayout {
     if chars.is_empty() || adv.len() < chars.len() {
         return QuoteLayout {
             shrink: 100,
@@ -342,7 +415,7 @@ pub fn layout_with_attr(
     }
     match orient {
         Orient::Horizontal => layout_h(chars, adv, m, band, spacing, attr_from),
-        Orient::Vertical => layout_v(chars, adv, m, band, spacing),
+        Orient::Vertical => layout_v(chars, adv, m, band, spacing, align),
     }
 }
 
@@ -488,6 +561,7 @@ fn layout_h(
                 y: oy + j as i32 * m.line_h,
                 rot: false,
                 src: i as u32,
+                brk: false,
             });
             x += adv[i];
         }
@@ -503,6 +577,7 @@ fn layout_h(
                 y: last.y,
                 rot: false,
                 src: u32::MAX,
+                brk: false,
             });
         }
         ellipsis = true;
@@ -518,6 +593,7 @@ fn layout_h(
         ellipsis,
         col_ranges: Vec::new(),
         col_x: Vec::new(),
+        math: Vec::new(),
     }
 }
 
@@ -529,6 +605,7 @@ fn layout_v(
     m: Metrics,
     band: (i32, i32, i32, i32),
     spacing: i32,
+    align: Align,
 ) -> QuoteLayout {
     let (bl, bt, br, bb) = band;
     let avail_w = (br - bl).max(1);
@@ -595,8 +672,19 @@ fn layout_v(
         (rows - 1) * cell + m.char_h
     };
     let oy = bt + (avail_h - ext_h) / 2;
-    // 第 0 列贴版心右缘（右起），于是整块天然右对齐 —— 条幅的读法
-    let x_r = br - m.char_w;
+    // 竖版只有一个横向自由轴。摆位必须按**墨迹**算，不能按列原点算：
+    // 列内的字在列距里是居中的（`gx = cx + (col_pitch - adv)/2`，半角字要摆到
+    // 列中间），所以墨迹右缘比列原点靠右 `(col_pitch - char_w)/2`。漏掉这一截，
+    // 整块会系统性偏右半列（实测 431 宽窗口偏 14px，肉眼一眼能看出「歪了」）。
+    let inset = ((m.col_pitch - m.char_w) / 2).max(0);
+    let block_w = (used as i32 - 1) * m.col_pitch + m.char_w;
+    // `Right` —— 墨迹右缘贴版心右缘（右起，条幅的古法）；
+    // `Center` —— 整块摆到版心正中（桌面挂件上更稳：只有一列时贴右缘
+    // 看起来像排版掉到一边）。
+    let mut x_r = br - m.char_w - inset;
+    if align == Align::Center && used > 0 {
+        x_r = bl + ((avail_w - block_w).max(0)) / 2 + (used as i32 - 1) * m.col_pitch - inset;
+    }
 
     let mut glyphs: Vec<Glyph> = Vec::new();
     for (ci, col) in cols.iter().take(used).enumerate() {
@@ -611,7 +699,9 @@ fn layout_v(
                 // **左下**；竖排里同一个位置看起来像「掉到下一个字下面」去了。
                 // 右移约半列、上移约半格，正好落在本格的右上角 ——
                 // 这就是竖排点号该待的地方。
-                gx += ((m.col_pitch as f32) * 0.55).round() as i32;
+                // 偏移量按**字宽**算，不按列距：列距是 1.70 字宽，
+                // 乘 0.55 会到 0.94 字宽 —— 点号直接飞进列间空档里。
+                gx += ((m.char_w as f32) * 0.55).round() as i32;
                 gy -= ((m.cell_h as f32) * 0.55).round() as i32;
                 gy = gy.max(bt);
             }
@@ -621,6 +711,7 @@ fn layout_v(
                 y: gy,
                 rot: is_vert_rot(ch),
                 src: i as u32,
+                brk: false,
             });
         }
     }
@@ -635,13 +726,13 @@ fn layout_v(
                 y: last.y,
                 rot: false,
                 src: u32::MAX,
+                brk: false,
             });
         }
         ellipsis = true;
     }
 
     let (ext_w, ext_h) = bounds(&glyphs, m);
-    let _ = avail_w;
 
     // 列范围（字形下标，列序自右向左）+ 列 x 瓦片（无缝，见字段注释）。
     // 省略号占的是被弹出那个字的下标槽位，列长不变 ⇒ 范围天然覆盖它。
@@ -680,6 +771,155 @@ fn layout_v(
         ellipsis,
         col_ranges,
         col_x,
+        // 纯文字路径**永远**不带公式块：带 `$` 的句子走 `layout_rich`。
+        // 这条分岔是有意的 —— 不含公式的句子逐字逐位与旧实现相同，
+        // 不因为「加了公式支持」而整体重排（像素级回归会立刻抓到）。
+        math: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod rich_tests {
+    use super::*;
+    use crate::tex::{TextMetric, Ink};
+
+    /// 假度量：汉字 1em、拉丁 0.55em，上高 0.8em、下深 0.2em。
+    /// 与 `tex` 里的那个同参，但**不能共用**（那个是 `#[cfg(test)]` 私有）。
+    struct FM;
+    impl crate::tex::Measure for FM {
+        fn text(&self, s: &[char], px: i32) -> TextMetric {
+            let mut w = 0;
+            for &c in s {
+                w += if (c as u32) >= 0x2E80 {
+                    px
+                } else {
+                    ((px as f32) * 0.55).round() as i32
+                };
+            }
+            TextMetric {
+                w,
+                ascent: ((px as f32) * 0.8).round() as i32,
+                descent: ((px as f32) * 0.2).round() as i32,
+            }
+        }
+        fn ink(&self, ch: char, px: i32) -> Ink {
+            let t = self.text(&[ch], px);
+            Ink {
+                top: -t.ascent,
+                bottom: t.descent,
+                w: t.w,
+                adv: t.w,
+            }
+        }
+    }
+
+    fn rich(src: &str, orient: Orient, band: (i32, i32, i32, i32)) -> QuoteLayout {
+        let (segs, _) = crate::quotes::segments(src);
+        let m = Metrics::new(20, 20);
+        let mut fm = FM;
+        layout_rich(&segs, 20, m, orient, band, 0, &mut fm)
+    }
+
+    #[test]
+    fn 横版公式不被折行拆开() {
+        // 版心只有 60px，而公式本身 200px 宽：它必须整块落在**一行**里，
+        // 宁可溢出，也绝不能拆成两半（拆开的分式没有意义）。
+        let ql = rich("字$\\frac{a}{b}$", Orient::Horizontal, (0, 0, 60, 300));
+        assert_eq!(ql.math.len(), 1, "公式应整块保留");
+        assert_eq!(ql.glyphs.len(), 1, "只有开头那个汉字");
+        // 两行：第一行 `字`，第二行公式
+        let y0 = ql.glyphs[0].y;
+        assert!(ql.math[0].y > y0, "公式应折到下一行");
+    }
+
+    #[test]
+    fn 公式后首字断开合批() {
+        let ql = rich("字$E=mc^2$字", Orient::Horizontal, (0, 0, 900, 400));
+        assert_eq!(ql.math.len(), 1);
+        assert_eq!(ql.glyphs.len(), 2);
+        assert!(!ql.glyphs[0].brk, "第一个字前面没有公式");
+        assert!(
+            ql.glyphs[1].brk,
+            "公式之后的字必须断批 —— 否则 GDI 按步进推，会吃掉公式让出的宽度"
+        );
+        // 断批还必须在 `runs()` 里生效：两段，不是一段
+        let runs = ql.runs();
+        assert!(runs.len() >= 2, "公式两边的字不能合进同一段：{:?}", runs);
+    }
+
+    #[test]
+    fn 竖版公式整块旋转且占位等于盒子宽() {
+        let ql = rich("字$E=mc^2$字", Orient::Vertical, (0, 0, 600, 600));
+        assert_eq!(ql.math.len(), 1, "竖版也必须保住公式块");
+        let blk = &ql.math[0];
+        assert!(blk.rot, "竖版的公式要整块转 90°");
+        // 旋转后宽高互换：占宽 = 盒子上高 + 下深，占高 = 盒子宽
+        assert_eq!(blk.w(), blk.mb.h());
+        assert_eq!(blk.h(), blk.mb.w);
+        assert!(blk.w() > 0 && blk.h() > 0);
+    }
+
+    #[test]
+    fn 纯文字不进公式块() {
+        let ql = rich("春眠不觉晓", Orient::Horizontal, (0, 0, 900, 400));
+        assert!(ql.math.is_empty());
+        assert_eq!(ql.glyphs.len(), 5);
+        assert!(ql.glyphs.iter().all(|g| !g.brk), "纯文字一个字都不该断批");
+    }
+
+    #[test]
+    fn 公式段解析不吞掉正文() {
+        let (segs, bad) = crate::quotes::segments("质能关系 $E=mc^2$ 就是能量");
+        assert!(!bad);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0], crate::quotes::Seg::Text(t) if t == "质能关系 "));
+        assert!(matches!(&segs[1], crate::quotes::Seg::Math(t) if t == "E=mc^2"));
+        assert!(matches!(&segs[2], crate::quotes::Seg::Text(t) if t == " 就是能量"));
+    }
+
+    #[test]
+    fn 落单美元符原样保留() {
+        // 半个 `$` 不许吞掉后半句 —— 宁可显示一个美元符，也不能让文字消失
+        let (segs, bad) = crate::quotes::segments("价格 $5 一句");
+        assert!(bad, "应报「有落单的 $」");
+        let all: String = segs
+            .iter()
+            .map(|s| match s {
+                crate::quotes::Seg::Text(t) | crate::quotes::Seg::Math(t) => t.clone(),
+            })
+            .collect();
+        assert_eq!(all, "价格 $5 一句");
+    }
+
+    #[test]
+    fn 示例库里的每条公式都能解析() {
+        // 这份示例是**给用户抄的**：里面有一条解析不了，用户复制过去就是
+        // 屏幕上多出一串反斜杠。所以它在编译期跟着测试走，不许过期。
+        let src = include_str!("../assets/quotes-math-sample.txt");
+        let mut n = 0;
+        for line in src.lines() {
+            if line.trim_start().starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let (segs, bad) = crate::quotes::segments(line);
+            assert!(!bad, "示例行有落单的 `$`：{}", line);
+            for s in segs {
+                if let crate::quotes::Seg::Math(m) = s {
+                    n += 1;
+                    crate::tex::parse(&m)
+                        .unwrap_or_else(|e| panic!("示例公式解析失败 `{}`：{}", m, e));
+                }
+            }
+        }
+        assert!(n >= 12, "示例里应有多条公式，实际 {}", n);
+    }
+
+    #[test]
+    fn 转义的美元符当文字() {
+        let (segs, bad) = crate::quotes::segments("价格 \\$5");
+        assert!(!bad);
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], crate::quotes::Seg::Text(t) if t == "价格 $5"));
     }
 }
 
@@ -697,6 +937,634 @@ fn bounds(glyphs: &[Glyph], m: Metrics) -> (i32, i32) {
         b = b.max(g.y + m.char_h);
     }
     (r - l, b - t)
+}
+
+// ---------------------------------------------------------------- 公式块
+
+/// 一块公式在画面上的位置。
+///
+/// 两种朝向的语义不同，字段注释写清楚，免得调用方混着用：
+///
+/// | | `x` | `y` |
+/// |---|---|---|
+/// | 横版（`rot = false`） | 盒子左缘 | **基线** |
+/// | 竖版（`rot = true`） | 旋转后包围盒左缘 | 包围盒**上缘** |
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MathBlock {
+    pub x: i32,
+    pub y: i32,
+    /// 整块顺时针 90°（竖版）。绘制走 `tex::draw_rot`。
+    pub rot: bool,
+    pub mb: MBox,
+}
+
+impl MathBlock {
+    /// 占宽（旋转后宽高互换）
+    pub fn w(&self) -> i32 {
+        if self.rot {
+            self.mb.h()
+        } else {
+            self.mb.w
+        }
+    }
+    /// 占高（旋转后宽高互换）
+    pub fn h(&self) -> i32 {
+        if self.rot {
+            self.mb.w
+        } else {
+            self.mb.h()
+        }
+    }
+}
+
+/// 排版里的一颗「原子」：一个字，或一整块公式。
+///
+/// 折行 / 分列都以**原子**为单位 —— 公式是**不可拆的**，不能像文字那样
+/// 在中间断开（把 `\frac{a}{b}` 断成两行没有任何意义）。
+struct Atom {
+    ch: Option<char>,
+    mb: Option<MBox>,
+    /// 占宽（公式含左右各半个 pad）
+    w: i32,
+    asc: i32,
+    desc: i32,
+    /// 原文下标（公式为 `u32::MAX`，与「补出来的 …」同档）
+    src: u32,
+}
+
+/// 公式缩到能放下时的字号下限（相对正文字号）。
+///
+/// 再小就没法看了 —— 宁可溢出报错，也不要排出「一坨黑点」。
+const MATH_FIT_MIN: f32 = 0.45;
+
+/// 把文字 / 公式的分段序列，摊成一条原子流。
+///
+/// `max_box_w` 是**公式盒子的可用上限**：横版是版心宽，竖版是版心高
+/// （竖版的公式整块旋转，盒子的「宽」转完就是屏幕上的高度）。
+/// 超过就只把**这块公式**缩字号，不去动正文 —— 正文跟着缩会让整句
+/// 莫名其妙变小，用户只会觉得「字怎么忽大忽小」。
+fn atoms_of(
+    segs: &[Seg],
+    px: i32,
+    meas: &mut dyn Measure,
+    max_box_w: Option<i32>,
+) -> Vec<Atom> {
+    let mut out: Vec<Atom> = Vec::new();
+    let mut idx: u32 = 0;
+    // 公式和两侧文字之间留一点气口，不然 `质能关系E=mc²说明` 会贴在一起。
+    // 0.2em 是看着调的：0.125em 时 `²` 和后面的汉字几乎挨上。
+    let pad = (px / 5).max(3);
+    for seg in segs {
+        match seg {
+            Seg::Text(t) => {
+                for c in t.chars() {
+                    let tm = meas.text(&[c], px);
+                    out.push(Atom {
+                        ch: Some(c),
+                        mb: None,
+                        w: tm.w.max(0),
+                        asc: tm.ascent,
+                        desc: tm.descent,
+                        src: idx,
+                    });
+                    idx += 1;
+                }
+            }
+            Seg::Math(src) => {
+                let node = crate::tex::parse_or_text(src);
+                let mut mpx = px;
+                let mut mb = crate::tex::layout(&node, mpx, meas);
+                if let Some(cap) = max_box_w {
+                    // 缩到能塞进版心为止，最多收到 `MATH_FIT_MIN`。
+                    // 缩不动就照原样交出去 —— 溢出由 `overflow` 报给调用方，
+                    // 那条路会把整句降到下一档字号，比在这里死循环强。
+                    //
+                    // **按比例一步到位，而不是每次乘 0.85**：字形 advance 与
+                    // 字号是线性的，比一比就能算出目标字号。之前逐次缩 15%
+                    // 时，一条比版心高出一倍多的公式要排五六遍，每次都是
+                    // 几十次 GDI 量字 —— 实测那正是竖版排版 1.2ms 的大头。
+                    // 非线性（取整、上下标档位跳变）靠后面最多两次校正兜住。
+                    let floor = ((px as f32) * MATH_FIT_MIN).round().max(8.0) as i32;
+                    let mut tries = 0;
+                    while mb.w + pad > cap && mpx > floor && tries < 2 {
+                        let want = (((cap - pad).max(1) as f64) * (mpx as f64) / (mb.w.max(1) as f64))
+                            .floor() as i32;
+                        let next = want.clamp(floor, mpx - 1);
+                        if next >= mpx {
+                            break;
+                        }
+                        mpx = next;
+                        mb = crate::tex::layout(&node, mpx, meas);
+                        tries += 1;
+                    }
+                }
+                out.push(Atom {
+                    ch: None,
+                    w: mb.w + pad,
+                    asc: mb.ascent,
+                    desc: mb.descent,
+                    mb: Some(mb),
+                    src: u32::MAX,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// **带公式的排版入口**。只有句子里含 `$...$` 时才走这里。
+///
+/// # 为什么和 `layout()` 分成两条路
+///
+/// `layout()` 吃的是「逐字步进数组」，是渲染层用 `GetTextExtentExPointW`
+/// 一次性量出来的（含 kerning）。公式块没有「逐字步进」这回事。
+///
+/// 与其把 `layout()` 改造成「有的字有步进、有的字是块」，不如新开一条：
+/// **不含公式的句子逐字逐位与旧实现相同**，公式支持不会让全库的格言
+/// 重新排一遍版。这条分岔由 `render::layout_quote` 判 `$` 决定，
+/// 并由单元测试钉住「纯文字走老路」。
+pub fn layout_rich(
+    segs: &[Seg],
+    px: i32,
+    m: Metrics,
+    orient: Orient,
+    band: (i32, i32, i32, i32),
+    spacing: i32,
+    meas: &mut dyn Measure,
+) -> QuoteLayout {
+    layout_rich_ex(segs, px, m, orient, band, spacing, meas, Align::Right)
+}
+
+/// `layout_rich` 的**带摆法**版本（竖版居中 / 贴右）。
+#[allow(clippy::too_many_arguments)]
+pub fn layout_rich_ex(
+    segs: &[Seg],
+    px: i32,
+    m: Metrics,
+    orient: Orient,
+    band: (i32, i32, i32, i32),
+    spacing: i32,
+    meas: &mut dyn Measure,
+    align: Align,
+) -> QuoteLayout {
+    let (bw, bh) = ((band.2 - band.0).max(1), (band.3 - band.1).max(1));
+    let max_box_w = match orient {
+        Orient::Horizontal => Some(bw),
+        // 竖版转 90°：盒子的「宽」变成竖向量，上限是版心**高**
+        Orient::Vertical => Some(bh),
+    };
+    let atoms = atoms_of(segs, px, meas, max_box_w);
+    if atoms.is_empty() {
+        return QuoteLayout {
+            shrink: 100,
+            ..Default::default()
+        };
+    }
+    match orient {
+        Orient::Horizontal => rich_h(&atoms, m, band, spacing, px),
+        Orient::Vertical => rich_v(&atoms, m, band, spacing, px, align),
+    }
+}
+
+/// 公式块 + 文字的包围盒（宽, 高）
+fn rich_bounds(ql: &QuoteLayout, m: Metrics) -> (i32, i32) {
+    let mut l = i32::MAX;
+    let mut t = i32::MAX;
+    let mut r = i32::MIN;
+    let mut b = i32::MIN;
+    for g in &ql.glyphs {
+        l = l.min(g.x);
+        t = t.min(g.y);
+        r = r.max(g.x + m.char_w);
+        b = b.max(g.y + m.char_h);
+    }
+    for mb in &ql.math {
+        l = l.min(mb.x);
+        t = t.min(mb.y);
+        r = r.max(mb.x + mb.w());
+        b = b.max(mb.y + mb.h());
+    }
+    if l > r {
+        (0, 0)
+    } else {
+        (r - l, b - t)
+    }
+}
+
+/// 定位表的**内容左上角**：横版排版把每一行居中到版心宽度上，坐标里带着
+/// 版心偏移；跑马灯只关心「这句本身有多宽、从哪儿起」，需要把这个偏移剥掉。
+pub fn content_origin(ql: &QuoteLayout) -> (i32, i32) {
+    let mut l = i32::MAX;
+    let mut t = i32::MAX;
+    for g in &ql.glyphs {
+        l = l.min(g.x);
+        t = t.min(g.y);
+    }
+    for mb in &ql.math {
+        l = l.min(mb.x);
+        t = t.min(mb.y);
+    }
+    if l == i32::MAX {
+        (0, 0)
+    } else {
+        (l, t)
+    }
+}
+
+/// 整体平移定位表（字形与公式块一起），让「内容左上角」落到给定位置。
+///
+/// 跑马灯把一句当**整块**搬动：排版时的版心（含行居中）在这里没有意义，
+/// 滚动只需要「内容从 x 开始」。公式块必须跟着挪 —— 只挪字不挪线，
+/// 分式的横线会留在原地。
+pub fn shift_by(ql: &mut QuoteLayout, dx: i32, dy: i32) {
+    for g in &mut ql.glyphs {
+        g.x += dx;
+        g.y += dy;
+    }
+    for mb in &mut ql.math {
+        mb.x += dx;
+        mb.y += dy;
+    }
+}
+
+/// 横版：公式当「一个宽字」参与折行，基线与同行文字对齐。
+fn rich_h(atoms: &[Atom], m: Metrics, band: (i32, i32, i32, i32), spacing: i32, px: i32) -> QuoteLayout {
+    let (bl, bt, br, bb) = band;
+    let avail_w = (br - bl).max(1);
+    let avail_h = (bb - bt).max(1);
+
+    let lw = |v: &[usize]| -> i32 {
+        let mut s = 0;
+        for (k, &i) in v.iter().enumerate() {
+            if k > 0 {
+                s += spacing;
+            }
+            s += atoms[i].w;
+        }
+        s
+    };
+
+    // ---- ① 贪心折行（行首 / 行尾禁则照旧；公式不可拆）
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    for (i, a) in atoms.iter().enumerate() {
+        if !cur.is_empty() && lw(&cur) + a.w + spacing > avail_w {
+            let hard = a.ch.map(no_start).unwrap_or(false);
+            if hard {
+                // 行首禁则：挤在本行（允许 ≤ 1 字宽的溢出），与 `layout_h` 同策
+                cur.push(i);
+                continue;
+            }
+            let tail_bad = cur.len() >= 2
+                && atoms[*cur.last().unwrap()]
+                    .ch
+                    .map(no_end)
+                    .unwrap_or(false);
+            if tail_bad {
+                let last = cur.pop().unwrap();
+                lines.push(std::mem::take(&mut cur));
+                cur.push(last);
+            } else {
+                lines.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+
+    // ---- ② 行高与基线：含公式的行按实际墨迹撑高
+    //
+    // 上限 `m.line_h` 不能省：没有公式的行如果按 `asc + desc` 算，会跟
+    // `layout()` 排出来的行距不一样 —— 同一版面里两种行距并存，一眼能看出。
+    let pad_y = (px / 3).max(6);
+    let mut geoms: Vec<(i32, i32, i32)> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let mut asc = 1;
+        let mut desc = 1;
+        let mut has_math = false;
+        for &i in line {
+            asc = asc.max(atoms[i].asc);
+            desc = desc.max(atoms[i].desc);
+            has_math |= atoms[i].mb.is_some();
+        }
+        let lh = if has_math {
+            (asc + desc + pad_y).max(m.line_h)
+        } else {
+            m.line_h.max(asc + desc)
+        };
+        geoms.push((asc, desc, lh));
+    }
+
+    // ---- ③ 纵向容量
+    let mut total = 0;
+    let mut used = 0;
+    for &(_, _, lh) in &geoms {
+        if total + lh > avail_h && used > 0 {
+            break;
+        }
+        total += lh;
+        used += 1;
+    }
+    // 两种「放不下」必须分开算：
+    //   * `cut`  —— 真的丢了内容（末尾要补 `…`，这是给用户看的）；
+    //   * `overflow` —— 「这一档排不下」，要让缩字阶梯往下走。
+    // 混成一个标志的后果是：明明一个字都没少，末尾却被换成了 `…`。
+    let too_wide = atoms.iter().any(|a| a.w > avail_w);
+    let mut cut = used < lines.len();
+    let oy = bt + (avail_h - total).max(0) / 2;
+
+    let pad = (px / 5).max(3);
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    let mut math: Vec<MathBlock> = Vec::new();
+    // 公式块之后的首字必须断批：它的 `x` 隔了一个公式的宽度，
+    // 而合批是靠「src 连续 + 同 y」判的，会把这段空档吃掉。
+    let mut pending_brk = false;
+    let mut y = oy;
+    for (j, line) in lines.iter().take(used).enumerate() {
+        let (asc, _desc, lh) = geoms[j];
+        let base = y + asc;
+        let mut x = bl + (avail_w - lw(line)) / 2;
+        for (k, &i) in line.iter().enumerate() {
+            if k > 0 {
+                x += spacing;
+            }
+            let a = &atoms[i];
+            match (a.ch, &a.mb) {
+                (Some(ch), _) => {
+                    // 最后一行的字越过右缘就截断（禁则带出来的那一字宽）
+                    if j + 1 == used && x + a.w > br && !glyphs.is_empty() {
+                        cut = true;
+                        break;
+                    }
+                    glyphs.push(Glyph {
+                        ch,
+                        x,
+                        // 文字 `y` 是**字格顶**（`TextOutW` 的语义），基线在同档
+                        // 字体的 `asc` 之下 —— 用原子自己的 `asc`，不是行首那个。
+                        y: base - a.asc,
+                        rot: false,
+                        src: a.src,
+                        brk: pending_brk,
+                    });
+                    pending_brk = false;
+                }
+                (None, Some(mb)) => {
+                    math.push(MathBlock {
+                        x: x + pad / 2,
+                        y: base,
+                        rot: false,
+                        mb: mb.clone(),
+                    });
+                    pending_brk = true;
+                }
+                (None, None) => {}
+            }
+            x += a.w;
+        }
+        y += lh;
+    }
+
+    let mut ellipsis = false;
+    if cut {
+        if let Some(last) = glyphs.pop() {
+            glyphs.push(Glyph {
+                ch: ELLIPSIS,
+                x: last.x,
+                y: last.y,
+                rot: false,
+                src: u32::MAX,
+                brk: false,
+            });
+        }
+        ellipsis = true;
+    }
+
+    let mut ql = QuoteLayout {
+        glyphs,
+        lanes: used as i32,
+        shrink: 100,
+        overflow: cut || too_wide,
+        ellipsis,
+        col_ranges: Vec::new(),
+        col_x: Vec::new(),
+        math,
+        extent: (0, 0),
+    };
+    ql.extent = rich_bounds(&ql, m);
+    ql
+}
+
+/// 竖版：公式整块**顺时针转 90°**，像书脊上的字一样侧躺，自上而下读。
+///
+/// # 为什么是旋转而不是横着嵌
+///
+/// 竖排里横着嵌一块公式（縦中横 的思路），公式一宽就会横向压到邻列 ——
+/// 而竖排的列距只有 `1.15 × 字宽`，连 `E = mc²` 都塞不进去。
+/// 转 90° 之后，公式的「宽」变成竖向的长度，正好沿着列的方向走，
+/// 列距只需要够放下它的「高」（一个多字高），几何上是自洽的。
+fn rich_v(
+    atoms: &[Atom],
+    m: Metrics,
+    band: (i32, i32, i32, i32),
+    spacing: i32,
+    px: i32,
+    align: Align,
+) -> QuoteLayout {
+    let (bl, bt, br, bb) = band;
+    let avail_w = (br - bl).max(1);
+    let avail_h = (bb - bt).max(1);
+    let cell = m.cell_h + spacing;
+    // 公式块上下（竖排里是「前后」）留一口气：旋转后的公式和下一个汉字
+    // 之间只隔一个 `spacing` 会贴在一起，像被按扁了。
+    let breath = (px / 3).max(6);
+
+    let atom_h = |a: &Atom| -> i32 {
+        match &a.mb {
+            Some(mb) => mb.w + spacing,
+            None => cell,
+        }
+    };
+
+    // ---- ① 分列：满了就断，断点优先落在句读后（仿古条幅的节奏）
+    let mut cols: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut used_h = 0;
+    for (i, a) in atoms.iter().enumerate() {
+        let h = atom_h(a);
+        if !cur.is_empty() && used_h + h > avail_h {
+            let mut brk = cur.len();
+            for p in (cur.len().saturating_sub(3)..cur.len()).rev() {
+                if atoms[cur[p]].ch.map(clause_end).unwrap_or(false) {
+                    brk = p + 1;
+                    break;
+                }
+            }
+            let rest = cur.split_off(brk);
+            cols.push(std::mem::take(&mut cur));
+            used_h = rest.iter().map(|&j| atom_h(&atoms[j])).sum();
+            cur = rest;
+        }
+        used_h += h;
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        cols.push(cur);
+    }
+
+    // ---- ② 每列宽度：**逐列算**，不用统一列距
+    //
+    // 一开始这里用的是「统一列距 = 最宽那一列的宽度」，结果整篇都被最胖的
+    // 那一列拖稀了：一句里有一个公式，其余五六列汉字之间的空隙全都翻倍。
+    // 竖排的列距本来就是「字宽 + 一点呼吸」，公式列自己有额外宽度，
+    // 两者不该互相绑架。
+    let gap = (m.col_pitch - m.char_w).max(2);
+    let mut col_w: Vec<i32> = Vec::with_capacity(cols.len());
+    for col in &cols {
+        let mut w = m.char_w;
+        for &i in col {
+            let aw = match &atoms[i].mb {
+                Some(mb) => mb.h(),
+                None => atoms[i].w,
+            };
+            w = w.max(aw);
+        }
+        col_w.push(w);
+    }
+
+    // 从右往左摆（右起），装不下就截断
+    let mut col_left: Vec<i32> = Vec::with_capacity(cols.len());
+    let mut x = br;
+    let mut used = 0usize;
+    for &w in &col_w {
+        if x - w < bl && used > 0 {
+            break;
+        }
+        let left = x - w;
+        col_left.push(left);
+        x = left - gap;
+        used += 1;
+        if used >= MAX_COLS {
+            break;
+        }
+    }
+    // 居中摆法：整块的右缘从 `br` 挪到「版心正中」。
+    // 列宽逐列不同（公式列更宽），所以按**实际占用**算偏移，不用统一列距。
+    if align == Align::Center && used > 0 {
+        let right = col_left[0] + col_w[0];
+        let left = col_left[used - 1];
+        let total = right - left;
+        let want_left = bl + (avail_w - total).max(0) / 2;
+        let dx = want_left - left;
+        for x in col_left.iter_mut().take(used) {
+            *x += dx;
+        }
+    }
+    // 公式整块比一列还高也算溢出（竖排里「一列的高度」就是版心高度）：
+    // 不报的话它会直接画出窗口下缘，缩字阶梯也不会被触发。
+    //
+    // 但「溢出」不等于「砍了字」：`cut` 只认列被砍掉，`…` 只在真丢内容时补。
+    let too_tall = atoms.iter().any(|a| atom_h(a) > avail_h);
+    let cut = used < cols.len();
+    let rows = cols
+        .iter()
+        .take(used)
+        .map(|c| c.iter().map(|&j| atom_h(&atoms[j])).sum::<i32>())
+        .max()
+        .unwrap_or(0);
+    let oy = bt + (avail_h - rows).max(0) / 2;
+
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    let mut math: Vec<MathBlock> = Vec::new();
+    let mut pending_brk = false;
+    let mut col_ranges: Vec<(usize, usize)> = Vec::with_capacity(used);
+    let mut col_x: Vec<(i32, i32)> = Vec::with_capacity(used);
+    for (ci, col) in cols.iter().take(used).enumerate() {
+        let (cx, cw) = (col_left[ci], col_w[ci]);
+        let s0 = glyphs.len();
+        let mut y = oy;
+        for &i in col.iter() {
+            let a = &atoms[i];
+            match (a.ch, &a.mb) {
+                (Some(ch), _) => {
+                    let mut gx = cx + (cw - a.w).max(0) / 2;
+                    let mut gy = y;
+                    if is_vert_dot(ch) {
+                        // 同上：按字宽而不是列宽偏移，否则公式列会把点号甩出去
+                        gx += ((m.char_w as f32) * 0.55).round() as i32;
+                        gy -= ((m.cell_h as f32) * 0.55).round() as i32;
+                        gy = gy.max(bt);
+                    }
+                    glyphs.push(Glyph {
+                        ch,
+                        x: gx,
+                        y: gy,
+                        rot: is_vert_rot(ch),
+                        src: a.src,
+                        brk: pending_brk,
+                    });
+                    pending_brk = false;
+                    y += cell;
+                }
+                (None, Some(mb)) => {
+                    math.push(MathBlock {
+                        x: cx + (cw - mb.h()).max(0) / 2,
+                        y,
+                        rot: true,
+                        mb: mb.clone(),
+                    });
+                    pending_brk = true;
+                    y += mb.w + spacing + breath;
+                }
+                (None, None) => {}
+            }
+        }
+        col_ranges.push((s0, glyphs.len()));
+        // 瓦片：相邻列在**列间空隙中点**相接；首列右缘、末列左缘各扩到版心边缘。
+        // 无缝是关键 —— 逐列渐变按瓦片查带，掉进缝里的像素会被当成「无带」，
+        // 取满亮度（症状是过渡时某几条竖线闪一下）。
+        let left_edge = if ci + 1 < used {
+            (col_left[ci + 1] + col_w[ci + 1] + cx) / 2
+        } else {
+            bl
+        };
+        let right_edge = if ci == 0 {
+            br
+        } else {
+            (cx + cw + col_left[ci - 1]) / 2
+        };
+        col_x.push((left_edge, right_edge));
+    }
+
+    let mut ellipsis = false;
+    if cut {
+        if let Some(last) = glyphs.pop() {
+            glyphs.push(Glyph {
+                ch: ELLIPSIS,
+                x: last.x,
+                y: last.y,
+                rot: false,
+                src: u32::MAX,
+                brk: false,
+            });
+        }
+        ellipsis = true;
+    }
+
+    let mut ql = QuoteLayout {
+        glyphs,
+        lanes: used as i32,
+        shrink: 100,
+        overflow: cut || too_tall,
+        ellipsis,
+        col_ranges,
+        col_x,
+        math,
+        extent: (0, 0),
+    };
+    ql.extent = rich_bounds(&ql, m);
+    ql
 }
 
 // ---------------------------------------------------------------- 测试
@@ -1074,9 +1942,10 @@ mod tests {
         // 只看 `y`/`src` 就会把它们合进一段 —— `PolyTextOutW` 随即沿一条基线
         // 把整列画成一行。2026-10-15 实测：240x80 竖版合批 vs 逐字差 669px。
         let (ch, adv) = uni(12);
-        let q = layout(&ch, &adv, metrics(), Orient::Vertical, (0, 0, 300, 30), 0);
+        // 版心宽要足够：列距是 1.70 字宽（= 34px），12 列需要 12×34 左右
+        let q = layout(&ch, &adv, metrics(), Orient::Vertical, (0, 0, 500, 30), 0);
         assert!(q.col_ranges.len() > 1, "该版心下应当是「每列一字」");
-        assert_eq!(q.col_ranges.len(), 12, "300px / 列距 23px 装得下 12 列，不该截断");
+        assert_eq!(q.col_ranges.len(), 12, "500px / 列距 34px 装得下 12 列，不该截断");
         for (s, n) in q.runs() {
             for k in 1..n {
                 let (p, g) = (q.glyphs[s + k - 1], q.glyphs[s + k]);
@@ -1099,7 +1968,7 @@ mod tests {
         // 注意版心宽要**够放下全部字**：一旦触发截断，末字会换成省略号
         // （`src = u32::MAX`），恰好把合并挡住，用例就白测了。
         let (ch, adv) = uni(12);
-        let q = layout(&ch, &adv, metrics(), Orient::Vertical, (0, 0, 300, 30), 0);
+        let q = layout(&ch, &adv, metrics(), Orient::Vertical, (0, 0, 500, 30), 0);
         assert_eq!(q.col_ranges.len(), 12, "12 字 / 每列 1 字 = 12 列");
         for (s, n) in q.runs() {
             assert_eq!(n, 1, "竖版每列一字时不许跨列合批，实际段 ({}, {})", s, n);

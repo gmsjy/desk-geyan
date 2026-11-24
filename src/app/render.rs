@@ -9,9 +9,9 @@
 use super::*;
 
 use windows_sys::Win32::Foundation::RECT;
-use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, HBRUSH, HDC, HGDIOBJ, SelectObject, SetTextCharacterExtra};
+use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, HBRUSH, HDC, HGDIOBJ, HFONT, SelectObject, SetTextCharacterExtra};
 use crate::transition;
-use crate::config::{Anim, Config, Orient};
+use crate::config::{Anim, Config, Orient, VStyle};
 use crate::gfx::{self, Fonts, Frame, QUOTE_SHRINK_STEPS};
 use crate::layout::{self, Metrics, QuoteLayout};
 use crate::quotes::Quote;
@@ -43,6 +43,8 @@ struct RC<'a> {
     qn: usize,
     m: f32,
     brush: HBRUSH,
+    /// 竖版界栏专用（见 `App::rule_brush`）
+    rule_brush: HBRUSH,
     /// **生效动效**（已把「竖版降级为静态」「放不下转跑马灯」两件事算进去）。
     /// 绘制只认它，不再自己去看 `cfg.anim`。
     anim: Anim,
@@ -272,13 +274,9 @@ pub(crate) fn build_frame_ex(a: &mut App, opacity: u8, no_batch: Option<bool>) {
         QuoteLayout::default()
     };
 
-    // ---- 竖版落款跟排（仿古条幅，2026-10-15 老板报「落款和正文脱节」）。
-    // 主文右起贴右缘，落款条的**右缘**贴主文块左缘 —— 整个卷轴是紧凑的
-    // 一块，而不是落款钉在窗口左缘、窗口一宽就和正文隔着几百像素空白。
-    // 只挪落款、**不重排主文**：主文右起贴 br，与版心左缘无关；frame_mod
-    // 在错峰相位本来就把末列带扩到 x=0、出处带先 push 先赢（见 6605 的
-    // 实测教训），瓦片不需要跟着落款走。反侧重排窄版心反而会截列。
-    let cb = hug_sign(&a.cfg, cb, &ql);
+    // ---- 竖版署名跟排（题跋式，2026-11-04 竖排改版）：署名接在正文末尾，
+    // 短句时跟得紧、长句时退到地脚，正文占满版面时让位。只对 A / B 生效。
+    let cb = place_sign(&a.cfg, cb, &ql);
     let crect = RECT {
         left: cb.x,
         top: cb.y,
@@ -288,8 +286,12 @@ pub(crate) fn build_frame_ex(a: &mut App, opacity: u8, no_batch: Option<bool>) {
 
     // 连缩到 70% 都放不下 → 横版转跑马灯。**竖版没有跑马灯**（横向滚动 ×
     // 竖排字格 = 横竖混排的怪物），就地带省略号收尾。
-    a.force_marquee =
-        ql.overflow && a.cfg.show_quote && a.cfg.orient == Orient::Horizontal;
+    //
+    // 含公式的句子**同样可以转**：跑马灯那条路现在会为公式句排一张定位表
+    // （`marquee_item`），不再是「画 `display()` 原文、露出 `$...$`」。
+    a.force_marquee = ql.overflow
+        && a.cfg.show_quote
+        && a.cfg.orient == Orient::Horizontal;
     // 生效动效**只从 `App::eff_anim()` 取**（它已含 force_marquee + 竖版降级）。
     // 这里以前又内联判断了一遍，成了「同一概念第四份定义」。
     let eff_anim = a.eff_anim();
@@ -325,6 +327,7 @@ pub(crate) fn build_frame_ex(a: &mut App, opacity: u8, no_batch: Option<bool>) {
         qn,
         m,
         brush,
+        rule_brush,
         ..
     } = a;
     let (w, h) = (cfg.w, cfg.h);
@@ -342,6 +345,7 @@ pub(crate) fn build_frame_ex(a: &mut App, opacity: u8, no_batch: Option<bool>) {
         qn: *qn,
         m: *m,
         brush: *brush,
+        rule_brush: *rule_brush,
         anim: eff_anim,
         slide,
         qk,
@@ -405,14 +409,29 @@ pub(crate) struct ClockBox {
     pub(crate) y: i32,
     pub(crate) w: i32,
     pub(crate) h: i32,
+    /// 默认位置（未叠 `clock_dx/dy`）。夹取偏移时按它反推，
+    /// 于是「默认位置」只有一处定义，横竖两套都在各自量的时候写进去。
+    pub(crate) dx0: i32,
+    pub(crate) dy0: i32,
     pub(crate) time: Option<Vec<u16>>,
     pub(crate) date: Option<Vec<u16>>,
     pub(crate) time_h: i32,
     pub(crate) gap: i32,
+    /// 竖版页头：时间 / 日期各自的左上角（**都横排**）。
+    /// 横版用不到（位置由 `x/y + time_h + gap` 推）。
+    pub(crate) time_at: (i32, i32),
+    pub(crate) date_at: (i32, i32),
+    /// 竖版页头用的时钟字体（大钟或小钟，按实测宽度选）。
+    pub(crate) clock_face: HFONT,
+    /// 竖版界栏：`(y, x0, x1)`。`None` = 这一形态没有界栏（B 极简）。
+    pub(crate) rule: Option<(i32, i32, i32)>,
+    /// 竖版页头下端（含界栏）。主文档心从它往下算 —— **页头永远在正文之上**，
+    /// 这是「时间放顶部」这条设计决定的唯一落点。
+    pub(crate) head_bottom: i32,
     /// 竖版落款：逐列小字，**右起**（第 0 列最靠主文）。空 = 横版。
     ///
-    /// 竖版下 `time` / `date` 留空，内容全在这里 —— 落款是一串**竖排**小字，
-    /// 跟横版「一行时间、一行日期」是两种几何，硬塞进同两个字段只会互相打结。
+    /// 竖版下 `time` / `date` 是**横排**的页头，`sig` 只剩署名一列竖排 ——
+    /// 两者是两种几何，混在同一个字段里只会互相打结。
     pub(crate) sig: Vec<SigCol>,
     /// 竖版落款的单元格高
     pub(crate) sig_cell: i32,
@@ -424,21 +443,20 @@ pub(crate) struct ClockBox {
 /// 竖版落款里的一列。
 #[derive(Clone)]
 pub(crate) struct SigCol {
-    s: Vec<u16>,
+    /// 这一列的字（UTF-16）。写入方在 `layout_header_v` / `place_sign`。
+    pub(crate) s: Vec<u16>,
     pub(crate) x: i32,
-    /// true → 走主色通道（mask）；false → 走日期色通道（dmask）
-    pub(crate) main_color: bool,
+    /// 这一列的**顶端**。竖版的列可以贴地脚（署名，A/B）也可以贴天头（C），
+    /// 位置不再共用一个 `cb.y` —— 所以每列自带 y。
+    pub(crate) y: i32,
     /// true → **出处列**：换句过渡时随格言一起淡（PR3，老板定的语义）。
-    /// 时间列是时钟（主职、静帧锚点）、日期列是落款配角，都不动。
     pub(crate) is_author: bool,
-    /// true → 整串旋转 90° 绘制（时间列，审查 U4），而非逐字下落。
-    pub(crate) rot: bool,
 }
 
 /// 量一次时间日期块的几何（无缓存，见 `layout_clock`）。
 fn layout_clock_raw(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox {
     if cfg.orient == Orient::Vertical {
-        return layout_sign(cfg, fonts, dc, quote);
+        return layout_header_v(cfg, fonts, dc, quote);
     }
     let scale = cfg.eff_scale();
     let (w, h) = (cfg.w, cfg.h);
@@ -461,10 +479,17 @@ fn layout_clock_raw(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> Cloc
         y: 0,
         w: 0,
         h: 0,
+        dx0: pad,
+        dy0: 0,
         time,
         date,
         time_h: 0,
         gap: 0,
+        time_at: (0, 0),
+        date_at: (0, 0),
+        clock_face: null_mut(),
+        rule: None,
+        head_bottom: 0,
         sig: Vec::new(),
         sig_cell: 0,
         sig_w: 0,
@@ -478,6 +503,7 @@ fn layout_clock_raw(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> Cloc
     } else {
         fonts.clock_small
     };
+    cb.clock_face = clock_face;
     let mut bw = 0;
     let mut date_h = 0;
 
@@ -507,8 +533,13 @@ fn layout_clock_raw(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> Cloc
     // 默认位置 + 拖动偏移，然后夹进窗口
     let max_x = (w - bw).max(0);
     let max_y = (h - cb.h).max(0);
+    cb.dx0 = pad.clamp(0, max_x);
+    cb.dy0 = ((h - cb.h) / 2).clamp(0, max_y);
     cb.x = (pad + cfg.clock_dx).clamp(0, max_x);
     cb.y = ((h - cb.h) / 2 + cfg.clock_dy).clamp(0, max_y);
+    cb.time_at = (cb.x, cb.y);
+    cb.date_at = (cb.x, cb.y + cb.time_h + gap);
+    cb.head_bottom = cb.y + cb.h;
     cb
 }
 
@@ -531,6 +562,14 @@ fn layout_clock_raw(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> Cloc
 /// 换句走 `qi`、换字号走 `font_epoch`、走秒走 `clock_stamp` —— 三条自动覆盖，
 /// 不必在每个写配置的地方手工插一句作废。漏一项的表现是「改了没生效」，
 /// 极难复现，所以宁可多列几个分量。
+///
+/// # 唯一覆盖不到的写法
+///
+/// 指纹认的是 `qi`（**哪一句**），不是句子内容。所以「就地替换 `list[qi]`」
+/// （不换 `qi`、只换文本或出处）不会让缓存失效 —— 拿回来的是上一句的页头，
+/// 署名用的是旧 `author`，整个署名列会凭空消失或停在旧位置。现有代码里
+/// 没有这种写法（换句一律动 `qi`，自检里造句子紧跟 `rebuild_fonts`，
+/// 后者涨 `font_epoch`）；将来要加，就得自己把 `font_epoch` 也涨一下。
 pub(crate) fn layout_clock(a: &mut App) -> ClockBox {
     let key = (
         clock_stamp(&a.cfg),
@@ -541,10 +580,15 @@ pub(crate) fn layout_clock(a: &mut App) -> ClockBox {
         a.qi as i32,
         u32::from(a.cfg.show_clock),
         u32::from(a.cfg.show_date),
-        match a.cfg.orient {
-            Orient::Horizontal => 0u32,
-            Orient::Vertical => 1u32,
-        },
+        // 版式 + 竖版形态打包成一个分量：页头的排法两者都决定，漏一个就会出现
+        // 「切了形态，时间还停在旧位置」——缓存命中比正确性更「持久」。
+        // （元组的 `PartialEq` 只到 12 元，所以不能各占一格。）
+        u32::from(a.cfg.orient == Orient::Vertical) * 4
+            + match a.cfg.v_style {
+                VStyle::Banner => 0u32,
+                VStyle::Minimal => 1u32,
+                VStyle::Head => 2u32,
+            },
         a.cfg.clock_dx,
         a.cfg.clock_dy,
         a.font_epoch,
@@ -563,30 +607,51 @@ pub(crate) fn layout_clock(a: &mut App) -> ClockBox {
     cb
 }
 
-/// 竖版形态 A 的**落款条**：窗口左侧一列列竖排小字，主文竖排在它右边。
+/// 竖版落款列的文字适配：超出「一列能排的格数」就截断并补省略号。
 ///
-/// 列序**自右向左**：时间 → 出处 → 日期（先读到的靠右，和主文同向）。
-/// 时间走**主色**通道，它首先是块表 —— 扫一眼就得看见；
-/// 出处与日期走**日期色**通道，它们是落款，本来就该比主角弱一档。
-/// 两条通道都是现成的 ⇒ 不新增第四条掩码，`Frame` / `compose` 一行都不用动。
-fn layout_sign(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox {
-    let (w, h) = (cfg.w, cfg.h);
-    let pad = cfg.pad();
+/// 竖排一列是从上往下读完的，超出的部分会被窗口底直接裁掉 —— 画面上就是
+/// 半句话凭空没了（实测 600×1084@300%：日期只剩一个「星」）。宁可显式给省略号。
+fn sign_fit(s: &str, max_cells: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_cells {
+        return s.to_string();
+    }
+    if max_cells <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = s.chars().take(max_cells - 1).collect();
+    out.push('…');
+    out
+}
 
-    // 右起第一列是时间（主色），然后出处、日期
-    // 第三分量 = 是否出处列（过渡时随格言淡，PR3）
-    let mut cols: Vec<(Vec<u16>, bool, bool)> = Vec::new();
-    if cfg.show_clock {
-        cols.push((wide(&fmt_clock(&local_time(), cfg.seconds)), true, false));
-    }
-    if !quote.author.is_empty() {
-        // 出处原样用，**不套书名号** —— `display()` 里也是原样，
-        // 而内置库里已经有「《周易》」这种自带书名号的出处，再套一层就成了《《周易》》
-        cols.push((wide(&quote.author), false, true));
-    }
-    if cfg.show_date {
-        cols.push((wide(&fmt_date_short(&local_time())), false, false));
-    }
+/// 竖版**页头**：时间与日期横排压顶，下面一条界栏（A / C 才有）。
+///
+/// # 为什么时间一定要横排、一定要在顶部
+///
+/// 旧实现把时间当落款的一列逐字竖排，`15:40:36` 于是成了八格八个字，
+/// 读起来是「一 / 五 / 冒号 / 四 / 零 …」八拍，扫一眼拿不到时间。
+/// 时钟是这块挂件的**静帧锚点**，必须一眼可读 —— 横排、置顶、字号独立于正文。
+///
+/// 三个形态共用这一个函数，差别只在三段：
+///
+/// | | 时间 | 日期 | 界栏 | 署名 |
+/// |---|---|---|---|---|
+/// | A 条幅 | 居中 | 居中在下一行 | 有 | 正文末尾左下方 |
+/// | B 极简 | 左上角 | 尽量与时间同一行 | 无 | 正文末尾左下方 |
+/// | C 栏头 | 左上角 | 右上角同一行 | 有 | 版心左侧一列（贴天头） |
+///
+/// 日期**始终带星期**（老板拍板）：`2026年11月4日 星期三`，放不下才逐级降级
+/// 到「11月4日 星期三」→「11月4日」—— 降级到最后一级也不丢「几号」。
+fn layout_header_v(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox {
+    let (w, h) = (cfg.w, cfg.h);
+    let pad = cfg.pad_v();
+    let em = fonts.quote_px[0].max(6);
+    let style = cfg.v_style;
+    let inner_l = pad;
+    let inner_r = (w - pad).max(inner_l + 1);
+    let inner_w = (inner_r - inner_l).max(1);
+    let cap = ((inner_w as f32) * 0.92).round() as i32;
+    let t = local_time();
 
     let mut cb = ClockBox {
         show: false,
@@ -594,83 +659,240 @@ fn layout_sign(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox 
         y: 0,
         w: 0,
         h: 0,
+        dx0: pad,
+        dy0: pad,
         time: None,
         date: None,
         time_h: 0,
         gap: 0,
+        time_at: (pad, pad),
+        date_at: (pad, pad),
+        clock_face: null_mut(),
+        rule: None,
+        head_bottom: pad,
         sig: Vec::new(),
         sig_cell: 0,
         sig_w: 0,
     };
-    if cols.is_empty() {
-        return cb;
-    }
 
-    // 拿日期字体量一个汉字：列宽 / 单元格高 / 列距全从这里推，不按比例估算
-    unsafe { SelectObject(dc, fonts.date as HGDIOBJ) };
-    let (cw, ch) = gfx::measure_text(dc, &wide("国"));
-    let (cw, ch) = (cw.max(1), ch.max(1));
-    let cell = ((ch as f32) * 1.30).round() as i32;
-    let ncol = cols.len() as i32;
-    // 列距先取自然值（字宽的 1.45 倍，竖排才不挤），但**整条落款不许超过窗口的 34%**：
-    // 落款的字号跟着 scale 一起涨，而窗口不一定跟着涨 —— 不设上限的话，
-    // 大字号 + 窄窗口下它会一路把主文挤到只剩一列（实测 240×520@150% 就发生过）。
-    let natural = ((cw as f32) * 1.45).round() as i32;
-    let cap_w = ((w as f32) * 0.34).round() as i32;
-    let pitch = if ncol > 1 {
-        natural.min(((cap_w - cw).max(cw / 2)) / (ncol - 1))
-    } else {
-        natural
-    }
-    .max(6);
-
-    let rows = cols
-        .iter()
-        .map(|(s, _, _)| s.len().saturating_sub(1))
-        .max()
-        .unwrap_or(0) as i32;
-    let bw = (ncol - 1) * pitch + cw;
-    let mut bh = (rows - 1).max(0) * cell + ch;
-    // 时间列整串旋转（U4）：纵向跨度 = 旋转字体的串宽，取它与逐字高度的较大者，
-    // 保证长串（如带秒的 8 字符）不被落款条底边裁掉。量完把字体选回 date。
+    // ---- 量文字：时间用**竖版专用**的那支（正文 1.25 倍），装不下再逐级退；
+    //      日期按宽度逐级降级（星期是老板点名要保的，排在降级链第二级）
+    let mut time_w = 0;
+    let mut time_h = 0;
     if cfg.show_clock {
-        if let Some((s, _, _)) = cols.first() {
-            unsafe {
-                SelectObject(dc, fonts.date_rot as HGDIOBJ);
-                let (tw, _) = gfx::measure_text(dc, s);
-                bh = bh.max(tw);
-                SelectObject(dc, fonts.date as HGDIOBJ);
+        let s = wide(&fmt_clock(&t, cfg.seconds));
+        for face in [fonts.clock_v, fonts.clock_small, fonts.date] {
+            unsafe { SelectObject(dc, face as HGDIOBJ) };
+            let (tw, th) = gfx::measure_text(dc, &s);
+            cb.clock_face = face;
+            time_w = tw;
+            time_h = th;
+            if tw <= cap {
+                break;
             }
+        }
+        cb.time = Some(s);
+        cb.time_h = time_h;
+    }
+
+    let mut date_w = 0;
+    let mut date_h = 0;
+    let gap_x = ((em as f32) * 0.55).round().max(2.0) as i32;
+    let gap_y = ((em as f32) * 0.32).round().max(1.0) as i32;
+    if cfg.show_date {
+        const WEEK: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
+        let wk = WEEK[(t.wDayOfWeek as usize).min(6)];
+        // 降级链：带年份 → 只留月日但保住星期 → 只剩月日。
+        // 「星期」是老板点名要保的，所以它在第二级还在，只有窄到装不下才丢。
+        let cands = [
+            fmt_date(&t),
+            format!("{}月{}日 星期{}", t.wMonth, t.wDay, wk),
+            format!("{}月{}日", t.wMonth, t.wDay),
+        ];
+        unsafe { SelectObject(dc, fonts.date_v as HGDIOBJ) };
+        // **星期优先**：老板点名要保。所以先在「带星期」的两档里挑能整行放下的
+        // 最长那个（先用带年份的，放不下退到「11月4日 星期三」）；
+        // 连带星期的都放不下，才退到「11月4日」。
+        //
+        // 注意判据是「整行放得下」而不是「能跟时间挤一行」：为了同一行而丢星期，
+        // 是拿用户明确要的信息去换版式，方向反了。能不能挤同一行由下面摆位那段
+        // 再判 —— 挤不下就落到第二行。
+        let mut pick = None;
+        for (i, s) in cands.iter().take(2).enumerate() {
+            let (dw, dh) = gfx::measure_text(dc, &wide(s));
+            if dw <= cap {
+                pick = Some((i, dw, dh));
+                break;
+            }
+        }
+        let (idx, dw, dh) = match pick {
+            Some(p) => p,
+            None => {
+                let (dw, dh) = gfx::measure_text(dc, &wide(&cands[2]));
+                (2, dw, dh)
+            }
+        };
+        date_w = dw;
+        date_h = dh;
+        cb.date = Some(wide(&cands[idx]));
+    }
+
+    // ---- 摆位（先按「页头从 pad 起」算默认位置，之后再整体叠加拖动偏移）
+    let top = pad;
+    let (head_bottom, bx0, by0, bx1, by1);
+
+    match style {
+        VStyle::Minimal => {
+            // 一行放得下就一行（桌面挂件最省高度），放不下分成两行、都靠左
+            let mut x = inner_l;
+            let mut line_bottom = top;
+            if cb.time.is_some() {
+                cb.time_at = (inner_l, top);
+                x = inner_l + time_w + gap_x;
+                line_bottom = top + time_h;
+            }
+            if cb.date.is_some() {
+                if cb.time.is_some() && x + date_w <= inner_r {
+                    cb.date_at = (x, top + (time_h - date_h) / 2);
+                    line_bottom = line_bottom.max(top + time_h.max(date_h));
+                } else {
+                    let dy = if cb.time.is_some() {
+                        top + time_h + gap_y
+                    } else {
+                        top
+                    };
+                    cb.date_at = (inner_l, dy);
+                    line_bottom = dy + date_h;
+                }
+            }
+            head_bottom = line_bottom;
+            bx0 = inner_l;
+            by0 = top;
+            bx1 = inner_r;
+            by1 = line_bottom;
+        }
+        VStyle::Banner => {
+            // 居中压顶：时间一行、日期一行，下面是界栏
+            let mut y = top;
+            if cb.time.is_some() {
+                cb.time_at = (inner_l + (inner_w - time_w).max(0) / 2, y);
+                y += time_h;
+            }
+            if cb.date.is_some() {
+                let dy = if cb.time.is_some() { y + gap_y } else { y };
+                cb.date_at = (inner_l + (inner_w - date_w).max(0) / 2, dy);
+                y = dy + date_h;
+            }
+            let rule_y = y + ((em as f32) * 0.55).round().max(2.0) as i32;
+            cb.rule = Some((rule_y, inner_l, inner_r));
+            head_bottom = rule_y;
+            bx0 = inner_l;
+            by0 = top;
+            bx1 = inner_r;
+            by1 = rule_y;
+        }
+        VStyle::Head => {
+            // 栏头：时间靠左、日期靠右，同一行（放不下才让日期落到第二行右端）
+            let mut y = top;
+            let line_bottom;
+            if cb.time.is_some() {
+                cb.time_at = (inner_l, y);
+            }
+            if cb.date.is_some() {
+                let right_x = inner_r - date_w;
+                let same_line = cb.time.is_some() && right_x >= inner_l + time_w + gap_x;
+                if same_line {
+                    cb.date_at = (right_x, y + (time_h - date_h) / 2);
+                    line_bottom = y + time_h.max(date_h);
+                } else {
+                    let dy = if cb.time.is_some() { y + time_h + gap_y } else { y };
+                    cb.date_at = (right_x.max(inner_l), dy);
+                    line_bottom = dy + date_h;
+                }
+            } else {
+                line_bottom = y + time_h;
+            }
+            y = line_bottom;
+            let rule_y = y + ((em as f32) * 0.55).round().max(2.0) as i32;
+            cb.rule = Some((rule_y, inner_l, inner_r));
+            head_bottom = rule_y;
+            bx0 = inner_l;
+            by0 = top;
+            bx1 = inner_r;
+            by1 = rule_y;
         }
     }
 
-    // 默认位置：贴左侧、垂直居中；再叠用户拖动偏移，夹进窗口
-    let x0 = pad;
-    let y0 = (h - bh) / 2;
+    // ---- 署名（竖排一列，**小字**）
+    //
+    // 用页头日期那支 55% 的字体，不用正文那支：题跋本来就是小字落款，
+    // 用正文同级字号会喧宾夺主 —— 实测 300×660@200% 下署名三字占掉
+    // 205px 纵向空间，比十二个字的正文还高，正文被迫挤成 4 列每列 3 字。
+    //
+    // 出处原样用，**不套书名号** —— 内置库里已经有「《周易》」这种自带书名号的
+    // 出处，再套一层就成了《《周易》》。
+    if !quote.author.is_empty() && cfg.show_quote {
+        unsafe { SelectObject(dc, fonts.date_v as HGDIOBJ) };
+        let (cw, ch) = gfx::measure_text(dc, &wide("国"));
+        let (cw, ch) = (cw.max(1), ch.max(1));
+        let cell = ((ch as f32) * 1.28).round() as i32;
+        let floor_y = if style == VStyle::Head {
+            // C：署名贴版心顶部，与正文同起
+            head_bottom + ((em as f32) * 0.95).round() as i32
+        } else {
+            pad
+        };
+        let max_cells = (((h - pad - floor_y) / cell.max(1)).max(1)) as usize;
+        let s = sign_fit(&quote.author, max_cells);
+        let rows = s.chars().count() as i32;
+        // A / B 的最终 y 要等正文排完才知道（题跋式跟排，见 `place_sign`），
+        // 这里先给一个「贴窗口底」的保守位置。
+        let y = if style == VStyle::Head {
+            floor_y
+        } else {
+            (h - pad - rows * cell).max(floor_y)
+        };
+        cb.sig.push(SigCol {
+            s: wide(&s),
+            x: inner_l,
+            y,
+            is_author: true,
+        });
+        cb.sig_cell = cell;
+        cb.sig_w = cw;
+        // 署名**不进**页头的包围盒：页头框是拖动命中的范围，署名在窗口底部，
+        // 算进去会让「拖空白处移动整窗」被误判成「拖时间」。
+    }
+    cb.head_bottom = head_bottom;
+
+    // ---- 整体叠加拖动偏移，然后夹进窗口
+    let bw = (bx1 - bx0).max(1);
+    let bh = (by1 - by0).max(1);
+    cb.dx0 = bx0.clamp(0, (w - bw).max(0));
+    cb.dy0 = by0.clamp(0, (h - bh).max(0));
     let max_x = (w - bw).max(0);
     let max_y = (h - bh).max(0);
-    let bx = (x0 + cfg.clock_dx).clamp(0, max_x);
-    let by = (y0 + cfg.clock_dy).clamp(0, max_y);
-
-    cb.sig = Vec::with_capacity(cols.len());
-    for (i, (s, mc, au)) in cols.into_iter().enumerate() {
-        let x = bx + (ncol - 1 - i as i32) * pitch;
-        cb.sig.push(SigCol {
-            s,
-            x,
-            main_color: mc,
-            is_author: au,
-            // 时间列 = 主色且非出处 → 整串旋转（U4）
-            rot: mc && !au,
-        });
+    let nx = (cb.dx0 + cfg.clock_dx).clamp(0, max_x);
+    let ny = (cb.dy0 + cfg.clock_dy).clamp(0, max_y);
+    let (dx, dy) = (nx - bx0, ny - by0);
+    if dx != 0 || dy != 0 {
+        // 时间 / 日期 / 界栏 / 署名一起挪 —— 页头是一块，不是几个独立元素
+        cb.time_at = (cb.time_at.0 + dx, cb.time_at.1 + dy);
+        cb.date_at = (cb.date_at.0 + dx, cb.date_at.1 + dy);
+        if let Some((ry, x0, x1)) = cb.rule {
+            cb.rule = Some((ry + dy, x0 + dx, x1 + dx));
+        }
+        for c in &mut cb.sig {
+            c.x += dx;
+            c.y += dy;
+        }
+        cb.head_bottom += dy;
     }
-    cb.x = bx;
-    cb.y = by;
+    cb.x = nx;
+    cb.y = ny;
     cb.w = bw;
     cb.h = bh;
-    cb.sig_cell = cell;
-    cb.sig_w = cw;
-    cb.show = true;
+    cb.show = cb.time.is_some() || cb.date.is_some();
     cb
 }
 
@@ -680,33 +902,68 @@ const MIN_QUOTE_BAND: i32 = 96;
 /// 堆叠摆法下，版心至少要有这个高度
 const MIN_QUOTE_H: i32 = 44;
 
-/// 竖版**落款跟排**（仿古条幅，2026-10-15 老板报「落款和正文脱节」）：
-/// 主文右起贴右缘，落款条的**右缘**贴主文块左缘 —— 整个卷轴是紧凑的
-/// 一块，而不是落款钉在窗口左缘、窗口一宽就和正文隔着几百像素空白。
+/// 竖版**署名跟排**：排完正文才知道它该落在哪。
 ///
-/// 只挪落款、**不重排主文**：主文右起贴 br，与版心左缘无关；frame_mod
-/// 在错峰相位本来就把末列带扩到 x=0、出处带先 push 先赢（见 6605 的
-/// 实测教训），瓦片不需要跟着落款走。反侧重排窄版心反而会截列。
-/// 用户拖动偏移（clock_dx）照样叠加；贴过去会出左界 / 会压到主文时
-/// 退回 layout_sign 的原位。`build_frame` 与自检都走这一个函数。
-pub(crate) fn hug_sign(cfg: &Config, mut cb: ClockBox, ql: &QuoteLayout) -> ClockBox {
-    if cfg.orient != Orient::Vertical || !cb.show || ql.is_empty() {
+/// 竖排的落款天然属于「读完之后」的位置 —— 所以 A / B 两套把它**接在正文
+/// 末尾**（题跋式），而不是钉在窗口左下角：短句时跟得紧，长句时退到地脚。
+/// 正文把版面占满时干脆不画（正文优先，署名是配角）。
+///
+/// 只对 A / B 生效：C 栏头的署名是版心左侧的一整列，位置在 `layout_header_v`
+/// 里就定死了（贴天头），不需要这一步。
+pub(crate) fn place_sign(cfg: &Config, mut cb: ClockBox, ql: &QuoteLayout) -> ClockBox {
+    if cfg.orient != Orient::Vertical || cb.sig.is_empty() || ql.is_empty() {
         return cb;
     }
-    let pad = cfg.pad();
-    let band = frame_band(cfg, &cb);
-    // 主文块左缘取**真实字形最小 x**：居中（U5）之后主文不再贴 br，
-    // 用 band.2 - extent 推会偏一个居中偏移量。
-    let main_left = ql.glyphs.iter().map(|g| g.x).min().unwrap_or(band.2);
-    let want_bx = (main_left - pad - cb.w + cfg.clock_dx)
-        .clamp(pad, (cfg.w - cb.w - pad).max(pad));
-    if want_bx > cb.x {
-        let dx = want_bx - cb.x;
-        cb.x = want_bx;
-        for col in &mut cb.sig {
-            col.x += dx;
+    let pad = cfg.pad_v();
+    let em = cfg.quote_font_px();
+    // 正文块的**实际**上下缘直接从定位表读，不再从版心反推 ——
+    // 正文排完之后 `frame_layout` 还会整体上提一把（把页头占掉的半高还给它），
+    // 反推出来的位置会比实际低一截，署名就会被判成「压到正文」而整列消失。
+    let origin = layout::content_origin(ql);
+    let body_bottom = origin.1 + ql.extent.1;
+    let rows = cb.sig[0].s.len().saturating_sub(1) as i32;
+    let tall = (rows - 1).max(0) * cb.sig_cell + cb.sig_w;
+    let gap = ((em as f32) * 1.25).round() as i32;
+
+    if cfg.v_style == VStyle::Head {
+        // C 栏头：署名是**正文左边的一列**，贴住正文块（而不是钉在窗口左缘）。
+        // 钉左缘时正文靠右、署名靠左，中间空出一大片 —— 看着像两个不相关的块。
+        let x = origin.0 - ((em as f32) * 0.75).round() as i32 - cb.sig_w;
+        if x < pad {
+            cb.sig.clear(); // 正文占满宽度：署名让位
+            return cb;
         }
+        cb.sig[0].x = x;
+        // 竖排从上往下读，署名与正文**同起**才对得齐 —— 贴版心上边界会浮在
+        // 正文头顶（正文是竖直居中的，版心顶往往高出正文一截）。
+        cb.sig[0].y = origin.1.max(pad);
+        return cb;
     }
+
+    // A / B：接在**最后一列正下方**（题跋式）。竖排是「读完正文再落名」，
+    // 名字贴着末列读下来才是一句话；钉在窗口左下角会和正文隔开一大片空白，
+    // 看起来像两个不相干的东西（草案 B 的实测结论）。
+    let want = body_bottom + gap;
+    let floor = cfg.h - pad - tall;
+    let y = want.min(floor);
+    if y < body_bottom + 1 {
+        // 下方确实没地方了（正文一路排到窗口底 = 窗口太矮或字号太大）：
+        // **横向**让位到正文块左侧，而不是直接消失。
+        //
+        // 「消失」看着像「这句本来就没有出处」—— 用户没法区分那是排版
+        // 决策还是 bug。挪到左边仍然是题跋：紧贴正文、读得下去，只是
+        // 换了个方向落款（C 栏头本来就这么排）。
+        let x = origin.0 - ((em as f32) * 0.5).round() as i32 - cb.sig_w;
+        if x >= pad {
+            cb.sig[0].x = x;
+            cb.sig[0].y = (body_bottom - tall).max(origin.1).max(pad);
+            return cb;
+        }
+        cb.sig.clear(); // 连左边都挤不出：正文占满整窗，署名让位
+        return cb;
+    }
+    cb.sig[0].x = origin.0.max(pad);
+    cb.sig[0].y = y.max(pad);
     cb
 }
 
@@ -739,16 +996,39 @@ pub(crate) fn quote_band(cfg: &Config, cb: &ClockBox) -> (i32, i32, i32, i32) {
     full
 }
 
-/// 竖版主文的版心：落款条右侧那一整片。
+/// 竖版主文的版心：页头**下面**那一整片。
+///
+/// 页头在顶部（时间 / 日期 / 界栏）是这次设计的硬约束 —— 主文永远从页头下方
+/// 起排，绝不可能压在时间上。C 栏头另有一条：署名占左侧一列，版心让开它。
 fn quote_band_v(cfg: &Config, cb: &ClockBox) -> (i32, i32, i32, i32) {
     let (w, h) = (cfg.w, cfg.h);
-    let pad = cfg.pad();
-    let full = (pad, pad, w - pad, h - pad);
-    if !cb.show {
-        return full;
+    let pad = cfg.pad_v();
+    let em = cfg.quote_font_px();
+
+    let mut l = pad;
+    // C 栏头：署名占正文左边一列，版心让开它（`||` 而不是嵌两层 `if`）。
+    if cfg.v_style == VStyle::Head && cb.sig.iter().any(|c| c.is_author) {
+        l = (pad + cb.sig_w + ((em as f32) * 0.55).round() as i32).min(w - pad - 1);
+        l = l.max(pad);
     }
-    let l = (cb.x + cb.w + pad).min(w - pad - 1).max(pad);
-    (l, pad, w - pad, h - pad)
+    let top = if cb.show {
+        // 页头下方留一口气：有界栏时 0.95em，纯文字页头 1.15em（没有线帮忙分块，
+        // 靠留白分）。
+        let g = if cb.rule.is_some() { 0.95 } else { 1.15 };
+        (cb.head_bottom + ((em as f32) * g).round() as i32).min(h - pad - 1)
+    } else {
+        pad
+    };
+    let top = top.max(pad);
+
+    // 正文**吃满整块版心**，不给署名预留纵向空间。
+    //
+    // 试过留：版心先减掉「署名列高 + 间距」再交给排版，署名就一定有地方落。
+    // 但那是拿正文换署名 —— 300×660@200% 下署名三字要 160px，正文只剩
+    // 三分之二，十二个字被迫挤成「待/到/重」这种三字一列，断句全碎。
+    // 宁可让正文满版、署名改用**横向让位**（见 `place_sign`：下方放不下
+    // 就挪到正文块左侧），两边都不受委屈。
+    (l, top, w - pad, h - pad)
 }
 
 /// 版心是不是退化到了「只能整窗画」这一步（横版）。
@@ -779,12 +1059,12 @@ pub(crate) fn frame_band(cfg: &Config, cb: &ClockBox) -> (i32, i32, i32, i32) {
 
 /// 当前这一帧的排版结果。
 pub(crate) fn frame_layout(a: &App, cb: &ClockBox) -> QuoteLayout {
-    let mut band = frame_band(&a.cfg, cb);
+    let band = frame_band(&a.cfg, cb);
     // 度量时字距必须为 0 —— 字距由排版层自己加进定位表
     unsafe { SetTextCharacterExtra(a.frame.dc(), 0) };
     // 竖版主文**不带出处尾巴**：「正文　——　作者」在竖排里会变成一列
     // 孤零零的旋转竖杠 + 与落款条重复的作者名，还把诗文的断列搅乱。
-    // 古籍正文从不夹署名 —— 出处归落款条（仿古排版，2026-10-15 老板拍板）。
+    // 古籍正文从不夹署名 —— 出处归落款（仿古排版，2026-10-15 老板拍板）。
     // 横版维持 display()（跑马灯一行带出处）。
     let q = &a.list[a.qi];
     let (text, attr_from) = if a.cfg.orient == Orient::Vertical {
@@ -800,34 +1080,25 @@ pub(crate) fn frame_layout(a: &App, cb: &ClockBox) -> QuoteLayout {
         };
         (q.display(), af)
     };
-    // ---- 竖版「卷轴整体居中」（审查 U5）：正文右起贴右缘 + 落款跟排之后，
-    // 短句时整个内容簇贴右、左侧近半窗口空白。把版心右缘左移 offset，
-    // 让「落款 + 正文」簇水平居中；hug_sign 按真实字形左缘贴排，关系不变。
-    // 用户拖过时钟（clock_dx != 0）时不碰 —— 用户意图压过自动行为。
-    // 偏移按指纹缓存：命中只排一趟，未命中才两趟（先量 extent 再定偏移）。
-    if a.cfg.orient == Orient::Vertical && cb.show && a.cfg.clock_dx == 0 && a.cfg.show_quote {
-        let pad = a.cfg.pad();
-        let key = (a.qi, a.font_epoch, a.cfg.w, a.cfg.h, cb.w);
-        let (ck, off) = a.v_center.get();
-        if ck == key {
-            band.2 -= off;
-        } else {
-            let probe = layout_quote(&a.cfg, &a.fonts, a.frame.dc(), band, &text, attr_from);
-            let avail = a.cfg.w - 2 * pad;
-            let cluster = cb.w + pad + probe.extent.0;
-            let off = if !probe.is_empty() && cluster < avail {
-                (avail - cluster) / 2
-            } else {
-                0
-            };
-            a.v_center.set((key, off));
-            if off == 0 {
-                return probe;
-            }
-            band.2 -= off;
+    let mut ql = layout_quote(&a.cfg, &a.fonts, a.frame.dc(), band, &text, attr_from);
+
+    // ---- 竖版：把页头占掉的那半高**还给正文**
+    //
+    // 版心从页头下方起算，正文在版心里竖直居中 ⇒ 整块会系统性偏下半个页头高，
+    // 短句时下面一大片空、上面贴着日期，观感像「排版掉了下去」。
+    // 这里把整块上提 `(页头高)/2`，但**留有上限**：
+    //   * 上提不超过竖直余量的一半（否则会顶到页头）；
+    //   * 上提后顶端绝不高于版心上边界。
+    // 只是整体平移，不重排 —— 列切分仍然按真实可用的版心算，不会被挤出窗口。
+    if a.cfg.orient == Orient::Vertical && !ql.is_empty() {
+        let pad = a.cfg.pad_v();
+        let slack = (band.3 - band.1) - ql.extent.1;
+        let lift = ((band.1 - pad) / 2).min(slack / 2).max(0);
+        if lift > 0 {
+            layout::shift_by(&mut ql, 0, -lift);
         }
     }
-    layout_quote(&a.cfg, &a.fonts, a.frame.dc(), band, &text, attr_from)
+    ql
 }
 
 /// 排一次格言，走「缩字阶梯」。
@@ -837,6 +1108,133 @@ pub(crate) fn frame_layout(a: &App, cb: &ClockBox) -> QuoteLayout {
 ///
 /// 返回的定位表在**同一帧的三趟绘制里共用** —— 排版只算一次，这是本项目
 /// 最贵的教训（`band_l` 那段注释就是它的墓碑）。
+/// 跑马灯排版用的「版心」上界：跑马灯**不折行**，版心宽高都取一个远超
+/// 任何句子的值，排完再整体平移到原点（`layout::content_origin`）。
+const MARQUEE_BAND: i32 = 1 << 20;
+
+/// 跑马灯里的一句：要么是一张**定位表**（含公式，能画出分式 / 根号），
+/// 要么是原来那串 UTF-16（纯文字，走老路径）。
+struct MarqueeItem {
+    ql: Option<QuoteLayout>,
+    s: Vec<u16>,
+    /// 整句宽（含公式块）—— 下一句的起点靠它算
+    w: i32,
+    /// **汉字行高**（不是内容外框高）—— 竖直居中靠它算
+    h: i32,
+    /// 内容顶到汉字行顶的距离。含分式的句子，公式会向上伸出去，
+    /// 这段留白必须扣掉，否则汉字会被公式顶着往上跑。
+    pad_top: i32,
+}
+
+/// 把一句话备成跑马灯条目。
+///
+/// 纯文字**不进** `layout_rich`：那条路要按字号现量每个字，代价比
+/// `measure_text` 高一两个数量级，而它产出的定位表在「整串平移」这件事上
+/// 并不比 `TextOutW` 多任何信息。
+fn marquee_item(cfg: &Config, fonts: &Fonts, dc: HDC, text: &str) -> MarqueeItem {
+    if crate::quotes::has_math(text) {
+        let (segs, _) = crate::quotes::segments(text);
+        unsafe { SelectObject(dc, fonts.quote as HGDIOBJ) };
+        let (cw, ch) = gfx::measure_text(dc, &wide("国"));
+        let m = Metrics::new(cw.max(1), ch.max(1));
+        let mut gm = crate::tex::GdiMeasure::borrowed(dc, fonts);
+        let mut ql = layout::layout_rich(
+            &segs,
+            fonts.px_at(0),
+            m,
+            Orient::Horizontal,
+            (0, 0, MARQUEE_BAND, MARQUEE_BAND),
+            cfg.quote_spacing(),
+            &mut gm,
+        );
+        // 排版给的是「版心内」坐标（横版每行还会在版心里居中），滚动只要
+        // 「这一句自己从 0 开始」，所以把内容左上角平移到原点。
+        let (qx, qy) = layout::content_origin(&ql);
+        layout::shift_by(&mut ql, -qx, -qy);
+        // 居中基准取**汉字行**，不取内容外框。
+        //
+        // 分式是有深度的：`T = 2π√(L/g)` 的分母 `g` 落在基线下方一截，
+        // 外框因此比一行字高出一倍。拿外框居中，整句汉字就被顶到窗口上半，
+        // 屏幕上就是「有的句子上下不居中」—— 而纯文字句外框≈字行，看着正常，
+        // 于是同一屏里两种竖直位置来回跳。
+        // 取字行之后，所有句子的汉字都落在同一条水平线上，公式按自身基线
+        // 该伸多高就伸多高。
+        let (mut gt, mut gb) = (i32::MAX, i32::MIN);
+        for g in &ql.glyphs {
+            gt = gt.min(g.y);
+            gb = gb.max(g.y + m.char_h);
+        }
+        let (pad_top, hh) = if gt <= gb {
+            (gt, gb - gt)
+        } else {
+            // 整句都是公式、一个字都没有：退回去用外框居中也比贴顶强
+            (0, ql.extent.1)
+        };
+        let w = ql.extent.0;
+        return MarqueeItem {
+            ql: Some(ql),
+            s: Vec::new(),
+            w: w.max(1),
+            h: hh.max(1),
+            pad_top,
+        };
+    }
+    let s = wide(text);
+    unsafe { SelectObject(dc, fonts.quote as HGDIOBJ) };
+    let (tw, th) = gfx::measure_text(dc, &s);
+    MarqueeItem {
+        ql: None,
+        s,
+        w: tw.max(1),
+        h: th.max(1),
+        pad_top: 0,
+    }
+}
+
+/// 画跑马灯里的一句。`pos` 是这句的**左上角**在窗口里的位置（已含阴影位移
+/// `ox` / `oy`），竖直居中的算法在调用处 —— 那里才知道窗口高。
+fn draw_marquee_item(
+    dc: HDC,
+    cfg: &Config,
+    fonts: &Fonts,
+    it: &MarqueeItem,
+    pos: (i32, i32),
+    color: u32,
+    no_batch: Option<bool>,
+) {
+    let (x, dy) = pos;
+    match &it.ql {
+        Some(ql) => {
+            gfx::draw_glyphs(
+                dc,
+                fonts.quote,
+                fonts.quote_rot_at(0),
+                ql,
+                x,
+                dy,
+                color,
+                cfg.quote_spacing(),
+                None,
+                no_batch,
+            );
+            // 公式块与正文**同偏移、同颜色**：分式横线 / 根号上横线不是字符，
+            // 得单独画；跟着一起挪，否则阴影趟里字有影子、横线留在原地。
+            if !ql.math.is_empty() {
+                let mut gm = crate::tex::GdiMeasure::borrowed(dc, fonts);
+                for mb in &ql.math {
+                    crate::tex::draw(dc, &mb.mb, x + mb.x, dy + mb.y, color, &mut gm);
+                }
+            }
+        }
+        None => {
+            unsafe { SelectObject(dc, fonts.quote as HGDIOBJ) };
+            unsafe { SetTextCharacterExtra(dc, cfg.quote_spacing()) };
+            gfx::draw_text(dc, &it.s, x, dy, color);
+            unsafe { SetTextCharacterExtra(dc, 0) };
+        }
+    }
+}
+
 fn layout_quote(
     cfg: &Config,
     fonts: &Fonts,
@@ -850,6 +1248,14 @@ fn layout_quote(
     // 字形里，否则竖排会把一个 emoji / 生僻字拆成两个无效半字。
     let chars: Vec<char> = text.chars().collect();
     let spacing = cfg.quote_spacing();
+    // 竖版的横向摆法：C 栏头走古法「右起贴右缘」，A / B 按墨迹居中。
+    // 横版一律 `Right` —— 横版排版自己会在版心里逐行居中，与它无关；
+    // 给 `Center` 只是让语义含糊，不出错但也没道理。
+    let align = if cfg.orient == Orient::Vertical && cfg.v_style != VStyle::Head {
+        layout::Align::Center
+    } else {
+        layout::Align::Right
+    };
     // 度量时字距必须是 0：`SetTextCharacterExtra` 会被 `GetTextExtentExPointW`
     // 计入且严格线性，字距由排版层自己加，混进度量会得到「末字多算一份」。
     unsafe { SetTextCharacterExtra(dc, 0) };
@@ -863,6 +1269,41 @@ fn layout_quote(
         shrink: QUOTE_SHRINK_STEPS[0],
         ..Default::default()
     };
+
+    // ---- 含公式的句子走另一条排版路（`layout::layout_rich`）
+    //
+    // 分岔判据只有「正文里有没有 `$`」这一条：**不含公式的句子一个字节都
+    // 不走这里**，逐字逐位与旧实现相同。公式排版要按字号现量每个字
+    // （含上标、分式那几档），拿不到渲染层预先量好的 `adv` 数组，所以只能
+    // 分开走；但两条路的产物是同一个 `QuoteLayout`，下游（合批 / 阴影 /
+    // 分带 / 动效）不需要知道有两条。
+    if crate::quotes::has_math(text) {
+        let (segs, _unmatched) = crate::quotes::segments(text);
+        // 度量器**借用 `Fonts` 的字体缓存**：每帧新建一个，但字体不重建，
+        // GDI 句柄数才是平的（见 `gfx::Fonts::math_font` 的注释）。
+        let mut gm = crate::tex::GdiMeasure::borrowed(dc, fonts);
+        for (k, &pct) in QUOTE_SHRINK_STEPS.iter().enumerate().take(steps) {
+            unsafe { SelectObject(dc, fonts.quote_at(k) as HGDIOBJ) };
+            let (cw, ch) = gfx::measure_text(dc, &wide("国"));
+            let m = Metrics::new(cw.max(1), ch.max(1));
+            let mut ql = layout::layout_rich_ex(
+                &segs,
+                fonts.px_at(k),
+                m,
+                cfg.orient,
+                band,
+                spacing,
+                &mut gm,
+                align,
+            );
+            ql.shrink = pct;
+            if !ql.overflow {
+                return ql;
+            }
+            last = ql;
+        }
+        return last;
+    }
     for (k, &pct) in QUOTE_SHRINK_STEPS.iter().enumerate().take(steps) {
         let font = fonts.quote_at(k);
         unsafe { SelectObject(dc, font as HGDIOBJ) };
@@ -881,7 +1322,7 @@ fn layout_quote(
         }
         let (cw, ch) = gfx::measure_text(dc, &wide("国"));
         let m = Metrics::new(cw.max(1), ch.max(1));
-        let mut ql = layout::layout_with_attr(&chars, &adv, m, cfg.orient, band, spacing, attr_from);
+        let mut ql = layout::layout_ex(&chars, &adv, m, cfg.orient, band, spacing, attr_from, align);
         ql.shrink = pct;
         if !ql.overflow {
             return ql;
@@ -945,29 +1386,37 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
     let (w, h) = (cfg.w, cfg.h);
     let pad = cfg.pad();
 
-    // ---- 时钟（横版：左上角的时间块；竖版：落款里走主色通道的那一列）
+    // ---- 时钟（横版：左上角的时间块；竖版：顶部的横排时间）
+    //
+    // 竖版的时间**不再逐字竖排**：`15:40:36` 拆成八格会被读成八拍，
+    // 时钟是静帧锚点，必须一眼可读（2026-11-04 竖排改版）。
     if cfg.orient == Orient::Vertical {
-        for c in cb.sig.iter().filter(|c| c.main_color) {
-            if c.rot {
-                // 时间列整串旋转 90°（U4）：一列读作一条时间，而非逐字格子
-                unsafe { SelectObject(dc, rc.fonts.date_rot as HGDIOBJ) };
-                gfx::draw_text(
-                    dc,
-                    &c.s,
-                    c.x + ox,
-                    cb.y + oy,
-                    pass.paint_color(gfx::CH_CLOCK),
-                );
+        if let Some(s) = &cb.time {
+            let face = if cb.clock_face.is_null() {
+                rc.fonts.clock_small
             } else {
-                unsafe { SelectObject(dc, rc.fonts.date as HGDIOBJ) };
-                gfx::draw_vtext(
-                    dc,
-                    &c.s,
-                    c.x + ox,
-                    cb.y + oy,
-                    cb.sig_cell,
-                    pass.paint_color(gfx::CH_CLOCK),
-                );
+                cb.clock_face
+            };
+            unsafe { SelectObject(dc, face as HGDIOBJ) };
+            gfx::draw_text(
+                dc,
+                s,
+                cb.time_at.0 + ox,
+                cb.time_at.1 + oy,
+                pass.paint_color(gfx::CH_CLOCK),
+            );
+        }
+        // 界栏：一条 1px 的横线，把页头和正文分开（A / C 有，B 没有）。
+        // 与横版的竖分隔线同理 —— 它是版式装饰，不带阴影。
+        if let Some((ry, x0, x1)) = cb.rule {
+            if !shadow_pass {
+                let line = RECT {
+                    left: x0,
+                    top: ry,
+                    right: x1,
+                    bottom: ry + 1,
+                };
+                unsafe { FillRect(dc, &line, rc.rule_brush) };
             }
         }
     } else if cb.show {
@@ -1013,7 +1462,8 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
     if cfg.show_quote {
         // 版心**只从 `frame_band` 取**：这里以前自己内联了一遍同样的 match，
         // 与排版时用的那份是两处定义 —— 加第三种朝向必漏一处。
-        let (bl, bt, br, bb) = frame_band(cfg, cb);
+        // 这里只要左右边界：竖直方向跑马灯按整个窗口裁（见下方注释）。
+        let (bl, _, br, _) = frame_band(cfg, cb);
         // 版心退化 = 时钟/日期块已经把窗口吃光。平时**不能**把格言压在时钟上：
         // 两块都会变得不可读，观感比「格言没了」更差，所以只画一句提示。
         //
@@ -1025,23 +1475,36 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
         if hide_quote {
             // 有意什么都不画 —— 提示在下面统一画
         } else if matches!(rc.anim, Anim::Marquee) {
-            // 跑马灯：整串滚动，排版表用不上，仍走整串绘制
-            let s = wide(&rc.list[rc.qi].display());
-            let s2 = wide(&rc.list[rc.qn].display());
-            unsafe { SelectObject(dc, rc.fonts.quote as HGDIOBJ) };
-            unsafe { SetTextCharacterExtra(dc, cfg.quote_spacing()) };
-            let (tw, th) = gfx::measure_text(dc, &s);
+            // 跑马灯：整串滚动。
+            //
+            // **含公式的句子照样滚**。这里以前一律 `draw_text(display())` ——
+            // 画的是原文，公式会原样滚出一串 `$\frac{a}{b}$`。先前的补救是
+            // 「公式句不滚，降级成静态」，结果是满库公式时挂件一动不动。
+            // 现在按句分两条画法：
+            //   * 纯文字 —— 整串 `TextOutW`（老路径，一个字节没改）；
+            //   * 含公式 —— 排成定位表，按横向偏移画，宽取 `extent`。
+            //
+            // 定位表每帧重排一次（滚动偏移是绘制期的 `x`，不参与排版），
+            // 两句一起约 0.4ms，相对 40ms 的滚动帧不到 1%。
             let gap = cfg.marquee_gap();
-            let ty = (h - th) / 2 + oy;
+            let color = pass.paint_color(gfx::CH_QUOTE);
+            let it1 = marquee_item(cfg, rc.fonts, dc, &rc.list[rc.qi].display());
+            let it2 = marquee_item(cfg, rc.fonts, dc, &rc.list[rc.qn].display());
             let x1 = (br as f32 - rc.m).round() as i32;
-            let x2 = x1 + tw + gap;
-            // 裁剪区跟着做**同一个**竖直位移：阴影趟里字往下挪了 `oy`，
-            // 裁剪区也要往下挪 `oy`，这样「裁掉字的哪一块」两趟完全一致。
-            // 只挪 y 不挪 x 是沿旧实现的做法（`ox` 只有 2~3px，落在裁剪区内的
-            // 部分本就完整可见）。
-            gfx::with_clip(dc, bl, bt + oy, br, bb + oy, |dc| {
-                gfx::draw_text(dc, &s, x1 + ox, ty, pass.paint_color(gfx::CH_QUOTE));
-                gfx::draw_text(dc, &s2, x2 + ox, ty, pass.paint_color(gfx::CH_QUOTE));
+            let x2 = x1 + it1.w + gap;
+            // 裁剪区只裁**横向**（滚动要裁掉窗口外的部分），竖直方向给整个
+            // 窗口高。以前竖直用的是版心（`bt..bb`），公式句一进来就出问题：
+            // 含分式的句子比版心高，分母 / 根号下沿正好落在版心外，被整条切掉
+            // —— 屏幕上看到的是「字只剩上半截」，像被压扁。
+            // `oy` 仍要跟着走：阴影趟里内容整体下移，裁剪区同移，两趟裁掉
+            // 的才是同一块。
+            gfx::with_clip(dc, bl, 0, br, h, |dc| {
+                // 竖直：汉字行居中（`pad_top` 扣掉公式向上伸出的那截），
+                // 不含公式的句子 `pad_top` 是 0，与旧实现逐像素相同。
+                let y1 = (h - it1.h) / 2 - it1.pad_top + oy;
+                let y2 = (h - it2.h) / 2 - it2.pad_top + oy;
+                draw_marquee_item(dc, cfg, rc.fonts, &it1, (x1 + ox, y1), color, rc.no_batch);
+                draw_marquee_item(dc, cfg, rc.fonts, &it2, (x2 + ox, y2), color, rc.no_batch);
             });
             unsafe { SetTextCharacterExtra(dc, 0) };
         } else if !ql.is_empty() {
@@ -1083,6 +1546,24 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
             // 静态内容**不加裁剪区**（「PR3·竖版最右列完整可见」钉着这条：
             // 裁一刀会把竖版右列墨迹越出步进框的那 1~2px 切掉）。
             gfx::draw_glyphs(dc, font, rot, ql, ox + rc.slide, oy, color, spacing, groups, rc.no_batch);
+
+            // 公式块：整块交给 `tex`，**同一趟、同一个偏移、同一个颜色**。
+            //
+            // 位置（含居中 / 折行 / 旋转）在排版层就定死了，这里只加两趟
+            // 共用的位移 `(ox + slide, oy)` —— 阴影趟的 `oy` 就是那个
+            // 「往右下挪一点再画一遍」，公式必须跟着挪，否则文字有影子、
+            // 公式没有，像贴上去的。
+            if !ql.math.is_empty() {
+                let fonts: &gfx::Fonts = rc.fonts;
+                let mut gm = crate::tex::GdiMeasure::borrowed(dc, fonts);
+                for mb in &ql.math {
+                    if mb.rot {
+                        crate::tex::draw_rot(dc, &mb.mb, mb.x + ox + rc.slide, mb.y + oy, color, &mut gm);
+                    } else {
+                        crate::tex::draw(dc, &mb.mb, mb.x + ox + rc.slide, mb.y + oy, color, &mut gm);
+                    }
+                }
+            }
         }
 
         // 那句提示必须说出来 —— 让用户对着一片叠着的字自己猜，
@@ -1159,22 +1640,33 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
 /// 日期（横版）/ 落款（竖版）。它画在**日期通道**上，所以天生就与时钟、
 /// 格言分得开 —— 不再需要「单独一条掩码通道 + 关掉时显式清空」那套。
 fn paint_date(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass) {
-    if !cb.show {
+    if !cb.show && cb.sig.is_empty() {
         return;
     }
     let (ox, oy) = pass.offset(rc.cfg);
 
     if rc.cfg.orient == Orient::Vertical {
         unsafe { SelectObject(dc, rc.fonts.date as HGDIOBJ) };
-        for c in cb.sig.iter().filter(|c| !c.main_color) {
-            // 出处列（`is_author`）的阴影随格言的 k 压暗；日期列不缩放。
-            // 非阴影趟 / 非过渡期两者都是纯通道色（`author_gray == 0`）。
+        // 页头的日期：横排、日期色。它是静帧，换句不跟着淡。
+        if let Some(s) = &cb.date {
+            unsafe { SelectObject(dc, rc.fonts.date_v as HGDIOBJ) };
+            gfx::draw_text(
+                dc,
+                s,
+                cb.date_at.0 + ox,
+                cb.date_at.1 + oy,
+                pass.paint_color(gfx::CH_DATE),
+            );
+        }
+        // 署名（出处）：竖排一列，小字，换句过渡时**随格言一起淡**。
+        unsafe { SelectObject(dc, rc.fonts.date_v as HGDIOBJ) };
+        for c in cb.sig.iter() {
             let color = if pass.is_shadow() && c.is_author && rc.author_gray != 0 {
                 rc.author_gray
             } else {
                 pass.paint_color(gfx::CH_DATE)
             };
-            gfx::draw_vtext(dc, &c.s, c.x + ox, cb.y + oy, cb.sig_cell, color);
+            gfx::draw_vtext(dc, &c.s, c.x + ox, c.y + oy, cb.sig_cell, color);
         }
         return;
     }

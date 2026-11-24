@@ -31,6 +31,11 @@ impl Quote {
         }
     }
 
+    /// 正文里有公式段吗（决定走不走公式排版那一趟）
+    pub fn has_math(&self) -> bool {
+        has_math(&self.text)
+    }
+
     /// 展示形态：正文 —— 作者
     pub fn display(&self) -> String {
         if self.author.is_empty() {
@@ -39,6 +44,77 @@ impl Quote {
             format!("{}　——　{}", self.text, self.author)
         }
     }
+}
+
+/// 格言里的一段：普通文字，或一段**公式**。
+///
+/// # 为什么公式写在正文里、而不是单独一个字段
+///
+/// 格言是「一句话」，公式往往就嵌在句中（`质能关系 $E = mc^2$ 说明……`）。
+/// 分成「正文 + 公式」两个字段的话，顺序就丢了；写成两行又破坏读法。
+/// 所以用行内标记 `$...$`，跟 LaTeX 的用法一致，写库的人不用学新格式。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seg {
+    Text(String),
+    Math(String),
+}
+
+/// 把一段文字切成「文字 / 公式」的序列。
+///
+/// 返回 `(段列表, 有没有落单的 $)`。落单的 `$` 会**原样当文字**处理 ——
+/// 显示成一个美元符，总好过整句消失（这个项目的底线：宁可难看，不能不说）。
+///
+/// 转义用 `\$`（写一个美元符）。`$$` 这种空公式按**空公式**收下，
+/// 排版层给出宽度 0，不会崩。
+pub fn segments(text: &str) -> (Vec<Seg>, bool) {
+    let mut out: Vec<Seg> = Vec::new();
+    let mut buf = String::new();
+    let mut math: Option<String> = None;
+    let mut it = text.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' if it.peek() == Some(&'$') => {
+                it.next();
+                match math.as_mut() {
+                    Some(m) => m.push('$'),
+                    None => buf.push('$'),
+                }
+            }
+            '$' => match math.take() {
+                Some(m) => {
+                    if !buf.is_empty() {
+                        out.push(Seg::Text(std::mem::take(&mut buf)));
+                    }
+                    out.push(Seg::Math(m));
+                }
+                None => {
+                    if !buf.is_empty() {
+                        out.push(Seg::Text(std::mem::take(&mut buf)));
+                    }
+                    math = Some(String::new());
+                }
+            },
+            _ => match math.as_mut() {
+                Some(m) => m.push(c),
+                None => buf.push(c),
+            },
+        }
+    }
+    let unmatched = math.is_some();
+    if let Some(m) = math {
+        // 落单的开标记：把 `$` 和已吃进去的内容还回去当文字
+        buf.push('$');
+        buf.push_str(&m);
+    }
+    if !buf.is_empty() {
+        out.push(Seg::Text(buf));
+    }
+    (out, unmatched)
+}
+
+/// 这一段文字里有没有公式段（廉价判据：含 `$` 就走公式排版那一趟）。
+pub fn has_math(text: &str) -> bool {
+    text.contains('$')
 }
 
 /// 内置库文件名。发布时与 `desk-geyan.exe` **同目录**（发布包是平铺的）。
@@ -357,6 +433,36 @@ pub fn audit() -> i32 {
                 } else {
                     format!("（例如「{}」）", b_dup[0])
                 }
+            )
+        },
+    ));
+
+    // ---- 公式段：`$...$` 的配对
+    //
+    // 落单的 `$` 不会崩，也不会静默吞字（它原样当文字排出），但那**多半是
+    // 手误** —— 写库的人以为自己在写公式，屏幕上却多出一个美元符。
+    // 这种情况必须能在 `--quotes` 里一眼看到，而不是等看到挂件才发现。
+    let with_math = list.iter().filter(|q| q.has_math()).count();
+    let unmatched: Vec<&str> = list
+        .iter()
+        .filter(|q| segments(&q.text).1)
+        .map(|q| q.text.as_str())
+        .collect();
+    rows.push((
+        "公式段（$…$）",
+        unmatched.is_empty(),
+        if unmatched.is_empty() {
+            if with_math == 0 {
+                "0 条含公式".to_string()
+            } else {
+                format!("{} 条含公式 · 标记全部配对", with_math)
+            }
+        } else {
+            format!(
+                "{} 条含公式 · {} 条 `$` 落单（例如「{}」）",
+                with_math,
+                unmatched.len(),
+                unmatched[0]
             )
         },
     ));

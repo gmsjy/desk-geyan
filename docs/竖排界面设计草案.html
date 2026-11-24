@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>竖排界面 · 设计草案</title>
+<style>
+  :root {
+    --bg: #0e0f12;
+    --card: #16181d;
+    --line: #262a31;
+    --ink: #e9e3d6;
+    --dim: #9a948a;
+    --faint: #6f6a62;
+    --gold: #d6ab63;
+    --warn: #c9664f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.75 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 72px 32px 120px; }
+  h1, h2, h3, .serif { font-family: "Noto Serif SC", "Source Han Serif SC", "STSong", "SimSun", serif; }
+  h1 { font-size: 40px; font-weight: 600; letter-spacing: .06em; margin: 0 0 10px; }
+  h2 {
+    font-size: 22px; font-weight: 600; letter-spacing: .04em;
+    margin: 72px 0 6px; padding-top: 26px; border-top: 1px solid var(--line);
+  }
+  h2 .no { color: var(--gold); font-family: ui-monospace, monospace; font-size: 15px; margin-right: 12px; letter-spacing: 0; }
+  h3 { font-size: 17px; font-weight: 600; margin: 0 0 4px; letter-spacing: .04em; }
+  p { margin: 10px 0; color: #cfc9bd; }
+  .lead { color: var(--dim); font-size: 14px; margin-bottom: 34px; letter-spacing: .04em; }
+  .kicker { color: var(--gold); font-size: 12px; letter-spacing: .28em; text-transform: uppercase; margin-bottom: 18px; }
+  em { color: var(--ink); font-style: normal; border-bottom: 1px solid #4a4437; }
+  code, .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .88em; color: #d8cbb0; }
+  .muted { color: var(--faint); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 20px 22px; }
+  figure { margin: 0; }
+  figure img { display: block; width: 100%; border-radius: 8px; border: 1px solid var(--line); }
+  figcaption { color: var(--faint); font-size: 12px; margin-top: 10px; letter-spacing: .03em; }
+  ul, ol { margin: 10px 0; padding-left: 20px; }
+  li { margin: 7px 0; color: #cfc9bd; }
+  li b { color: var(--ink); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin: 18px 0 6px; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--faint); font-weight: 500; font-size: 12px; letter-spacing: .08em; }
+  td.num { font-family: ui-monospace, monospace; color: #d8cbb0; white-space: nowrap; }
+  .tag { display: inline-block; font-size: 11px; letter-spacing: .1em; padding: 2px 8px; border-radius: 999px; border: 1px solid #463c28; color: var(--gold); }
+  .tag.red { border-color: #4a2b24; color: var(--warn); }
+  .quote { border-left: 2px solid #3a3324; padding: 4px 0 4px 16px; color: #b8b1a4; margin: 16px 0; }
+  .pill { color: var(--faint); font-size: 12px; }
+  hr.soft { border: 0; border-top: 1px dashed var(--line); margin: 26px 0; }
+  .two { display: grid; grid-template-columns: 1.15fr .85fr; gap: 30px; align-items: start; }
+  .spec-svg { width: 100%; height: auto; }
+  .fit { display: flex; flex-direction: column; align-items: center; }
+  .fit img { width: auto; max-width: 100%; max-height: 600px; }
+  .fit figcaption { align-self: stretch; }
+  .foot { color: var(--faint); font-size: 12px; margin-top: 70px; border-top: 1px solid var(--line); padding-top: 18px; }
+  @media (max-width: 860px) {
+    .grid3, .grid2, .two { grid-template-columns: 1fr; }
+    h1 { font-size: 30px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="kicker">Desk 格言 · 竖排界面</div>
+  <h1>竖排界面 · 设计草案</h1>
+  <p class="lead">2026-11-04 ／ 只出草案，未改代码 ／ 样机按 1:1 像素生成</p>
+
+  <p>
+    竖排现在不好看，不是字体的问题，是<em>度量</em>的问题：列距只有字宽的 1.15 倍，等于列间没有白；
+    时间被按字拆成一列数字；落款三列小字并排，和正文一个密度。这三条决定了「很难获取信息」。
+  </p>
+  <p>
+    这份草案做三件事：给竖排一套<em>固定字格</em>、一条<em>界栏</em>、一个<em>整块居中的字块</em>，
+    再给出三个形态（条幅／极简／栏头）供你选一个方向。
+  </p>
+
+  <h2><span class="no">01</span>现状：三处度量把它拖垮了</h2>
+
+  <div class="two">
+    <figure>
+      <img src="mock/OLD_431x660.png" alt="现状复刻">
+      <figcaption>按现有实现的度量复刻（431×660，字号 200%）。参数取自代码，不是估计值。</figcaption>
+    </figure>
+    <div>
+      <ol>
+        <li><b>列距 = 1.15 字宽</b><br><span class="muted mono">layout.rs:218</span>　列间只剩 0.15 字，三列糊成一片，眼睛找不到下一列从哪起。</li>
+        <li><b>时间按字拆</b><br><span class="muted mono">render.rs:1126</span>　15:40 排成「1 5 : 4 0」，四个数字读成四拍，还要跨列拼。</li>
+        <li><b>落款三列并排</b><br><span class="muted mono">render.rs:604</span>　时间／出处／日期三列 0.8em 小字，占宽 45%，和正文同密度抢注意力。</li>
+        <li><b>正文贴右缘、顶部对齐</b><br><span class="muted mono">render.rs:795</span>　短句时左半边整片空白，长句时贴边——同一套代码两种难看的姿势。</li>
+        <li><b>满格硬切</b><br><span class="muted mono">layout.rs:497</span>　「九层之台」被劈成两列，一列一口气的节奏断了。</li>
+      </ol>
+    </div>
+  </div>
+
+  <h2><span class="no">02</span>四条原则</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <h3>一｜一屏一句，一眼一块</h3>
+      <p>字块是画面主体。它必须<em>成块</em>（列距均匀）、<em>居中</em>（两侧留白相等）、<em>有边界</em>（与落款分开）。现在它贴着右缘、上下顶格，看起来像被窗口裁剩下的。</p>
+    </div>
+    <div class="card">
+      <h3>二｜列距 &gt; 字距</h3>
+      <p>横排换行是往下跳，竖排换列是往左跳——横向跳更费眼。所以列间留白必须明显大于字间：字距 1.10em、列距 1.70em，比值 1.55。</p>
+    </div>
+    <div class="card">
+      <h3>三｜时间是一块表，不是一串字</h3>
+      <p>数字竖排要一个字一个字往下认；整块顺时针旋转 90° 之后，它仍然是一个「词」，歪一下头就一眼读完。旋转是竖排处理西文与数字的常规手段，不是取巧。</p>
+    </div>
+    <div class="card">
+      <h3>四｜落款属于「读完之后」</h3>
+      <p>竖排从右往左读，最左是末尾。所以落款只在左侧、只比正文弱：字号 0.58em／0.44em，颜色降一档，且与正文<em>同底收尾</em>。</p>
+    </div>
+  </div>
+
+  <h2><span class="no">03</span>字格：一套以 em 为单位的度量</h2>
+
+  <div class="two">
+    <div>
+      <table>
+        <tr><th>度量</th><th>现状</th><th>草案</th><th>为什么</th></tr>
+        <tr><td>列距 P</td><td class="num">1.15em</td><td class="num">1.70em</td><td>列间白 0.70 字，眼睛有落点</td></tr>
+        <tr><td>单元格</td><td class="num">1.24em</td><td class="num">1.10em</td><td>字距收紧，把空间让给列距</td></tr>
+        <tr><td>天头</td><td class="num">1.20em</td><td class="num">1.55em</td><td>上重下轻，是挂轴的观感</td></tr>
+        <tr><td>地脚</td><td class="num">1.20em</td><td class="num">1.15em</td><td>略小于天头</td></tr>
+        <tr><td>左右边距</td><td class="num">1.20em</td><td class="num">0.85em</td><td>竖排的呼吸在上下，不在左右</td></tr>
+        <tr><td>落款</td><td class="num">3 列 / 0.80em</td><td class="num">2 列 / 0.58·0.44em</td><td>并排三列必然糊，堆叠才分得清</td></tr>
+        <tr><td>时间</td><td class="num">逐字竖排</td><td class="num">整块旋转 90°</td><td>一个词，不是一个字串</td></tr>
+        <tr><td>界栏</td><td class="num">无</td><td class="num">1px / 16%</td><td>最省墨的分区手段</td></tr>
+        <tr><td>断列</td><td class="num">满格硬切</td><td class="num">一句一列 ±30%</td><td>一列一口气</td></tr>
+        <tr><td>列数</td><td class="num">能塞几列塞几列</td><td class="num">长宽比 ≈ 0.55</td><td>竖幅画心大致 1:1.8</td></tr>
+      </table>
+      <p class="pill">em = 正文字号。<span class="mono">1.70em</span> 这类值都按 em 给，换字号不用重算。</p>
+    </div>
+    <div>
+      <svg class="spec-svg" viewBox="0 0 320 400" xmlns="http://www.w3.org/2000/svg">
+        <rect x="1" y="1" width="318" height="398" fill="#12141a" stroke="#2a2f37"/>
+        <!-- 读向 -->
+        <path d="M300 20 L300 46" stroke="#d6ab63" stroke-width="1.1" fill="none"/>
+        <path d="M296 40 L300 48 L304 40" stroke="#d6ab63" stroke-width="1.1" fill="none"/>
+        <path d="M300 376 L40 376" stroke="#d6ab63" stroke-width="1.1" fill="none"/>
+        <path d="M48 372 L40 376 L48 380" stroke="#d6ab63" stroke-width="1.1" fill="none"/>
+        <text x="308" y="40" fill="#d6ab63" font-size="9" font-family="monospace">读</text>
+
+        <!-- 天头 / 地脚 -->
+        <line x1="24" y1="58" x2="292" y2="58" stroke="#d6ab63" stroke-opacity=".5" stroke-dasharray="4 4"/>
+        <line x1="24" y1="348" x2="292" y2="348" stroke="#d6ab63" stroke-opacity=".5" stroke-dasharray="4 4"/>
+        <text x="26" y="50" fill="#d6ab63" font-size="9" font-family="monospace">天头 1.55em</text>
+        <text x="26" y="364" fill="#d6ab63" font-size="9" font-family="monospace">地脚 1.15em</text>
+
+        <!-- 界栏 -->
+        <line x1="112" y1="70" x2="112" y2="336" stroke="#e9e3d6" stroke-opacity=".38"/>
+        <text x="107" y="86" fill="#9a948a" font-size="9" font-family="monospace" text-anchor="end">界栏</text>
+
+        <!-- 落款：时间块 + 出处 / 日期 -->
+        <rect x="26" y="238" width="26" height="74" fill="none" stroke="#4a4335" stroke-dasharray="2 3"/>
+        <rect x="60" y="238" width="26" height="74" fill="none" stroke="#4a4335" stroke-dasharray="2 3"/>
+        <rect x="26" y="322" width="26" height="26" fill="none" stroke="#4a4335" stroke-dasharray="2 3"/>
+        <text x="26" y="232" fill="#8b8578" font-size="8" font-family="monospace">时间</text>
+        <text x="60" y="232" fill="#8b8578" font-size="8" font-family="monospace">日期</text>
+        <text x="26" y="360" fill="#8b8578" font-size="8" font-family="monospace">出处</text>
+
+        <!-- 正文三列（右起） -->
+        <g stroke="#3a4048" fill="none">
+          <rect x="150" y="70" width="40" height="44"/><rect x="150" y="114" width="40" height="44"/>
+          <rect x="150" y="158" width="40" height="44"/><rect x="150" y="202" width="40" height="44"/>
+          <rect x="205" y="70" width="40" height="44"/><rect x="205" y="114" width="40" height="44"/>
+          <rect x="205" y="158" width="40" height="44"/><rect x="205" y="202" width="40" height="44"/>
+          <rect x="260" y="70" width="40" height="44"/><rect x="260" y="114" width="40" height="44"/>
+          <rect x="260" y="158" width="40" height="44"/>
+        </g>
+        <g fill="#e9e3d6" font-size="24" font-family="'Noto Serif SC',serif" text-anchor="middle">
+          <text x="170" y="102">千</text><text x="170" y="146">里</text><text x="170" y="190">之</text><text x="170" y="234">行</text>
+          <text x="225" y="102">足</text><text x="225" y="146">下</text>
+          <text x="280" y="102">合</text><text x="280" y="146">抱</text><text x="280" y="190">之</text>
+        </g>
+
+        <!-- 列距 -->
+        <line x1="190" y1="272" x2="205" y2="272" stroke="#c9664f"/>
+        <line x1="190" y1="267" x2="190" y2="277" stroke="#c9664f"/>
+        <line x1="205" y1="267" x2="205" y2="277" stroke="#c9664f"/>
+        <line x1="190" y1="246" x2="190" y2="288" stroke="#c9664f" stroke-opacity=".35" stroke-dasharray="2 2"/>
+        <line x1="205" y1="246" x2="205" y2="288" stroke="#c9664f" stroke-opacity=".35" stroke-dasharray="2 2"/>
+        <text x="212" y="276" fill="#c9664f" font-size="9" font-family="monospace">列距 1.70em</text>
+      </svg>
+      <figcaption>字格 1.10em｜列距 1.70em。读向自上而下、自右向左；落款在最后一个位置，与正文同底。</figcaption>
+    </div>
+  </div>
+
+  <h2><span class="no">04</span>三个形态（同一套字格）</h2>
+  <p class="lead">差别只在「时间放哪、落款多重」。三个都是 431×660、字号 200% 的同一句话。</p>
+
+  <div class="two" style="grid-template-columns: 1.02fr .98fr; gap: 34px; align-items: center;">
+    <figure>
+      <img src="mock/A_431x660.png" alt="方案 A 条幅">
+      <figcaption>A · 条幅　窗口 431×660 ／ 字号 200%</figcaption>
+    </figure>
+    <div>
+      <span class="tag">推荐</span>
+      <h3 style="margin:12px 0 6px">A · 条幅</h3>
+      <p>左：时间（旋转）+ 出处；再左：日期。中间一条界栏，右边正文。整块水平居中，正文竖直居中，落款与正文<em>同底收尾</em>。</p>
+      <p>三个形态里只有它把「正文 / 时间 / 署名」三级同时摆清楚：界栏给了分区的合法性，落款两列堆叠不再和正文比密度，时间旋转成块之后是一个整体。</p>
+      <p class="muted">适用：默认形态，任何句长都稳。<br>代价：落款固定占 2.5em 宽，窄窗时要让列。</p>
+    </div>
+  </div>
+
+  <hr class="soft">
+
+  <div class="grid2">
+    <div>
+      <figure>
+        <img src="mock/B_431x660.png" alt="方案 B 极简">
+        <figcaption>B · 极简　431×660 ／ 200%</figcaption>
+      </figure>
+      <h3 style="margin-top:16px">B · 极简</h3>
+      <p>无界栏、无日期。落款只剩一个 0.85em 的旋转时钟和一列出处，缩在正文最左列的下方（放不下才另起一列）。</p>
+      <p class="muted">适用：只想看字、桌面要干净。代价：时间弱一档，扫视性差。</p>
+    </div>
+    <div>
+      <figure>
+        <img src="mock/C_431x660.png" alt="方案 C 栏头">
+        <figcaption>C · 栏头　431×660 ／ 200%</figcaption>
+      </figure>
+      <h3 style="margin-top:16px">C · 栏头</h3>
+      <p>时间 1.05em 横排压在顶上，右侧带日期，一条细线分界，正文从线下开始竖排并居中，出处接在末列末尾。</p>
+      <p class="muted">适用：宽窗、或「时钟要显眼」。代价：横竖混排，最不古。</p>
+    </div>
+  </div>
+
+  <h2><span class="no">05</span>尺寸适配：窗口和字号要成比例</h2>
+
+  <div class="grid2">
+    <figure class="fit">
+      <img src="mock/A_600x1084.png" alt="600x1084">
+      <figcaption>600×1084，字号 300%（em=60）：3 列 10 字，字块占宽 44%，居中。</figcaption>
+    </figure>
+    <figure class="fit">
+      <img src="mock/A_300x660_long.png" alt="300x660">
+      <figcaption>300×660，字号 100%（em=20），长句：4 列，字块占宽 45%。</figcaption>
+    </figure>
+  </div>
+
+  <p>
+    竖排的字块大小由<em>字数</em>决定，窗口大小由<em>em</em>决定。两者不成比例时，短句一定有空——
+    设计能做的是让空<em>均分在两侧</em>，而不是全堆在左边。这条推论给出了一个硬建议：
+  </p>
+  <div class="quote">
+    竖窗宽度 ≈ 10 em（正文 3 列 + 落款 2.5 em）；窗高 ≥ 12 em。<br>
+    现在的默认 300×660 配 20px 字 = <b>15 em</b>，正文只占一半宽——这就是「空、散、像截图截歪了」的根源。
+    要么把默认窗宽收到 220，要么把默认字号提到 30。
+  </div>
+
+  <h2><span class="no">06</span>落地清单</h2>
+  <p class="lead">按你惯用的优先级排，P0 三条不改就等于没做。</p>
+
+  <table>
+    <tr><th>优先</th><th>位置</th><th>改什么</th></tr>
+    <tr>
+      <td><span class="tag red">P0</span></td>
+      <td class="num">layout.rs:199<br>layout.rs:218</td>
+      <td>竖版拆出独立度量：<span class="mono">col_pitch 1.15em → 1.70em</span>、<span class="mono">cell_h 1.05·char_h → 1.10em</span>。横版不动。</td>
+    </tr>
+    <tr>
+      <td><span class="tag red">P0</span></td>
+      <td class="num">render.rs:587</td>
+      <td><span class="mono">layout_sign</span> 从「三列并排」改成「两列堆叠」：时间块 + 出处同列，日期一列；整组与正文同底。</td>
+    </tr>
+    <tr>
+      <td><span class="tag red">P0</span></td>
+      <td class="num">render.rs:1126</td>
+      <td>竖版时钟从逐字 <span class="mono">draw_vtext</span> 改为整块旋转 90°：<span class="mono">SetGraphicsMode(GM_ADVANCED)</span> + <span class="mono">SetWorldTransform</span>。</td>
+    </tr>
+    <tr>
+      <td><span class="tag">P1</span></td>
+      <td class="num">render.rs:795</td>
+      <td><span class="mono">quote_band_v</span> 的版心 = 正文块本身（而不是「落款右侧的剩余区」），并让整块水平居中、竖直居中。</td>
+    </tr>
+    <tr>
+      <td><span class="tag">P1</span></td>
+      <td class="num">layout.rs:497</td>
+      <td>断列改成「一句一列」：列长在 cap 的 0.75–1.30 倍之间浮动，优先落在句读后；列数按字块长宽比 0.55 选。</td>
+    </tr>
+    <tr>
+      <td><span class="tag">P1</span></td>
+      <td class="num">render.rs:1164</td>
+      <td>分隔线从「仅横版」放开到竖版（竖向 1px，主色 16%），位置贴正文块左缘而不是固定 x。</td>
+    </tr>
+    <tr>
+      <td><span class="tag">P2</span></td>
+      <td class="num">config.rs:475<br>config.rs:491</td>
+      <td>边距拆成天头／地脚／左右四个值；<span class="mono">pad_v</span> 只在窄窗兜底。新增 <span class="mono">v_form</span>（条幅／极简／栏头）。</td>
+    </tr>
+  </table>
+
+  <h2><span class="no">07</span>要你定的三件事</h2>
+  <div class="grid3">
+    <div class="card"><h3>① 形态</h3><p>A 条幅（推荐）／B 极简／C 栏头。<br><span class="muted">也可以 A 做默认、C 做宽窗自动切换。</span></p></div>
+    <div class="card"><h3>② 时间位置</h3><p>左（旋转，随落款）／顶（横排，最易读）。<br><span class="muted">这是三套里唯一不可兼得的选择。</span></p></div>
+    <div class="card"><h3>③ 日期</h3><p>保留「十一月四日周三」／只留月日／不要。<br><span class="muted">落款每多一行，字块就多占一列宽度。</span></p></div>
+  </div>
+
+  <p style="margin-top:34px">
+    定完这三条我就按 P0 → P1 落代码，并用 <span class="mono">--dump</span> 出同尺寸对照图验收；
+    样机脚本在 <span class="mono">tools/vertical_mock.py</span>，改一个数字重跑就能看效果。
+  </p>
+
+  <div class="foot">
+    样机：Pillow 逐字摆格，字体「屏显臻宋」，与 GDI 同一套字面。图按 1:1 生成，页面按 70% 缩显。<br>
+    本文只到草案，<span class="mono">src/</span> 未改动。
+  </div>
+
+</div>
+</body>
+</html>

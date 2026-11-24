@@ -21,7 +21,7 @@ use super::*;
 use std::mem::{size_of, zeroed};
 use std::ptr::null;
 use windows_sys::Win32::Foundation::{POINT};
-use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MonitorFromPoint};
+use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MonitorFromPoint, DeleteObject, HGDIOBJ};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, INPUT, INPUT_KEYBOARD, SendInput};
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, GetWindowLongPtrW, IsWindowVisible, KillTimer};
@@ -32,7 +32,7 @@ use crate::{autostart, clipboard, favorites};
 // 这条和 `bench` 模块里那条是同一个函数 —— 测试夹具要发的消息就是它，
 // 没道理让 wndproc 里的调试计数另起一套。
 use crate::bench::{mouse_moves_at, press, pump, pump_wait, send_mouse, with_config_guard};
-use crate::config::{self, Anim, Config, Mode};
+use crate::config::{self, Anim, Config, Mode, Orient};
 use crate::config_ui;
 use crate::ffi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDPIAware, SetProcessDpiAwarenessContext};
 use crate::gfx;
@@ -624,16 +624,20 @@ fn probe_inner() -> i32 {
         // 窗口句柄非空、列表项数 > 0、关掉之后 is_open 变回 false。
         //
         // 再加一条：**读回真实 GDI 计数，开关两轮**。这个窗口为列表里每个字体名
-        // 建了一个字体句柄（本机 67 个）+ 界面字体 + 预览字体 + 两个色刷，
-        // `free_resources` 一旦漏掉一件，每开关一次就漏掉一件 —— 而 `--memtest`
-        // 根本不碰配置窗口，抓不到它。
+        // 建了一个字体句柄（本机 307 个）+ 界面字体 + 预览字体 + 三个色刷 +
+        // 两个窗口图标，`free_resources` 一旦漏掉一件，每开关一次就漏掉一件 ——
+        // 而 `--memtest` 根本不碰配置窗口，抓不到它。
         //
-        // 判据是「**第二轮 == 第一轮**」而不是「回到起点」：首轮实测 +5（22→27），
-        // 而第二、三轮恒定不动 —— 那 5 个是首次创建主题化控件时 uxtheme/comctl32
+        // 判据是「**第二轮 == 第一轮**」而不是「回到起点」：首轮实测 +9（31→40），
+        // 而第二、三轮恒定不动 —— 那 9 个是首次创建主题化控件时 uxtheme/comctl32
         // 按**进程**缓存的一次性系统对象，不是我们建的、也不随开关累积。
         // 和 `--memtest` 先跑 5 轮预热是同一个道理：一次性成本 ≠ 泄漏。
         // 建 / 毁都是**同步**完成的（`CreateWindowExW` / `DestroyWindow` 内联派发
         // WM_CREATE / WM_DESTROY），所以这里不需要 pump 也能量准。
+        //
+        // 这条断言真的抓到过东西：图标（`LoadImageW` 每次新建、`WM_SETICON` 设进去
+        // 窗口不负责释放）与刷子（交给 `WM_CTLCOLOR*` 后被选进控件 DC，窗口还活着时
+        // `DeleteObject` 一律失败）都曾让它每轮 +9。现在两者都推迟到窗口销毁之后回收。
         {
             let was = a.config.is_open();
             let gdi = |a: &App| -> u32 {
@@ -661,7 +665,7 @@ fn probe_inner() -> i32 {
                     R::Fail
                 },
                 format!(
-                    "建窗={} · 字体列表 {} 项 · 关闭后句柄已清={} · GDI {}→{}→{}（首轮一次性 +{}，第二轮 Δ{}）",
+                    "建窗={} · 字体列表 {} 项 · 关闭后句柄已清={} · GDI {}→{}→{}（首轮 +{}，二轮 Δ{}）",
                     opened,
                     n,
                     closed,
@@ -1232,8 +1236,41 @@ pub(crate) fn dump(path: &str, overrides: &[(String, String)]) -> i32 {
 
     match crate::png::write_png(path, w as u32, h as u32, &rgba) {
         Ok(()) => {
+            // 版式读数：竖排的页头 / 界栏 / 版心 / 正文块都是**看不见的几何**，
+            // 出图时顺带打出来，调形态时不用二开代码去猜。
+            let cb0 = render::layout_clock(&mut a);
+            let ql0 = render::frame_layout(&a, &cb0);
+            // 和 `build_frame` 走同一条路：署名位置是排完正文才定的，
+            // 只读 `layout_clock` 会拿到摆位之前的原位（读数就成了假信息）。
+            let cb = render::place_sign(&a.cfg, cb0, &ql0);
+            let ql = render::frame_layout(&a, &cb);
+            let band = render::frame_band(&a.cfg, &cb);
+            let head = if a.cfg.orient == config::Orient::Vertical {
+                let o = crate::layout::content_origin(&ql);
+                format!(
+                    "\n竖排·{} · 页头 y{}..{}（时间 {}@({},{}) 日期 {}@({},{})）· 界栏 {:?} · 版心 {:?} · 正文 ({},{}) 尺寸 {:?} {} 列 · 署名 {:?}",
+                    a.cfg.v_style.label(),
+                    cb.y,
+                    cb.y + cb.h,
+                    cb.time.is_some(),
+                    cb.time_at.0,
+                    cb.time_at.1,
+                    cb.date.is_some(),
+                    cb.date_at.0,
+                    cb.date_at.1,
+                    cb.rule,
+                    band,
+                    o.0,
+                    o.1,
+                    ql.extent,
+                    ql.lanes,
+                    cb.sig.first().map(|c| (c.x, c.y))
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "已写入 {}  ({}x{}，叠加于棋盘格之上)\n外观：{} {}% · 时钟{}% 格言{}% · 主色{} 日期{} 格言{} · 时间位置 +{}/+{}\n版式：{} · 字距 {} · 动效 {}",
+                "已写入 {}  ({}x{}，叠加于棋盘格之上)\n外观：{} {}% · 时钟{}% 格言{}% · 主色{} 日期{} 格言{} · 时间位置 +{}/+{}\n版式：{} · 字距 {} · 动效 {}{}",
                 path,
                 w,
                 h,
@@ -1249,6 +1286,7 @@ pub(crate) fn dump(path: &str, overrides: &[(String, String)]) -> i32 {
                 a.cfg.orient.label(),
                 a.cfg.letter_spacing,
                 a.cfg.eff_anim().label(),
+                head,
             );
             0
         }
@@ -1256,6 +1294,317 @@ pub(crate) fn dump(path: &str, overrides: &[(String, String)]) -> i32 {
             println!("FAIL  写文件失败: {}", e);
             3
         }
+    }
+}
+
+// ---------------------------------------------------------------- 公式样张
+
+/// `desk-geyan --math [out.png]`：把公式子集排成一张样张。
+///
+/// 这是公式层的**唯一**验证入口：不建窗口、不碰挂件状态，纯 GDI 画到 DIB
+/// 再存 PNG。排版对不对，看图和读数比读代码快 —— 尤其是「分子是不是压在
+/// 横线上」「上标有没有和底字撞在一起」这类只能看出来的问题。
+pub(crate) fn mathdemo(path: &str) -> i32 {
+    const W: i32 = 2100;
+    const H: i32 = 2000;
+    // COLORREF 是 0x00BBGGRR（GDI 接口用）；DIB 像素是 0x00RRGGBB（直接读内存）。
+    // 两种序混用是这里最容易写错的地方，所以分成两个常量、名字里带用途。
+    const FG_COLORREF: u32 = 0x00DC_E4E8;
+    const DIM_COLORREF: u32 = 0x0070_787C;
+    const BG_PIXEL: u32 = 0x0014_181C;
+
+    let Some(mut d) = gfx::Dib::new(W, H) else {
+        println!("FAIL  建 DIB 失败");
+        return 3;
+    };
+    d.clear(BG_PIXEL);
+
+    let face = wide("Microsoft YaHei");
+    let title_font = gfx::make_font(34, FW_NORMAL, &face);
+    let src_font = gfx::make_font(15, FW_NORMAL, &face);
+    let dc = d.dc;
+
+    gfx::draw_text(dc, &wide("公式排版样张 · 高中数理子集"), 60, 40, FG_COLORREF);
+    gfx::draw_text(
+        dc,
+        &wide("结构：上下标 · 分式 · 根号 · 求和上下限 · 希腊字母 · 矢量箭头 · 伸缩定界符 · 省略号"),
+        60,
+        88,
+        DIM_COLORREF,
+    );
+
+    // (源码, 字号)。字号不同是为了看「小字号下标糊不糊」。
+    let cases: [(&str, i32); 14] = [
+        ("E = mc^2", 56),
+        ("a^2 + b^2 = c^2", 56),
+        ("v = \\sqrt{2gh}", 48),
+        ("T = 2\\pi\\sqrt{\\frac{L}{g}}", 48),
+        ("F = G\\frac{m_1 m_2}{r^2}", 44),
+        ("E_k = \\frac{1}{2}mv^2", 44),
+        ("\\sin^2\\alpha + \\cos^2\\alpha = 1", 40),
+        ("x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}", 40),
+        ("\\vec{F} = m\\vec{a}", 44),
+        ("\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}", 40),
+        ("v_t = v_0 + at", 44),
+        ("\\rho = \\frac{m}{V},\\quad p = \\frac{F}{S}", 40),
+        // 伸缩定界符：括号要长到能抱住分式，而不是跟正文一样高
+        ("e = \\lim_{n \\to \\infty}\\left(1 + \\frac{1}{n}\\right)^n", 40),
+        // 省略号：中线三点（\cdots），不是句尾的「…」
+        ("1 + 2 + \\cdots + n = \\frac{n(n+1)}{2}", 40),
+    ];
+
+    let mut gm = crate::tex::GdiMeasure::new(dc, &face);
+    let mut top = 140;
+    let mut ok = 0;
+    println!("公式样张（宽 / 上高 / 下深 / 图元数）：");
+    for (src, px) in cases {
+        let node = match crate::tex::parse(src) {
+            Ok(n) => {
+                ok += 1;
+                n
+            }
+            Err(e) => {
+                // 解析失败也画出来（兜底成文字），否则样张里会「凭空少一行」
+                println!("  [WARN] {} 解析失败：{}", src, e);
+                crate::tex::parse_or_text(src)
+            }
+        };
+        let mb = crate::tex::layout_with_gdi(&node, px, &mut gm);
+        // 基线 = 方块顶 + ascent
+        let baseline = top + mb.ascent;
+        crate::tex::draw(dc, &mb, 90, baseline, FG_COLORREF, &mut gm);
+        gfx::draw_text(dc, &wide(src), 1300, baseline - 8, DIM_COLORREF);
+        println!(
+            "  {:<40} px={:<3} w={:<5} h={:<5} asc={:<4} desc={:<4} 图元={}",
+            src,
+            px,
+            mb.w,
+            mb.h(),
+            mb.ascent,
+            mb.descent,
+            mb.items.len()
+        );
+        top = baseline + mb.descent + 22;
+    }
+
+    // ---- 旋转对照：同一块公式按竖版的方式转 90° 画一遍
+    //
+    // 单独画、不叠任何别的东西 —— 竖版里「看着歪」到底是被邻居挤的、
+    // 还是 `draw_rot` 本身算错，只有把这块单独摊在空底上才分得清。
+    {
+        gfx::draw_text(dc, &wide("旋转 90°（竖版公式）"), 1000, 120, DIM_COLORREF);
+        let node = crate::tex::parse("E = mc^2").expect("解析应通过");
+        let mb = crate::tex::layout_with_gdi(&node, 60, &mut gm);
+        crate::tex::draw_rot(dc, &mb, 1000, 180, FG_COLORREF, &mut gm);
+        println!(
+            "  旋转块：盒子 {}x{} 上高 {} 下深 {} · 屏幕 x[{}..{}] y[{}..{}]",
+            mb.w,
+            mb.h(),
+            mb.ascent,
+            mb.descent,
+            1000,
+            1000 + mb.h(),
+            180,
+            180 + mb.w
+        );
+    }
+
+    unsafe {
+        DeleteObject(title_font as HGDIOBJ);
+        DeleteObject(src_font as HGDIOBJ);
+    }
+
+    // DIB（0x00RRGGBB）→ PNG（RGBA）
+    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+    for &p in d.pixels().iter() {
+        rgba.extend_from_slice(&[
+            ((p >> 16) & 0xFF) as u8,
+            ((p >> 8) & 0xFF) as u8,
+            (p & 0xFF) as u8,
+            255,
+        ]);
+    }
+    match crate::png::write_png(path, W as u32, H as u32, &rgba) {
+        Ok(()) => {
+            println!("\n已写入 {}（{}x{}）· 解析成功 {}/{}", path, W, H, ok, cases.len());
+            if ok == cases.len() {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            println!("FAIL  写文件失败: {}", e);
+            3
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 公式格言
+
+/// `desk-geyan --mathquote "<一句话>" [前缀]`：用**真实渲染管线**排一句带公式的
+/// 格言，横竖两种朝向各出一张 PNG。
+///
+/// # 为什么不能只验 `--math`
+///
+/// `--math` 验的是「公式盒子本身排得对不对」，它绕过了排版层、版心、阴影趟、
+/// 缩字阶梯。而公式接进挂件之后真正会出问题的是**接线**：
+/// 折行时公式有没有被劈开、竖版旋转有没有转反、阴影趟有没有跟着挪、
+/// 公式块的基线跟同行文字对不对齐 —— 这些只有走一遍 `build_frame` 才看得见。
+///
+/// 参数是**一句真的格言**，不是公式源码：`$...$` 之外的文字走普通文字排版。
+pub(crate) fn mathquote(text: &str, prefix: &str) -> i32 {
+    let mut bad = 0;
+    let (segs, unmatched) = quotes::segments(text);
+    if unmatched {
+        println!("WARN  有落单的 `$`（会原样当文字排出）");
+        bad += 1;
+    }
+    if segs.iter().all(|s| !matches!(s, quotes::Seg::Math(_))) {
+        println!("WARN  这句话里没有公式段（`$...$`），跑的是普通文字路径");
+        bad += 1;
+    }
+
+    for (tag, orient) in [("h", Orient::Horizontal), ("v", Orient::Vertical)] {
+        let Some(mut a) = App::new() else {
+            println!("FAIL  初始化失败");
+            return 3;
+        };
+        a.cfg.orient = orient;
+        a.cfg.show_quote = true;
+        // 跑马灯画的是 `display()` 原文（公式会露出 `$...$` 源码），
+        // 验排版必须落到静态路 —— 否则验的是「另一种动效」，不是公式接线。
+        a.cfg.anim = Anim::Static;
+        a.list = vec![quotes::Quote {
+            text: text.to_string(),
+            author: String::new(),
+        }];
+        a.qi = 0;
+        a.qn = 0;
+        a.rebuild_fonts();
+        a.trans.settle();
+        a.phase = 0.0;
+
+        // 先只排版、拿读数（`build_frame` 内部还会再排一次，两条路同一个函数）
+        let cb = layout_clock(&mut a);
+        let ql = super::render::frame_layout(&a, &cb);
+        println!(
+            "  [{}] {} · 字形 {} · 公式块 {} · 档 {}% · 占 {}x{} · 截断 {}",
+            tag,
+            orient.label(),
+            ql.glyphs.len(),
+            ql.math.len(),
+            ql.shrink,
+            ql.extent.0,
+            ql.extent.1,
+            ql.overflow
+        );
+        if std::env::var("MQ_DEBUG").is_ok() {
+            for (i, g) in ql.glyphs.iter().enumerate() {
+                print!("{}@{},{} ", g.ch, g.x, g.y);
+                if i % 8 == 7 {
+                    println!();
+                }
+            }
+            println!();
+        }
+        for (i, mb) in ql.math.iter().enumerate() {
+            println!(
+                "      公式#{} 位置({},{}) 旋转={} 盒子 {}x{} 上高 {} 下深 {} 图元 {}",
+                i,
+                mb.x,
+                mb.y,
+                mb.rot,
+                mb.mb.w,
+                mb.mb.h(),
+                mb.mb.ascent,
+                mb.mb.descent,
+                mb.mb.items.len()
+            );
+            if std::env::var("MQ_DEBUG").is_ok() {
+                for it in &mb.mb.items {
+                    match it {
+                        crate::tex::Item::Glyph { ch, dx, dy, px } => println!(
+                            "        '{}' dx={} dy={} px={} → 屏幕({},{})",
+                            ch,
+                            dx,
+                            dy,
+                            px,
+                            mb.x + mb.mb.descent - dy,
+                            mb.y + dx
+                        ),
+                        crate::tex::Item::Rule { dx0, dx1, dy, thick } => println!(
+                            "        rule dx[{}..{}] dy={} t={}",
+                            dx0, dx1, dy, thick
+                        ),
+                        crate::tex::Item::Arrow { dx0, dx1, dy, thick } => println!(
+                            "        arrow dx[{}..{}] dy={} t={}",
+                            dx0, dx1, dy, thick
+                        ),
+                        crate::tex::Item::Dots {
+                            dx,
+                            dy,
+                            gap,
+                            size,
+                        } => println!(
+                            "        dots dx={} dy={} gap={} size={}",
+                            dx, dy, gap, size
+                        ),
+                    }
+                }
+            }
+        }
+
+        // 排版的**单帧成本**：公式那一趟要现量每个字（含上标 / 分式那几档），
+        // 比纯文字贵，得知道贵多少 —— 红线是 1200µs/帧。
+        {
+            let n = 200;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let cb = super::render::layout_clock(&mut a);
+                let _ = super::render::frame_layout(&a, &cb);
+            }
+            let us = t0.elapsed().as_micros() as f64 / n as f64;
+            println!("      排版耗时 {:.0} µs/帧（含公式）", us);
+        }
+
+        let o = a.text_alpha();
+        build_frame(&mut a, o);
+
+        let (w, h) = (a.frame.w, a.frame.h);
+        let px = a.frame.out_pixels();
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        let mut ink = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let p = px[(y * w + x) as usize];
+                let al = (p >> 24) & 0xFF;
+                if al > 8 {
+                    ink += 1;
+                }
+                let (r, g, b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                let bg = if ((x / 16) + (y / 16)) % 2 == 0 { 0xF2u32 } else { 0x9Eu32 };
+                let mix = |c: u32| -> u8 { (c + bg * (255 - al) / 255).min(255) as u8 };
+                rgba.extend_from_slice(&[mix(r), mix(g), mix(b), 255]);
+            }
+        }
+        let path = format!("{}-{}.png", prefix, tag);
+        match crate::png::write_png(&path, w as u32, h as u32, &rgba) {
+            Ok(()) => println!("  已写入 {}（{}x{}，非透明像素 {}）", path, w, h, ink),
+            Err(e) => {
+                println!("FAIL  写文件失败: {}", e);
+                return 3;
+            }
+        }
+        if ink == 0 {
+            println!("FAIL  [{}] 一个像素都没画出来", tag);
+            bad += 1;
+        }
+    }
+    if bad == 0 {
+        0
+    } else {
+        1
     }
 }
 
@@ -2519,4 +2868,136 @@ pub(crate) fn cfgshot(dir: &str) -> i32 {
         println!("面板两页已导出（用真实 config.ini，未改动任何设置）");
     }
     fail
+}
+
+// ---------------------------------------------------------------- 图标
+
+/// `--icontest`：验「PE 资源里的图标能被取出来，且确实是设计稿那版」。
+///
+/// 为什么值得单开一条入口：图标是**构建期**产物（`build.rs` 手写 `.res`，
+/// 见那边的注释），写错了编译期不一定报错，运行期也只是悄悄退回系统默认图标。
+/// 静默降级最难查，所以留一条会红的检查。
+///
+/// 判据三条：
+///   1. `LoadImage` 取到的 HICON 非空；
+///   2. 实际位图尺寸 == 请求尺寸（说明命中了 ICO 里的对应档，而不是拿 32px 缩放）；
+///   3. 不透明像素占比落在 25%..85%，且平均色不是中性灰
+///      —— 系统默认应用图标是灰蓝色块，占比与色相都对不上。
+pub(crate) fn icontest() -> i32 {
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, DIB_RGB_COLORS,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
+
+    let mut ok = true;
+    println!("图标资源自检");
+    for &want in &[16i32, 24, 32, 48] {
+        let hicon = crate::icon::app_icon(want, want);
+        if hicon.is_null() {
+            println!("  [FAIL] {want:2}px  取不到 HICON");
+            ok = false;
+            continue;
+        }
+
+        let mut ii: ICONINFO = unsafe { zeroed() };
+        if unsafe { GetIconInfo(hicon, &mut ii) } == 0 {
+            println!("  [FAIL] {want:2}px  GetIconInfo 失败");
+            ok = false;
+            continue;
+        }
+
+        let mut bm: BITMAP = unsafe { zeroed() };
+        let got = unsafe {
+            GetObjectW(
+                ii.hbmColor,
+                size_of::<BITMAP>() as i32,
+                &mut bm as *mut BITMAP as *mut c_void,
+            )
+        };
+        if got == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+            println!("  [FAIL] {want:2}px  取不到位图");
+            ok = false;
+            unsafe {
+                windows_sys::Win32::Graphics::Gdi::DeleteObject(ii.hbmColor as _);
+                windows_sys::Win32::Graphics::Gdi::DeleteObject(ii.hbmMask as _);
+            }
+            continue;
+        }
+
+        let (bw, bh) = (bm.bmWidth, bm.bmHeight);
+        let mut bi: BITMAPINFO = unsafe { zeroed() };
+        bi.bmiHeader.biSize = size_of::<windows_sys::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+        bi.bmiHeader.biWidth = bw;
+        bi.bmiHeader.biHeight = -bh; // 负高度 ⇒ 自上而下，省一次翻转
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = 0; // BI_RGB
+
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
+        let dc = unsafe { GetDC(null_mut()) };
+        let lines = unsafe {
+            GetDIBits(
+                dc,
+                ii.hbmColor,
+                0,
+                bh as u32,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut bi,
+                DIB_RGB_COLORS,
+            )
+        };
+        unsafe {
+            ReleaseDC(null_mut(), dc);
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(ii.hbmColor as _);
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(ii.hbmMask as _);
+        }
+
+        // 像素是 BGRA
+        let n = (bw * bh) as f32;
+        let mut opaque = 0f32;
+        let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
+        for px in buf.chunks(4) {
+            if px[3] > 8 {
+                opaque += 1.0;
+                sb += px[0] as u64;
+                sg += px[1] as u64;
+                sr += px[2] as u64;
+            }
+        }
+        let ratio = opaque / n;
+        let cnt = opaque.max(1.0) as u64;
+        let (ar, ag, ab) = ((sr / cnt) as u8, (sg / cnt) as u8, (sb / cnt) as u8);
+        let neutral = ar.abs_diff(ag) < 6 && ag.abs_diff(ab) < 6;
+
+        let size_ok = bw == want && bh == want;
+        let ink_ok = (0.25..=0.85).contains(&ratio);
+        let color_ok = !neutral;
+        if !(size_ok && ink_ok && color_ok && lines == bh) {
+            ok = false;
+            println!(
+                "  [FAIL] {want:2}px  实际 {bw}x{bh} 不透明 {:.0}% 平均 #{ar:02X}{ag:02X}{ab:02X}{}",
+                ratio * 100.0,
+                if neutral { "（中性灰＝疑似系统默认图标）" } else { "" }
+            );
+        } else {
+            println!(
+                "  [PASS] {want:2}px  {bw}x{bh} 不透明 {:.0}% 平均 #{ar:02X}{ag:02X}{ab:02X}",
+                ratio * 100.0
+            );
+        }
+    }
+
+    println!(
+        "\n{}",
+        if ok {
+            "图标资源全部符合预期"
+        } else {
+            "存在失败项"
+        }
+    );
+    if ok {
+        0
+    } else {
+        3
+    }
 }

@@ -52,6 +52,8 @@
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, SIZE};
@@ -78,6 +80,18 @@ pub struct Fonts {
     pub face: Vec<u16>,
     pub clock: HFONT,
     pub clock_small: HFONT,
+    /// **竖版页头**的时间字体：按正文字号的 1.25 倍建，而不是横版那支 46px。
+    ///
+    /// 竖窗天生窄：横版那支在 431 宽的条幅上会让时间吃掉 83% 的宽度，
+    /// 整块挂件的主角就成了表 —— 而竖排里主角永远是字。时钟字号倍率照样乘进去，
+    /// 想放大的人调「时钟字号」即可（那是用户意图，不该被这里压住）。
+    pub clock_v: HFONT,
+    /// **竖版页头**的日期字体：正文字号的 0.55 倍。
+    ///
+    /// 横版那支 `date` 是 16px 绝对值（随 scale），在竖排里正好是 0.8em ——
+    /// 跟正文差不多大，压在页头会抢戏。页头是**背景信息**：时间一眼可读、
+    /// 日期退到第二档，这是草案里就定下的层级。
+    pub date_v: HFONT,
     pub date: HFONT,
     /// 竖版落款时间列：整串旋转 90°（审查 U4）。逐字竖排把「14:44:45」
     /// 拆成 8 个格子没法瞟读；旋转后一列读作一条时间。
@@ -105,6 +119,23 @@ pub struct Fonts {
     /// （每组各自提交），错的只是**大小**，所以只在竖版 + 长句 + 缩字时可见，
     /// 平时根本碰不到。
     pub quote_rot: [HFONT; 3],
+    /// 三档正文的**实际字号**（px），与 `quote_at(k)` 一一对应。
+    ///
+    /// 公式排版要的就是这个数：公式的字号必须跟正文同档，否则「正文缩到 85%、
+    /// 公式还是 100%」会立刻看出来。`font_height()` 给的是 `tmHeight`
+    /// （含字体自己的行距，常比标称值大 1~2px），拿它排公式会系统性偏大。
+    pub quote_px: [i32; 3],
+    /// 公式字体缓存（字号 → 字体），**按需建、随 `Fonts` 存活**。
+    ///
+    /// 为什么不放在 `tex::GdiMeasure` 里：那个对象是每帧新建的（它要绑当前
+    /// DC），字体若挂在它身上，每帧就会重建一遍 —— `--memtest` 的 GDI 句柄
+    /// 计数会随帧数抖，看着像泄漏。放这里就是「一次建、全局用」。
+    ///
+    /// 公式的字号不像正文那样只有三档（上标 0.62、分式 0.82、根号按内容
+    /// 反算），所以用散列表而不是定长数组。
+    math: RefCell<HashMap<i32, HFONT>>,
+    /// 同一批字号的**顺时针 90°** 版本（竖版整块旋转用，见 `tex::draw_rot`）。
+    math_rot: RefCell<HashMap<i32, HFONT>>,
 }
 
 /// 缩字回退的候选档（百分比）。老板定的下限是 70%。
@@ -118,6 +149,16 @@ impl Fonts {
         Fonts {
             clock: make_font(s(46, clock_ratio), FW_SEMIBOLD, &f),
             clock_small: make_font(s(34, clock_ratio), FW_SEMIBOLD, &f),
+            clock_v: make_font(
+                ((quote_px * 125 / 100) * clock_ratio / 100).max(6),
+                FW_SEMIBOLD,
+                &f,
+            ),
+            date_v: make_font(
+                ((quote_px * 55 / 100) * clock_ratio / 100).max(9),
+                FW_NORMAL,
+                &f,
+            ),
             date: make_font(s(16, clock_ratio), FW_NORMAL, &f),
             date_rot: make_font_ex(s(16, clock_ratio), FW_NORMAL, &f, 900),
             quote: make_font(quote_px, FW_NORMAL, &f),
@@ -143,6 +184,13 @@ impl Fonts {
                     900,
                 ),
             ],
+            quote_px: [
+                quote_px,
+                (quote_px * QUOTE_SHRINK_STEPS[1] / 100).max(6),
+                (quote_px * QUOTE_SHRINK_STEPS[2] / 100).max(6),
+            ],
+            math: RefCell::new(HashMap::new()),
+            math_rot: RefCell::new(HashMap::new()),
             face: f,
         }
     }
@@ -165,6 +213,36 @@ impl Fonts {
         self.quote_rot[k.min(self.quote_rot.len() - 1)]
     }
 
+    /// 取缩字档对应的**标称字号**（px），给公式排版用。
+    pub fn px_at(&self, k: usize) -> i32 {
+        self.quote_px[k.min(self.quote_px.len() - 1)]
+    }
+
+    /// 公式用的某一号字体（没有就建，建了就一直留着）。
+    pub fn math_font(&self, px: i32) -> HFONT {
+        let px = px.max(7);
+        if let Some(&f) = self.math.borrow().get(&px) {
+            return f;
+        }
+        let f = make_font(px, FW_NORMAL, &self.face);
+        self.math.borrow_mut().insert(px, f);
+        f
+    }
+
+    /// 同一号字的**顺时针 90°** 版本（竖版公式整块旋转）。
+    ///
+    /// `2700` 不是随手写的：实测 `lfEscapement = 900` 是**向上**推进、
+    /// `2700` 才是向下（竖排要的「从上往下读」）。见 `tex::draw_rot`。
+    pub fn math_font_rot(&self, px: i32) -> HFONT {
+        let px = px.max(7);
+        if let Some(&f) = self.math_rot.borrow().get(&px) {
+            return f;
+        }
+        let f = make_font_ex(px, FW_NORMAL, &self.face, 2700);
+        self.math_rot.borrow_mut().insert(px, f);
+        f
+    }
+
     pub fn destroy(&self) {
         unsafe {
             // ⚠️ 新增句柄必须加进这个数组。漏了的话 memtest 的 GDI 计数会涨，
@@ -182,8 +260,22 @@ impl Fonts {
                 self.quote_rot[0],
                 self.quote_rot[1],
                 self.quote_rot[2],
+                // 竖版专用（页头横排的时间 / 日期）。2026-11-04 加了这两支，
+                // 忘了写进这张表 —— `--probe` 的「开关两轮不涨句柄」当场抓到
+                // 第二轮 Δ9：每开关一次就漏 2 个 HFONT。
+                self.clock_v,
+                self.date_v,
             ];
-            for h in all {
+            // 公式字体是**按需建**的散列表，必须单独清 —— 漏了它，
+            // `--memtest` 会看到 GDI 句柄数比开窗时多出几个，看着像泄漏。
+            let math: Vec<HFONT> = self
+                .math
+                .borrow_mut()
+                .drain()
+                .chain(self.math_rot.borrow_mut().drain())
+                .map(|(_, f)| f)
+                .collect();
+            for h in all.into_iter().chain(math) {
                 if !h.is_null() {
                     DeleteObject(h as HGDIOBJ);
                 }
@@ -201,6 +293,20 @@ impl Fonts {
 impl Drop for Fonts {
     fn drop(&mut self) {
         self.destroy();
+    }
+}
+
+/// 公式排版直接吃这套字体缓存：`tex::GdiMeasure::borrowed(dc, fonts)`。
+///
+/// 实现放在 `gfx` 而不是 `tex`，是因为 trait 归 `tex`、类型归 `gfx` ——
+/// 这样 `tex` 不必知道「窗口里的字体集合」长什么样，反过来 `gfx` 也不必
+/// 知道公式怎么排版。两边各留一个窄接口。
+impl crate::tex::FontAt for Fonts {
+    fn font(&self, px: i32) -> HFONT {
+        self.math_font(px)
+    }
+    fn font_rot(&self, px: i32) -> HFONT {
+        self.math_font_rot(px)
     }
 }
 

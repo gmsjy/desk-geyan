@@ -561,6 +561,7 @@ pub mod media {
         }
 
         /// 完整信息（歌名 - 艺人），给诊断入口与将来的展开态用。
+        #[allow(dead_code)] // 暂时只有单测在调；展开态接上后去掉这条
         pub fn detailed(&self) -> String {
             match (self.title.is_empty(), self.artist.is_empty()) {
                 (false, false) => format!("{} - {}", self.title, self.artist),

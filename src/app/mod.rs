@@ -39,8 +39,8 @@ pub(crate) use window::*;
 // 实现散在各个子模块里，在此集中再导出，免得调用方要知道内部怎么分。
 pub(crate) use input::on_menu;
 pub(crate) use verify::{
-    cfgshot, clicktest, dragbench, dragtest, dump, dump_island, favtest, islandtest, memtest, perf,
-    probe, selftest,
+    cfgshot, clicktest, dragbench, dragtest, dump, dump_island, favtest, icontest, islandtest,
+    mathdemo, mathquote, memtest, perf, probe, selftest,
 };
 
 use std::cell::Cell;
@@ -344,6 +344,16 @@ pub(crate) const MI_ISLAND_DOT_COLOR: u32 = 124;
 /// 撞名会让按钮静默跑到缩放逻辑上去。
 pub(crate) const MI_DESK_FIT: u32 = 125;
 
+/// 竖版形态单选命令：87 / 88 / 89 = A 条幅 / B 极简 / C 栏头
+///
+/// 只影响竖版。横版下点了也存下来（下次切回竖版就是它），不弹提示 ——
+/// 三个形态共用一块画布，没有「无效操作」这回事。
+///
+/// ⚠️ 87–98 是 `MI_QUIT = 99` 与灵动岛段（83–86、104 起）之间的**唯一空档**。
+/// 原来排在 84，与 `MI_ISLAND_UNREAD` 撞了 —— 那种重复编译期不报错，
+/// 症状是「点竖排极简把未读计数关了」，只有 `--selftest` 的命令码去重能抓到。
+pub(crate) const MI_VSTYLE_BASE: u32 = 87;
+
 /// 时间日期块拖动命中的最小判定范围（避免块很小时抓不住）
 pub(crate) const CLOCK_MIN_GRAB: i32 = 28;
 
@@ -488,7 +498,12 @@ pub(crate) struct App {
     /// 而这种 bug 在测试里极难复现。
     font_epoch: u64,
     frame: Frame,
+    /// 横版的竖分隔线用的画刷（很淡，0x50 档）
     brush: HBRUSH,
+    /// 竖版页头下方那条**界栏**用的画刷。比 `brush` 亮一档：界栏是 A/C 两种
+    /// 形态唯一的分块手段，淡到看不见就等于没画（实测 0x50 档只把底色推动
+    /// 3/255，屏幕上根本认不出有一条线）。
+    rule_brush: HBRUSH,
 
     glass: Glass,
     accent_ok: bool,
@@ -676,6 +691,7 @@ impl App {
         // 旧值 0x505050 是三通道同强度，在只读 byte0 的旧实现里恰好等于 0x50；
         // 换到「通道即语义」的新布局就必须只说一个通道，否则会被判成三色叠加。
         let brush = unsafe { CreateSolidBrush(gfx::ch_dim(0x50)) };
+        let rule_brush = unsafe { CreateSolidBrush(gfx::ch_dim(0xA8)) };
         let list = quotes::library_for(&data_dir(), cfg.fav_only);
         if list.is_empty() {
             return None;
@@ -699,6 +715,7 @@ impl App {
             font_epoch: 1,
             frame,
             brush,
+            rule_brush,
             glass: Glass::Acrylic,
             accent_ok: false,
             tray_ok: false,
@@ -1147,14 +1164,18 @@ mod command_id_tests {
             MI_ISLAND_BODY_COLOR, MI_ISLAND_ACCENT_COLOR, MI_ISLAND_W_DOWN,
             MI_ISLAND_W_UP, MI_ISLAND_H_DOWN, MI_ISLAND_H_UP, MI_ISLAND_KEEP,
             MI_ISLAND_PEEK_DOWN, MI_ISLAND_PEEK_UP, MI_ISLAND_DOT_COLOR, MI_DESK_FIT,
+            MI_VSTYLE_BASE,
         ];
         // 连续段展开（基址已在 named 里，这里只补段内其余成员）：
-        // 动效 4 档、岛条目 7 项。版式 2 档（70/71）已全命名，无需展开。
+        // 动效 4 档、岛条目 7 项、竖排形态 3 档。版式 2 档（70/71）已全命名，无需展开。
         for k in 1..4 {
             ids.push(MI_ANIM_BASE + k);
         }
         for k in 1..7 {
             ids.push(MI_ISLAND_ITEM_BASE + k);
+        }
+        for k in 1..3 {
+            ids.push(MI_VSTYLE_BASE + k);
         }
         ids.sort_unstable();
         for w in ids.windows(2) {
