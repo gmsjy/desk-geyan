@@ -24,7 +24,13 @@ use windows_sys::Win32::Foundation::{POINT};
 use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MonitorFromPoint, DeleteObject, HGDIOBJ};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, INPUT, INPUT_KEYBOARD, SendInput};
-use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, GetWindowLongPtrW, IsWindowVisible, KillTimer};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyWindow, GA_ROOT, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
+    KillTimer, SetWindowPos, WindowFromPoint,
+};
+/// `HWND_BOTTOM`（1）：`SetWindowPos` 的「放到 Z 序最底」句柄值。
+/// `consts` 里只收了 TOPMOST / NOTOPMOST 两个，这个只在自检里制造「被盖住」现场用。
+const HWND_BOTTOM: isize = 1;
 use crate::{autostart, clipboard, favorites};
 // 抽干消息队列。`--dragtest` 发的鼠标消息必须真的被派发到 wndproc，
 // 而不是停在队列里当作「测试通过」。
@@ -674,6 +680,70 @@ fn probe_inner() -> i32 {
                     g2,
                     g1.saturating_sub(g0),
                     g2 as i64 - g1 as i64
+                ),
+            ));
+        }
+
+        // ---- 已开着时再唤出：必须**复用**同一个窗口，并且真的被提到最前
+        //
+        // 用户报过的症状：「设置面板明明开着，按 Ctrl+Alt+O 就是叫不出来」。
+        // 根因不是窗口没建 —— 是这条 already-open 分支只调了 `SetForegroundWindow`，
+        // 而进程不是前台进程时它会被系统**静默拒绝**（没有返回值、没有异常），
+        // 面板留在别的窗口下面。用户的体感是「坏了」，面板其实好好开着。
+        //
+        // 判据取「面板中心点上最上层的那个窗口是不是它」—— 这正是用户
+        // 「看不看得见」的直接口径，比读样式位或前台标志都贴近现实。
+        {
+            config_ui::open(a);
+            let h1 = a.config.hwnd_handle();
+            // 面板此刻已经开着，再唤一次（走 already-open 分支）
+            config_ui::open(a);
+            let h2 = a.config.hwnd_handle();
+
+            // 「最上面是不是它」——取面板中心点上那一层窗口，归一到顶层。
+            // 直接问 `IsWindowVisible` 没有意义：被别的窗口盖住时它一样是 true，
+            // 而那正是用户说的「叫不出来」。
+            let on_top = |h: HWND| -> bool {
+                if h.is_null() {
+                    return false;
+                }
+                let mut rc: RECT = zeroed();
+                if GetWindowRect(h, &mut rc) == 0 {
+                    return false;
+                }
+                let pt = POINT {
+                    x: (rc.left + rc.right) / 2,
+                    y: (rc.top + rc.bottom) / 2,
+                };
+                let hit = WindowFromPoint(pt);
+                !hit.is_null() && GetAncestor(hit, GA_ROOT) == h
+            };
+
+            // 先把面板**压到 Z 序最底**，制造「被盖住」的现场 ——
+            // 否则在没人跟它抢的桌面上，「是不是最上层」恒为真，这条断言等于没测。
+            SetWindowPos(
+                h2,
+                HWND_BOTTOM as HWND,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let buried = !on_top(h2);
+            // 此刻再唤一次：already-open 分支必须把它捞回最前
+            config_ui::open(a);
+            let lifted = on_top(h2);
+
+            let same = !h1.is_null() && h1 == h2;
+            let vis = !h2.is_null() && IsWindowVisible(h2) != 0;
+            config_ui::close(a);
+            rows.push((
+                "设置面板·已开着再唤出（复用窗口 + 从被盖住捞回最前）",
+                if same && vis && buried && lifted { R::Pass } else { R::Fail },
+                format!(
+                    "两次句柄 {} / {}（须相同，不许重建）· 可见={} · 压到底后在最上层={}（须 false）· 唤出后在最上层={}（须 true）",
+                    h1 as isize, h2 as isize, vis, !buried, lifted
                 ),
             ));
         }

@@ -63,14 +63,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnab
 use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect,
-    GetCursorPos, GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadCursorW,
+    GetCursorPos, GetSystemMetrics, GetWindowRect, GetWindowTextW, IsWindow, LoadCursorW,
     MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
     SetWindowTextW, ShowWindow, WNDCLASSW, HICON,
     // 控件专用常量（consts 未收录）仍走 windows_sys，单一来源：
     BM_CLICK, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
     BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, LBN_SELCHANGE, LB_ADDSTRING,
     LB_GETCURSEL, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
+    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOW,
     WM_COMMAND, WM_CREATE,
     WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_GETMINMAXINFO, WM_MEASUREITEM,
     WM_SETFONT, WM_SETICON, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
@@ -553,8 +553,14 @@ impl Default for ConfigUi {
 }
 
 impl ConfigUi {
+    /// 面板是否**真的**还开着。
+    ///
+    /// 不能只看句柄非空：句柄是个裸 `isize`，窗口被销毁之后它照样非零
+    /// （窗口句柄会被复用，别的地方也可能拿着它）。于是「已打开」判断一旦
+    /// 依赖它，`open()` 就会走「只 ShowWindow 一个死句柄」的分支 —— 静默无事发生。
+    /// `IsWindow` 才是唯一可靠的口径。
     pub fn is_open(&self) -> bool {
-        !self.hwnd.is_null()
+        !self.hwnd.is_null() && unsafe { IsWindow(self.hwnd) != 0 }
     }
 
     /// 面板窗口句柄。给 `--cfgshot` 抓图用（`open` 之后才有值）。
@@ -1186,11 +1192,14 @@ unsafe fn window_size_for_client(lw: i32, lh: i32, k: f32, dpi_raw: u32) -> (i32
 /// 打开设置面板。已经开着就置前，不重复建。
 pub fn open(a: &mut App) {
     if a.config.is_open() {
-        unsafe {
-            ShowWindow(a.config.hwnd, SW_SHOWNORMAL);
-            SetForegroundWindow(a.config.hwnd);
-        }
+        bring_to_front(a.config.hwnd);
         return;
+    }
+    // 句柄非空、窗口却已经不在了（外部销毁 / 会话切换 / 桌面重建）：
+    // 不清掉这个槽位，`is_open()` 会一直返回真，于是每次按热键都只是
+    // `ShowWindow` 一个死句柄 —— 静默失败，表现为「面板再也打不开」。
+    if !a.config.hwnd.is_null() {
+        a.config.hwnd = null_mut();
     }
 
     unsafe {
@@ -1273,8 +1282,29 @@ pub fn open(a: &mut App) {
         a.config.icons.push(icon_big);
         SendMessageW(h, WM_SETICON, 0, icon_small as LPARAM); // ICON_SMALL
         SendMessageW(h, WM_SETICON, 1, icon_big as LPARAM); // ICON_BIG
-        ShowWindow(h, SW_SHOWNORMAL);
-        SetForegroundWindow(h);
+        bring_to_front(h);
+    }
+}
+
+/// 把设置面板拉到最前（新建后 / 已存在时都走这里）。
+///
+/// **只调 `SetForegroundWindow` 是不够的。** 进程不是前台进程时，这个调用会被
+/// 系统**静默拒绝** —— 没有返回值可查、没有异常，只是面板留在别的窗口下面。
+/// 用户的体感是「按了 Ctrl+Alt+O，面板没出来」，而面板其实好好开着，
+/// 于是他再按几次、再关一次，结论就成了「面板坏了、唤不出来」。
+///
+/// 手法是先 `SetWindowPos` 到 TOPMOST 再立刻落回 NOTOPMOST：系统把这次位置
+/// 变更认作「用户意图」，随后 `SetForegroundWindow` 才有资格生效。这不是绕
+/// 安全策略 —— 面板本来就是用户按热键/菜单叫出来的，本来就该到最前。
+///
+/// `SW_RESTORE` 而不是 `SW_SHOWNORMAL`：面板被最小化时前者会还原，
+/// 后者在已最小化的情况下不保证展开到可用尺寸。
+fn bring_to_front(hwnd: HWND) {
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetWindowPos(hwnd, HWND_TOPMOST as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetWindowPos(hwnd, HWND_NOTOPMOST as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetForegroundWindow(hwnd);
     }
 }
 
@@ -1287,7 +1317,13 @@ pub fn close(a: &mut App) {
     // DestroyWindow 的嵌套 WM_DESTROY 同样会被闸门挡掉，所以资源在这里
     // 显式释放；`free_resources` 会先清空句柄，销毁用保存下来的局部值。
     a.config.free_resources();
-    unsafe { DestroyWindow(hwnd) };
+    // 窗口可能已经不在了（外部销毁）：`DestroyWindow` 对死句柄会失败，
+    // 但不该因此把「清资源」也一起跳掉 —— 那会留下一堆悬空的 GDI 句柄。
+    unsafe {
+        if IsWindow(hwnd) != 0 {
+            DestroyWindow(hwnd);
+        }
+    }
     a.config.release_owned_after_destroy();
 }
 
