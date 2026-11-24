@@ -12,6 +12,7 @@ mod consts;
 mod favorites;
 mod ffi;
 mod gfx;
+mod island;
 mod layout;
 mod png;
 mod quotes;
@@ -25,6 +26,10 @@ fn main() {
     }
     if args.iter().any(|a| a == "--probe") {
         std::process::exit(app::probe());
+    }
+    // 灵动岛端到端（建窗 / 端点几何 / 静止零出帧 / 开关不涨句柄 / visible=0 仍活）
+    if args.iter().any(|a| a == "--islandtest") {
+        std::process::exit(app::islandtest());
     }
     if args.iter().any(|a| a == "--dragtest") {
         std::process::exit(app::dragtest());
@@ -65,6 +70,19 @@ fn main() {
     }
     if args.iter().any(|a| a == "--perf") {
         std::process::exit(app::perf());
+    }
+    // --dump-island <png> [key=value ...]：导出岛的一帧（透明底），供像素回归
+    if let Some(i) = args.iter().position(|a| a == "--dump-island") {
+        let Some(path) = args.get(i + 1) else {
+            println!("用法: desk-geyan --dump-island <输出.png> [state=expanded|compact ...]");
+            std::process::exit(2);
+        };
+        let overrides: Vec<(String, String)> = args[i + 2..]
+            .iter()
+            .filter_map(|s| s.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        std::process::exit(app::dump_island(path, &overrides));
     }
     // --dump <png> [key=value ...]：渲染一帧存成图片，可临时覆盖任意配置项
     if let Some(i) = args.iter().position(|a| a == "--dump") {

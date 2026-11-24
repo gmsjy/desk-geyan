@@ -7,11 +7,13 @@
 //! 本文件（探测、单帧导出、穿透与收藏的端到端实测）。
 
 mod bench;
+mod islandtest;
 mod selftest;
 
 // glob 不链式传递：`selftest.rs` / `bench.rs` 里要被 `app/mod.rs`
 // 再导出的入口，必须在这里显式转一手。
 pub(crate) use bench::{dragbench, memtest, perf};
+pub(crate) use islandtest::{dump_island, islandtest};
 pub(crate) use selftest::selftest;
 
 use super::*;
@@ -67,7 +69,11 @@ fn cfg_fingerprint(a: &App) -> String {
         "clock={clock} date={date} quote={quote} shadow={shadow} sec={sec} top={top} \
          autohide={autohide} layout={layout} paused={paused} fav={fav} shrink={shrink} mode={mode} anim={anim} \
          orient={orient} op={op} spd={spd} scale={scale} cs={cs} qs={qs} sp={sp} \
-         col={col:06X} dcol={dcol:06X} qcol={qcol:06X} font={font}",
+         col={col:06X} dcol={dcol:06X} qcol={qcol:06X} font={font} \
+         island={isl} isl_state={isl_state} isl_items={isl_items} isl_rot={isl_rot} \
+         isl_w={isl_w} isl_h={isl_h} isl_bc={isl_bc:06X} isl_ba={isl_ba} isl_ac={isl_ac:06X} \
+         isl_hov={isl_hov} isl_leave={isl_leave} isl_scr={isl_scr} isl_unread={isl_unread} \
+         isl_keep={isl_keep}",
         clock = c.show_clock,
         date = c.show_date,
         quote = c.show_quote,
@@ -92,6 +98,22 @@ fn cfg_fingerprint(a: &App) -> String {
         dcol = c.date_color,
         qcol = c.quote_color,
         font = c.font,
+        // 岛的字段也必须进指纹：不进的话「点一下 cfg 没变」会把岛设置页的
+        // 每一个控件都误判成没接上（这些命令只改岛自己的字段）。
+        isl = c.island,
+        isl_state = c.island_state,
+        isl_items = c.island_items,
+        isl_rot = c.island_rotate,
+        isl_w = c.island_w,
+        isl_h = c.island_h,
+        isl_bc = c.island_body_color,
+        isl_ba = c.island_body_alpha,
+        isl_ac = c.island_accent_color,
+        isl_hov = c.island_hover_ms,
+        isl_leave = c.island_leave_ms,
+        isl_scr = c.island_screen,
+        isl_unread = c.island_unread,
+        isl_keep = c.island_events_keep,
     )
 }
 
@@ -648,6 +670,51 @@ fn probe_inner() -> i32 {
             ));
         }
 
+        // ---- 分页：两页的控件都在，但**同时只有一页可见**
+        //
+        // 分页是为「面板一页到底、没有滚动条」腾高度（见 `config_ui::Page`）。
+        // 它最容易犯的错不是布局，而是**显隐两路分叉**：`page` 字段切了、
+        // `ShowWindow` 没跟上，用户看到的是「点了切页，界面纹丝不动」。
+        // 所以判据取系统的 `IsWindowVisible`，而且要求两页的可见数**恰好分完**
+        // 所有控件 —— 既不许有控件哪一页都不显示，也不许同一页之外还漏着一个。
+        {
+            config_ui::open(a);
+            let all = config_ui::windowed_ctl_count(a);
+            let p0 = config_ui::current_page(a);
+            let v0 = config_ui::visible_ctl_count(a);
+            config_ui::test_page_switch(a);
+            let p1 = config_ui::current_page(a);
+            let v1 = config_ui::visible_ctl_count(a);
+            // 切回来：可见数必须回到开头那个值（不是 0，也不是另一页的数）
+            config_ui::test_page_switch(a);
+            let p2 = config_ui::current_page(a);
+            let v2 = config_ui::visible_ctl_count(a);
+            config_ui::close(a);
+            let ok = p0 == 0
+                && p1 == 1
+                && p2 == 0
+                && v0 > 0
+                && v1 > 0
+                && v0 + v1 == all
+                && v2 == v0;
+            rows.push((
+                "设置面板·分页（两页共存 · 同时只显示一页）",
+                if ok { R::Pass } else { R::Fail },
+                format!(
+                    "控件共 {} 个 · 挂件页可见 {} + 岛页可见 {} = {}（须等于总数）· 切页 {}{}{} · 切回可见 {}（须 {})",
+                    all,
+                    v0,
+                    v1,
+                    v0 + v1,
+                    p0,
+                    p1,
+                    p2,
+                    v2,
+                    v0
+                ),
+            ));
+        }
+
         // ---- 连续换字体后，预览区不能出现「叠字」
         //
         // 用户报的现象：在列表里连着点几个字体，预览区的新字和旧字叠在一起。
@@ -713,6 +780,10 @@ fn probe_inner() -> i32 {
         // 所以把跳过的条数报出来，和表格里那份清单对数。
         {
             let keep = a.cfg.clone();
+            // 片段开关的往返断言需要**至少两项**：只剩一项时「关掉最后一项」会被
+            // `Items::parse` 的空集合兜底拉回 `clock`（设计如此：不允许空胶囊），
+            // 于是「点一下 cfg 没变」会被误判成没接上。钉成两项再点。
+            a.cfg.island_items = "clock,dot".to_string();
             config_ui::open(a);
 
             let live = config_ui::interactive_cmds(a);
@@ -897,6 +968,14 @@ fn probe_inner() -> i32 {
                 // `keep` 是在这几轮之后才快照的。
                 a.set_font(config::FONT_PRESETS[0]);
                 config_ui::resync(a);
+                // 想抓**灵动岛设置页**时传 `DG_CAPTURE_PAGE=island`（默认挂件页）。
+                // 抓完切回原页：截图是自检的副产物，不许改变被测对象的状态。
+                let want_island = std::env::var("DG_CAPTURE_PAGE")
+                    .map(|v| v.eq_ignore_ascii_case("island") || v == "1")
+                    .unwrap_or(false);
+                if want_island != (config_ui::current_page(a) == 1) {
+                    config_ui::test_page_switch(a);
+                }
                 // `PrintWindow` 读的是窗口**已经合成好的表面**，它不会替我们重走一遍
                 // WM_PAINT —— `resync` 只是把窗口标脏。所以先让队列里的绘制落地
                 // 再抓，否则抓到的还是改动之前那一帧（这条坑见 README 踩坑第 15 条）。
@@ -945,25 +1024,42 @@ fn probe_inner() -> i32 {
                 let gdi0 = crate::ffi::gui_resources().map(|r| r.0);
                 let base = config_ui::test_dpi_change(a, 100);
                 let base_rc = config_ui::test_ctl_rects(a);
-                let dbl = config_ui::test_dpi_change(a, 200);
+                // **倍率要选本屏装得下的那档**：这条断言验的是「等比换挡」，
+                // 不是「屏幕够不够高」。1080 高的屏放不下 1280px 的客户区，
+                // 系统会把窗口截短（实测 200% 只拿到 1061px），于是「恰好 2 倍」
+                // 必然假红 —— 而且红得与面板毫无关系。
+                // 试 200%，拿到的客户区明显不够就退到 150%（再不够就 125%）。
+                let mut big_pct = 200u32;
+                let mut dbl = config_ui::test_dpi_change(a, big_pct);
+                if let (Some((w0, h0)), Some((w1, h1))) = (base, dbl) {
+                    if (w1 - 2 * w0).abs() > 2 || (h1 - 2 * h0).abs() > 2 {
+                        big_pct = 150;
+                        dbl = config_ui::test_dpi_change(a, big_pct);
+                    }
+                }
                 let dbl_rc = config_ui::test_ctl_rects(a);
-                let _ = config_ui::test_dpi_change(a, 150);
+                let mid_pct = if big_pct == 200 { 150u32 } else { 125 };
+                let _ = config_ui::test_dpi_change(a, mid_pct);
                 let half_rc = config_ui::test_ctl_rects(a);
                 let back = config_ui::test_dpi_change(a, home);
                 let back_rc = config_ui::test_ctl_rects(a);
 
                 let n = base_rc.len();
                 let same_n = n > 0 && dbl_rc.len() == n && half_rc.len() == n;
+                let big_k = big_pct as f32 / 100.0;
+                let mid_k = mid_pct as f32 / 100.0;
 
-                // ① 客户区跟着倍率走（100% → 200% 恰好翻倍）
+                // ① 客户区跟着倍率走（100% → 选定倍率，恰好那个倍数）
                 let mut worst_c = 0i32;
                 let mut grew = false;
                 if let (Some((w0, h0)), Some((w1, h1))) = (base, dbl) {
-                    worst_c = (w1 - 2 * w0).abs().max((h1 - 2 * h0).abs());
+                    worst_c = (w1 - (w0 as f32 * big_k).round() as i32)
+                        .abs()
+                        .max((h1 - (h0 as f32 * big_k).round() as i32).abs());
                     grew = worst_c <= 2;
                 }
 
-                // ② 控件矩形等比：200% 恰好 2 倍、150% 恰好 1.5 倍（±1px 取整），
+                // ② 控件矩形等比：选定倍率与 1.25/1.5 各恰好对应（±1px 取整），
                 //    并且全部落在客户区内
                 let mut worst = 0i32;
                 let mut inner = true;
@@ -977,8 +1073,8 @@ fn probe_inner() -> i32 {
                             (d.right, h.right, b.right),
                             (d.bottom, h.bottom, b.bottom),
                         ] {
-                            let e2 = (dv - bv * 2).abs();
-                            let e15 = (hv - (bv as f32 * 1.5).round() as i32).abs();
+                            let e2 = (dv - (bv as f32 * big_k).round() as i32).abs();
+                            let e15 = (hv - (bv as f32 * mid_k).round() as i32).abs();
                             worst = worst.max(e2).max(e15);
                         }
                         if d.left < 0 || d.top < 0 || d.right > cw || d.bottom > ch {
@@ -1019,8 +1115,19 @@ fn probe_inner() -> i32 {
                     "设置面板·跨屏 DPI（真发 WM_DPICHANGED）",
                     if ok { R::Pass } else { R::Fail },
                     format!(
-                        "基准 {:?}@100% → 200% {:?}（客户区偏差 {}px）→ 150% → 回 {}%{:?} · 控件 {} 个 · 矩形等比偏差 {}px · 全在客户区内={} · 复位偏差 {}px · GDI {}→{}",
-                        base, dbl, worst_c, home, back, n, worst, inner, worst_back,
+                        "基准 {:?}@100% → {}% {:?}（客户区偏差 {}px{}）→ {}% → 回 {}%{:?} · 控件 {} 个 · 矩形等比偏差 {}px · 全在客户区内={} · 复位偏差 {}px · GDI {}→{}",
+                        base,
+                        big_pct,
+                        dbl,
+                        worst_c,
+                        if big_pct == 200 { "" } else { "（本屏放不下 200%，已降档）" },
+                        mid_pct,
+                        home,
+                        back,
+                        n,
+                        worst,
+                        inner,
+                        worst_back,
                         gdi0.map(|v| v as i64).unwrap_or(-1),
                         gdi1.map(|v| v as i64).unwrap_or(-1)
                     ),

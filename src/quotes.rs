@@ -108,7 +108,10 @@ pub fn load_builtin() -> Vec<Quote> {
 /// U+FEFF 会黏在第一行行首，于是本该被跳过的注释行变成**一条以 BOM 开头
 /// 的格言**（`#` 前面的字符让它躲过了 `starts_with('#')`），黑底上会飘出
 /// 一个不可见的怪符号。这是「用户拿记事本改一下文件」最常见的坏法。
-fn strip_bom(s: &str) -> &str {
+/// 去掉 UTF-8 BOM。`pub(crate)`：事件管道（`island::content`）也要用 ——
+/// PowerShell 的 `Set-Content -Encoding utf8` 会写 BOM，不去掉的话正文首字符
+/// 会变成不可见的 `\u{feff}`，量字宽时算作全角，胶囊宽度会莫名其妙多一截。
+pub(crate) fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 

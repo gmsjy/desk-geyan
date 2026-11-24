@@ -1632,7 +1632,7 @@ pub(crate) fn selftest() -> i32 {
     // 顺带把「加了一行之后最下面一行跑出窗口」也钉死：面板没有滚动条，
     // 排不下就是看不见。判据直接问布局函数要余量，不是拿放大镜看截图。
     {
-        let expected: [u32; 42] = [
+        let expected: &[u32] = &[
             MI_CLOCK,
             MI_DATE,
             MI_SECONDS,
@@ -1675,6 +1675,27 @@ pub(crate) fn selftest() -> i32 {
             MI_RELOAD,
             MI_RESET,
             MI_TOGGLE,
+            // ---- 灵动岛设置页（第二页）。顺序 = `table(Page::Island)` 的屏幕顺序，
+            // 页面在表格里排在挂件页之后，`table_cmds()` 也是这么拼的。
+            MI_ISLAND,
+            MI_ISLAND_UNREAD,
+            MI_ISLAND_KEEP,
+            MI_ISLAND_ITEM_BASE,
+            MI_ISLAND_ITEM_BASE + 1,
+            MI_ISLAND_ITEM_BASE + 2,
+            MI_ISLAND_ITEM_BASE + 3,
+            MI_ISLAND_ITEM_BASE + 4,
+            MI_ISLAND_ITEM_BASE + 5,
+            MI_ISLAND_ROT_DOWN,
+            MI_ISLAND_ROT_UP,
+            MI_ISLAND_OP_DOWN,
+            MI_ISLAND_OP_UP,
+            MI_ISLAND_BODY_COLOR,
+            MI_ISLAND_ACCENT_COLOR,
+            MI_ISLAND_W_DOWN,
+            MI_ISLAND_W_UP,
+            MI_ISLAND_H_DOWN,
+            MI_ISLAND_H_UP,
         ];
         let got = config_ui::table_cmds();
         let mut uniq = got.clone();

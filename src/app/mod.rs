@@ -39,7 +39,8 @@ pub(crate) use window::*;
 // 实现散在各个子模块里，在此集中再导出，免得调用方要知道内部怎么分。
 pub(crate) use input::on_menu;
 pub(crate) use verify::{
-    clicktest, dragbench, dragtest, dump, favtest, memtest, perf, probe, selftest,
+    clicktest, dragbench, dragtest, dump, dump_island, favtest, islandtest, memtest, perf, probe,
+    selftest,
 };
 
 use std::cell::Cell;
@@ -54,6 +55,7 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, SetTimer, ShowWindow, TranslateMessage};
 use crate::transition;
 use crate::config::{Anim, Config, Mode};
+use crate::island;
 use crate::config_ui::{self, ConfigUi};
 use crate::ffi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDPIAware, SetProcessDpiAwarenessContext};
 use crate::gfx::{self, Fonts, Frame};
@@ -295,6 +297,39 @@ pub(crate) const MI_BACKUP: u32 = 81;
 /// 导出纯文本诊断报告
 pub(crate) const MI_DIAG: u32 = 82;
 
+// ---- 灵动岛（与格言并列的独立功能）
+//
+// 只有三条命令：总开关、描边、未读计数。岛的颜色/尺寸走 `config.ini`
+// 或设置面板的数值行 —— 菜单里塞一堆「胶囊底不透明度 +2」没有意义。
+/// 显示 / 隐藏灵动岛（开则建窗、关则**销毁**）
+pub(crate) const MI_ISLAND: u32 = 83;
+
+/// 是否统计未读数（关掉只显示最近一条）
+pub(crate) const MI_ISLAND_UNREAD: u32 = 84;
+
+/// 落下 island_state：收起 / 展开（P2 的「钉住」先用它验证落盘）
+pub(crate) const MI_ISLAND_COLLAPSE: u32 = 85;
+pub(crate) const MI_ISLAND_EXPAND: u32 = 86;
+
+// 灵动岛设置页的命令码。**只出现在设置面板里**（菜单里不重复，与其它设置项
+// 同一口径）。片段开关用 `BASE + 0..6`，顺序与 `content::ALL_ITEMS` 一致。
+// ⚠️ 起始值必须**大于现有最大命令码**（`MI_QUIT = 99`）。第一版从 87 起排，
+// 排到 99 正好撞上 `MI_QUIT` —— 症状是「退出」项变成「展开宽 +20」，
+// 而 clippy 报的是 `MI_QUIT` 那条 match 分支不可达。命令码是手工分配的，
+// 加新段落时先看一眼这个文件的尾部。
+pub(crate) const MI_ISLAND_ITEM_BASE: u32 = 104;
+pub(crate) const MI_ISLAND_ROT_DOWN: u32 = 110;
+pub(crate) const MI_ISLAND_ROT_UP: u32 = 111;
+pub(crate) const MI_ISLAND_OP_DOWN: u32 = 112;
+pub(crate) const MI_ISLAND_OP_UP: u32 = 113;
+pub(crate) const MI_ISLAND_BODY_COLOR: u32 = 114;
+pub(crate) const MI_ISLAND_ACCENT_COLOR: u32 = 115;
+pub(crate) const MI_ISLAND_W_DOWN: u32 = 116;
+pub(crate) const MI_ISLAND_W_UP: u32 = 117;
+pub(crate) const MI_ISLAND_H_DOWN: u32 = 118;
+pub(crate) const MI_ISLAND_H_UP: u32 = 119;
+pub(crate) const MI_ISLAND_KEEP: u32 = 120;
+
 /// 时间日期块拖动命中的最小判定范围（避免块很小时抓不住）
 pub(crate) const CLOCK_MIN_GRAB: i32 = 28;
 
@@ -527,6 +562,11 @@ pub(crate) struct App {
     /// 挂在 `App` 上而不是自己开一个全局：配置窗口的过程函数本来就走
     /// `app_ready()` 拿 `&mut App`，状态放一起就不必再引第二层裸指针。
     pub(crate) config: ConfigUi,
+    /// 灵动岛：**与格言并列的独立功能**（`src/island/`）。
+    ///
+    /// 它有自己的窗口、定时器、排版与绘制，从不写 `cfg.w/h/x/y`，
+    /// 也不读 `cfg.visible` / `orient` / `anim`。`island=0` 时窗口不存在。
+    pub(crate) island: island::Island,
 }
 
 /// 布局模式下鼠标抓着什么。
@@ -694,7 +734,16 @@ impl App {
             autostart_err: 0,
             force_marquee: false,
             config: ConfigUi::default(),
+            island: island::Island::new(),
         })
+    }
+
+    /// 格言窗口是不是**因为全屏**而藏着。
+    ///
+    /// 岛要读它来做自己的显隐，但只读不写 —— 两个功能的 `fs_hidden`
+    /// 记账各自独立，互相覆盖会出现「退出全屏后岛弹回来而格言没弹」。
+    pub(crate) fn fs_hidden(&self) -> bool {
+        self.fs_hidden
     }
 
     fn should_show_panel(&self) -> bool {
@@ -937,6 +986,12 @@ pub(crate) unsafe fn bootstrap(a: &mut App) -> bool {
     ShowWindow(text, SW_SHOWNOACTIVATE);
     if !a.cfg.visible {
         set_visible(a, false);
+    }
+    // 灵动岛：**独立窗口**，默认不建（`cfg.island = false`）。
+    // 放在最后：`create` 里会读 `window_dpi`，那时窗口已经在了，
+    // 读到的才是它真正所在屏的 DPI。
+    if a.cfg.island {
+        island::create(a);
     }
     true
 }

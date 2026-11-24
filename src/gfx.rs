@@ -585,8 +585,66 @@ impl Frame {
         date_color: u32,
         quote_color: u32,
     ) {
+        // 旧签名原样保留、转调新实现 —— 现有调用点一行不改，
+        // 「`tk=255` 且无 body 时逐位相同」因此是**结构性**的，
+        // 而不是靠每个调用点自觉传对参数。
+        self.compose_ex(
+            opacity,
+            shadow_k,
+            bands,
+            color,
+            date_color,
+            quote_color,
+            255,
+            None,
+        );
+    }
+
+    /// `compose` 的扩展版：多一个**文字通道全局系数** `tk` 与**胶囊底** `body`。
+    ///
+    /// * `tk` 让灵动岛用一个数控制「收起内容 / 展开内容」的淡入淡出。
+    ///   它乘在三条文字通道上，**不乘 body** —— 胶囊底在动画全程可见，
+    ///   只改尺寸不改透明度。`tk == 255` 时整数恒等。
+    /// * `body = Some((0x00RRGGBB, alpha))` 时，`ink` 的 **byte3** 被当成
+    ///   胶囊覆盖率（形状趟写的），合成顺序是 `文字 over 阴影 over 胶囊底`。
+    ///   为什么用 byte3 存覆盖率而不是第四条颜色：32bpp 只剩这一个字节，
+    ///   而 alpha 必须留给合成；覆盖率是"有没有底"，颜色仍在 `body` 参数里，
+    ///   于是"颜色只在 compose 里乘"这条哲学没有破。
+    ///
+    /// 三条快速路径（顺序即成本）：
+    /// 1. 无墨、无底、无阴影 ⇒ 跳过（占九成像素）；
+    /// 2. 无墨、`cov == 255`、无阴影 ⇒ 一次赋值写预乘底；
+    /// 3. 其余（文字 / 边缘 1px）走完整的三层 over。
+    pub fn compose_ex(
+        &mut self,
+        opacity: u8,
+        shadow_k: u8,
+        bands: &BandTable,
+        color: u32,
+        date_color: u32,
+        quote_color: u32,
+        tk: u8,
+        body: Option<(u32, u8)>,
+    ) {
         let sk = if self.shadows_on { shadow_k as u32 } else { 0 };
         let op = opacity as u32;
+        let tka = tk as u32;
+        // 胶囊底的预乘值。`op` 也要乘：用户调"不透明度"时胶囊一起变，
+        // 否则文字淡了而底还实着，观感是"字浮在玻璃上"。
+        let bp = body.map(|(c, a)| {
+            let a = (a as u32) * op / 255;
+            (
+                a,
+                color_r(c) * a / 255,
+                color_g(c) * a / 255,
+                color_b(c) * a / 255,
+            )
+        });
+        // 整块底的点：一次赋值就能写完一个像素
+        let body_full = match bp {
+            Some((a, r, g, b)) => (a << 24) | (r << 16) | (g << 8) | b,
+            None => 0,
+        };
         let (cr, cg, cb) = (color_r(color), color_g(color), color_b(color));
         let (dr, dg, db) = (color_r(date_color), color_g(date_color), color_b(date_color));
         let (qr, qg, qb) = (
@@ -629,12 +687,16 @@ impl Frame {
                 let i = (y as usize) * wi + (x as usize);
 
                 let p = px[i];
+                // byte3 = 胶囊覆盖率（形状趟写的）。旧路径从不写它，所以这里
+                // 恒为 0 —— 下面两条快路径与原实现逐位一致。
+                let cov = (p >> 24) & 0xFF;
+                let ink = p & 0x00FF_FFFF;
                 // 阴影位图同一点的值（白底黑字 ⇒ 覆盖率 = 255 - byte0）。
                 // 阴影趟画的是「整体位移 (off,off) 之后的那批字形」，位移
                 // 已经体现在位图内容里，这里不做任何坐标换算。
                 let shv = if sh.len() > i { sh[i] & 0xFF } else { 255 };
 
-                // ---- 快路径：三条通道全空。
+                // ---- 快路径 1：无墨、无底、无阴影。
                 //
                 // 这块挂件九成以上的像素是背景，而它们全都要陪跑下面那一整套
                 // 「乘不透明度 + 比三路 + 乘颜色」。实测（`--perf` 的帧内拆解）
@@ -650,7 +712,7 @@ impl Frame {
                 //
                 // **查带也走这条捷径**：无墨无影的像素一次 `get` 都不做
                 // （带表最多 16 项线性扫描，只该花在有内容的像素上）。
-                if p & 0x00FF_FFFF == 0 {
+                if ink == 0 && cov == 0 {
                     if shv == 255 {
                         continue;
                     }
@@ -662,6 +724,14 @@ impl Frame {
                     continue;
                 }
 
+                // ---- 快路径 2：胶囊内部、无字、无影 ⇒ 一次赋值。
+                // 这是灵动岛最常见的像素（整块底），把它压到内存带宽级别；
+                // 只有文字笔画和边缘 1px 抗锯齿带会走下面的慢路径。
+                if ink == 0 && shv == 255 && cov == 255 {
+                    px[i] = body_full;
+                    continue;
+                }
+
                 let (bq, bd) = bands.get(x as u16);
                 let sa = if shv == 255 {
                     0
@@ -669,11 +739,12 @@ impl Frame {
                     ((255 - shv) * sk * op) / (255 * 255)
                 };
 
-                let ma = ((p & 0xFF) as u32 * op) / 255;
-                let da = ((((p >> 8) & 0xFF) as u32 * op) / 255) * bd / 255;
-                // 带系数 255 时 `(x * 255) / 255 == x` 对整数恒成立
-                // ⇒ 与旧路径逐位相同
-                let qa = ((((p >> 16) & 0xFF) as u32 * op) / 255) * bq / 255;
+                // `tk` 乘在三条文字通道上（岛的内容相位）。`tk=255` 时
+                // `(x * 255) / 255 == x` 对整数恒成立 ⇒ 与旧路径逐位相同。
+                let ma = ((((p & 0xFF) as u32 * op) / 255) * tka) / 255;
+                let da = ((((((p >> 8) & 0xFF) as u32 * op) / 255) * bd) / 255) * tka / 255;
+                // 带系数 255 时同样恒等
+                let qa = ((((((p >> 16) & 0xFF) as u32 * op) / 255) * bq) / 255) * tka / 255;
                 // `qa` 先缩放再进下面的最强通道比较 —— 于是「时钟压在格言上」
                 // 的重叠区在格言淡出过程中不淡（时钟更强），这与「取最强通道」
                 // 的既有语义一致，不是特例。
@@ -686,13 +757,48 @@ impl Frame {
                     (ma, cr * ma / 255, cg * ma / 255, cb * ma / 255)
                 };
 
-                let a = if sa == 0 {
+                // 文字 over 阴影（阴影是纯黑，只抬 alpha 不动颜色分量）
+                let a1 = if sa == 0 {
                     ta
                 } else {
                     ta + (sa * (255 - ta)) / 255
                 };
+
+                // 再 over 胶囊底。底在最下面，所以它的颜色要按 `(255 - a1)`
+                // 衰减 —— 这正是预乘 over 的定义，不需要反预乘。
+                let (a, r, g, b) = match bp {
+                    None => (a1, r, g, b),
+                    Some((ba, br, bg, bb)) => {
+                        if cov == 0 || ba == 0 {
+                            (a1, r, g, b)
+                        } else {
+                            let bc = cov;
+                            let ba = ba * bc / 255;
+                            if ba == 0 {
+                                (a1, r, g, b)
+                            } else {
+                                let k = 255 - a1;
+                                (
+                                    a1 + ba * k / 255,
+                                    r + (br * bc / 255) * k / 255,
+                                    g + (bg * bc / 255) * k / 255,
+                                    b + (bb * bc / 255) * k / 255,
+                                )
+                            }
+                        }
+                    }
+                };
                 px[i] = (a << 24) | (r << 16) | (g << 8) | b;
             }
+        }
+    }
+
+    /// 掩码位图的可变视图 —— 形状趟要直接往 byte3 写覆盖率，
+    /// 走 GDI 会被它把最高字节清成 0。
+    pub fn ink_pixels_mut(&mut self) -> &mut [u32] {
+        match self.ink.as_mut() {
+            Some(d) => d.pixels(),
+            None => &mut [],
         }
     }
 
@@ -733,6 +839,73 @@ impl Frame {
                 &blend,
                 ULW_ALPHA,
             ) != 0
+        }
+    }
+}
+
+/// 把胶囊（圆角矩形）的**覆盖率**写进 `ink` 的最高字节（byte3）。
+///
+/// # 为什么是 byte3
+///
+/// `ink` 是 32bpp，byte0/1/2 已经被时钟 / 日期 / 格言三条掩码占用，
+/// byte3 **恒为 0**（GDI 画 `0x00RRGGBB` 不碰最高字节）。它是一块现成的、
+/// 免费的第四通道。用 alpha 存"有没有底"、颜色留在 `compose` 的参数里，
+/// 于是"通道只存覆盖率、颜色只在 compose 里乘"这条哲学没有被破。
+///
+/// # 必须画在所有 GDI 绘制之后
+///
+/// GDI 写像素时会把 byte3 清 0。所以顺序只能是「掩码趟 → 阴影趟 → 形状趟」，
+/// 反过来会把字形所在的位置的覆盖率抹掉，表现为"字周围一圈透光"。
+///
+/// # 抗锯齿
+///
+/// 只在上/下各 `r` 行的四段圆弧上做 SDF（1px 过渡带），中间直边整行
+/// `|= 0xFF00_0000` 一次写满 —— 面积成本 O(w·h) 但只有常数次乘法。
+pub fn body_coverage_into(px: &mut [u32], w: i32, h: i32, r: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let n = w as usize * h as usize;
+    if px.len() < n {
+        return;
+    }
+    let wi = w as usize;
+    let r = r.clamp(0, (h / 2).min(w / 2));
+    for y in 0..h {
+        let row = y as usize * wi;
+        let in_arc = r > 0 && (y < r || y >= h - r);
+        if !in_arc {
+            for x in 0..w {
+                let i = row + x as usize;
+                px[i] = (px[i] & 0x00FF_FFFF) | 0xFF00_0000;
+            }
+            continue;
+        }
+        let yc = y as f32 + 0.5;
+        // 到最近一条水平直边的距离（上圆角段取顶边，下圆角段取底边）
+        let dy = if y < r {
+            r as f32 - yc
+        } else {
+            yc - (h - r) as f32
+        };
+        let rf = r as f32;
+        for x in 0..w {
+            let xc = x as f32 + 0.5;
+            let dx = if x < r {
+                rf - xc
+            } else if x >= w - r {
+                xc - (w - r) as f32
+            } else {
+                0.0
+            };
+            let cov = if dx == 0.0 {
+                255u32
+            } else {
+                let dist = (dx * dx + dy * dy).sqrt();
+                (((rf + 0.5 - dist) * 255.0).clamp(0.0, 255.0)) as u32
+            };
+            let i = row + x as usize;
+            px[i] = (px[i] & 0x00FF_FFFF) | (cov << 24);
         }
     }
 }
@@ -1145,5 +1318,144 @@ pub fn with_clip<F: FnOnce(HDC)>(hdc: HDC, l: i32, t: i32, r: i32, b: i32, f: F)
         IntersectClipRect(hdc, l, t, r, b);
         f(hdc);
         RestoreDC(hdc, saved);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 圆角矩形的**解析**面积：`w·h` 减掉四个角上「方角比圆弧多算的」那一块。
+    ///
+    /// 每个角多算的是 `r² - πr²/4`，四个角合起来 `(4 - π)r²`。
+    fn analytic_area(w: i32, h: i32, r: i32) -> f64 {
+        let r = r as f64;
+        (w * h) as f64 - (4.0 - std::f64::consts::PI) * r * r
+    }
+
+    /// 覆盖率之和（把 cov/255 当面积看）
+    fn covered(px: &[u32]) -> f64 {
+        px.iter()
+            .map(|p| ((p >> 24) & 0xFF) as f64 / 255.0)
+            .sum::<f64>()
+    }
+
+    fn blank(n: usize) -> Vec<u32> {
+        vec![0u32; n]
+    }
+
+    /// 形状面积与解析面积对得上。
+    ///
+    /// # 阈值为什么是 0.1% 而不是规格书里的 1%
+    ///
+    /// 规格书 §7.2 #9 写的是「误差 < 1%，注毒方式：圆角少 1px ⇒ 面积偏大」。
+    /// 这两句是**自相矛盾**的：面积主要来自 `w·h`，圆角只占 `(4-π)r²`，
+    /// 半径差 1px 时总面积只变 `(4-π)(2r-1)/w·h` —— 实测 420×136/r=18 是
+    /// **0.054%**，96×34/r=17 是 0.90%。1% 的阈值只能盖住后者，
+    /// 前者注毒也不会红。所以这条阈值收紧到实测（0.031%）的 3 倍，
+    /// 而「1px 半径」这种细粒度错误交给下面那条角块计数去判。
+    #[test]
+    fn body_coverage_area_matches_analytic() {
+        for (w, h, r) in [(420, 136, 18), (96, 34, 17), (247, 34, 17), (420, 136, 2)] {
+            let mut px = blank((w * h) as usize);
+            body_coverage_into(&mut px, w, h, r);
+            let got = covered(&px);
+            let want = analytic_area(w, h, r);
+            let err = (got - want).abs() / want;
+            assert!(
+                err < 0.001,
+                "{w}x{h} r={r}: 覆盖率面积 {got:.1} vs 解析 {want:.1}（误差 {:.3}%）",
+                err * 100.0
+            );
+        }
+    }
+
+    /// **每个角块**里被覆盖过半的像素数 == 四分之一圆的面积。
+    ///
+    /// 这才是「圆角半径对不对」的尖锐判据：半径差 1px，整块面积只动 0.05%
+    /// （上一条根本红不了），而角块里的计数直接差 **27 个像素**（r=18 时
+    /// 255 → 228），一眼就红。
+    #[test]
+    fn body_coverage_corner_count_matches_quarter_disc() {
+        for r in [13, 17, 18] {
+            let (w, h) = (2 * r + 40, 2 * r + 10);
+            let mut px = blank((w * h) as usize);
+            body_coverage_into(&mut px, w, h, r);
+            // 四个角块（左上 / 右上 / 左下 / 右下）
+            let blocks = [
+                (0, 0),
+                (w - r, 0),
+                (0, h - r),
+                (w - r, h - r),
+            ];
+            let want = std::f64::consts::PI * (r * r) as f64 / 4.0;
+            for (bx, by) in blocks {
+                let mut n = 0;
+                for y in by..by + r {
+                    for x in bx..bx + r {
+                        if (px[(y * w + x) as usize] >> 24) >= 128 {
+                            n += 1;
+                        }
+                    }
+                }
+                // 离散化误差实测最大 2.3 个像素（r=13 时），半径差 1px 是 20+ 个
+                assert!(
+                    (n as f64 - want).abs() <= 3.0,
+                    "r={r} 角块 ({bx},{by})：过半像素 {n} 个，解析 {want:.1} 个"
+                );
+            }
+        }
+    }
+
+    /// `r = 0` 时退化成一个实心矩形：面积必须**严格**等于 `w·h`。
+    #[test]
+    fn body_coverage_radius_zero_is_solid_rect() {
+        let (w, h) = (64, 20);
+        let mut px = blank((w * h) as usize);
+        body_coverage_into(&mut px, w, h, 0);
+        assert_eq!(covered(&px), (w * h) as f64, "r=0 不是实心矩形");
+    }
+
+    /// 形状趟**只写 byte3**，低 24 位逐位不变。
+    ///
+    /// 低三字节是三条掩码通道（时钟 / 日期 / 格言）。形状趟要是顺手写坏
+    /// 哪怕一位，症状是「文字颜色串了」——而面积断言此时照样通过，
+    /// 因为面积只由 byte3 决定。所以这两条必须成对存在。
+    #[test]
+    fn body_coverage_only_touches_top_byte() {
+        let (w, h, r) = (77, 41, 13);
+        // 低 24 位填成非零的伪随机值：全 0 的话「写坏」也可能正好写回 0
+        let mut before: Vec<u32> = (0..w * h)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(2654435761);
+                (x & 0x00FF_FFFF) | ((x >> 25) << 24)
+            })
+            .collect();
+        let mut after = before.clone();
+        body_coverage_into(&mut after, w, h, r);
+
+        for i in 0..before.len() {
+            assert_eq!(
+                after[i] & 0x00FF_FFFF,
+                before[i] & 0x00FF_FFFF,
+                "第 {i} 个像素的低 24 位被形状趟改动了"
+            );
+        }
+        // 同时证明 byte3 真的被写了（否则上一条断言等于没测任何东西）
+        before[0] = 0;
+        assert!(
+            after.iter().any(|p| p >> 24 != 0),
+            "形状趟没有写 byte3，覆盖率通道是空的"
+        );
+    }
+
+    /// 越界 / 退化尺寸不 panic、不越界写。
+    #[test]
+    fn body_coverage_rejects_bad_input() {
+        let mut px = blank(10);
+        body_coverage_into(&mut px, 0, 5, 3);
+        body_coverage_into(&mut px, 5, 0, 3);
+        body_coverage_into(&mut px, 100, 100, 3); // 缓冲区不够
+        assert!(px.iter().all(|p| *p == 0), "非法入参却写了像素");
     }
 }

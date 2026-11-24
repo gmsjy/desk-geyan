@@ -248,6 +248,9 @@ pub(crate) fn raise_pair(a: &App) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+    // 灵动岛是**另一个窗口**，它不在这一对里。TOPMOST 组内后设置者在上，
+    // 不补这一步格言会把它压下去。规则：岛恒在格言之上（信息层 > 内容层）。
+    crate::island::raise(a);
 }
 
 pub(crate) fn apply_topmost(a: &App) {

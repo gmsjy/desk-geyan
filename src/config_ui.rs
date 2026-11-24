@@ -59,6 +59,7 @@ use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_SELECTED, ODT_LISTBOX,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
+use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
     GetCursorPos, GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadCursorW,
@@ -67,7 +68,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, BM_CLICK, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
     BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, LBN_SELCHANGE, LB_ADDSTRING,
     LB_GETCURSEL, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOZORDER,
     WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_GETMINMAXINFO, WM_MEASUREITEM,
     WM_PAINT,
@@ -81,7 +83,10 @@ use crate::app::{
     MI_OP_UP, MI_ORIENT_BASE, MI_PAUSE, MI_FAV_ONLY, MI_PREV, MI_QUOTE, MI_QUOTE_COLOR,
     MI_QUOTE_DOWN, MI_QUOTE_UP, MI_RELOAD, MI_RESET, MI_SCALE_DOWN, MI_SCALE_UP, MI_SECONDS,
     MI_SHADOW, MI_SHRINK_FIT, MI_SPACING_DOWN, MI_SPACING_UP, MI_SPEED_DOWN, MI_SPEED_UP,
-    MI_TEXT, MI_TOGGLE, MI_TOPMOST,
+    MI_TEXT, MI_TOGGLE, MI_TOPMOST, MI_ISLAND, MI_ISLAND_UNREAD,
+    MI_ISLAND_ACCENT_COLOR, MI_ISLAND_BODY_COLOR, MI_ISLAND_H_DOWN, MI_ISLAND_H_UP,
+    MI_ISLAND_ITEM_BASE, MI_ISLAND_KEEP, MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP,
+    MI_ISLAND_ROT_DOWN, MI_ISLAND_ROT_UP, MI_ISLAND_W_DOWN, MI_ISLAND_W_UP,
 };
 use crate::config::{self, Anim, Mode, Orient, FONT_PRESETS};
 use crate::consts::*;
@@ -95,6 +100,8 @@ const CFG_CLASS: &str = "DeskGeyanConfig";
 /// 左列（字体列表 / 恢复默认字体）的控件 id
 const ID_FONT_LIST: i32 = 1001;
 const ID_BTN_FONT_DEFAULT: i32 = 1002;
+/// 「切到另一页」的按钮（左列，与「恢复默认字体」同一行）
+const ID_BTN_PAGE: i32 = 1004;
 /// 设置区控件的 id 从这里起按表格顺序自增。
 /// 它们和 `MI_*` 命令码是两码事：id 只用来在 `WM_COMMAND` 里找回「是哪个控件」，
 /// 而「点击要干什么」由 `Ctl.cmd` 决定。
@@ -154,7 +161,11 @@ const CLIENT_H: i32 = 640;
 /// **往 `table()` 里加行之后一定要跑 `--selftest`**：断言会报出
 /// 「需要 Npx / 常量 Mpx」，把这里顶上去。
 const MIN_TRACK_W: i32 = 780;
-const MIN_TRACK_H: i32 = 640;
+/// 最小客户区高度。**加一行设置就要同步它** —— `--selftest` 的
+/// 「控件清单（表格即规格）」会算 `plan_min_height()` 并报余量，
+/// 排不下就是红的（面板没有滚动条，最后一行会被静默切掉）。
+/// 660 = 加灵动岛两行之后的需求 657 向上取整。
+const MIN_TRACK_H: i32 = 660;
 
 /// 判「字体含不含汉字」用的样本字。挑的都是最常用的字：一个字体连「永」
 /// （CJK 覆盖率的事实标准测试字）都没有，挂件上的中文必然糊成豆腐。
@@ -173,6 +184,45 @@ const PREVIEW_LINES: [(&str, bool); 3] = [
 ];
 
 // ---------------------------------------------------------------- 状态
+
+/// 设置面板的两页。
+///
+/// # 为什么必须分页（而不是新增一节）
+///
+/// 面板是**一页到底、没有滚动条**的：`MIN_TRACK_H` 就是「整张表刚好放得下」的
+/// 高度。往 `table()` 里加一整节灵动岛设置（约 5 行 + 分组标题）要多 160px，
+/// 面板会长到 820px —— 768 高的屏（可用约 728）直接放不下，最后一行被切掉，
+/// 而且不报错、不崩，只能靠肉眼发现。
+///
+/// 分页把「高度预算」这件事彻底解决：每页各自排，取最高的一页当常量。
+/// 代价是多一次点击才能看到岛的设置，换来的是小屏不会截断。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
+    /// 格言挂件的设置（原来的全部内容）
+    Widget,
+    /// 灵动岛的设置
+    Island,
+}
+
+impl Page {
+    /// 两页，按切换顺序
+    pub const ALL: [Page; 2] = [Page::Widget, Page::Island];
+
+    pub fn other(self) -> Page {
+        match self {
+            Page::Widget => Page::Island,
+            Page::Island => Page::Widget,
+        }
+    }
+
+    /// 切换按钮上的字：写的是「点一下会去哪」，不是「现在在哪」。
+    fn switch_label(self) -> &'static str {
+        match self {
+            Page::Widget => "灵动岛设置 ›",
+            Page::Island => "‹ 挂件设置",
+        }
+    }
+}
 
 /// 一个控件（或一块自己画的内容）在面板里的角色。
 ///
@@ -262,62 +312,85 @@ const fn act(cmd: u32, text: &'static str, span: i32) -> W {
 ///
 /// 顺序 = 屏幕上的顺序（从左到右、从上到下，遇 `sec` 换行）。
 /// 一行放满 6 格就自动折行，所以增减控件不用手动改任何坐标。
-fn table() -> Vec<W> {
+fn table(page: Page) -> Vec<W> {
     use Role::*;
-    vec![
-        // ---- 显示内容
-        sec("显示内容"),
-        chk(MI_CLOCK, "时钟", 2),
-        chk(MI_DATE, "日期", 2),
-        chk(MI_SECONDS, "秒", 2),
-        chk(MI_QUOTE, "格言", 2),
-        chk(MI_SHADOW, "文字阴影", 2),
-        // ---- 窗口与行为
-        sec("窗口与行为"),
-        chk(MI_TOPMOST, "总在最前", 2),
-        chk(MI_AUTOHIDE, "全屏时隐藏", 2),
-        chk(MI_AUTOSTART, "开机自启", 2),
-        chk(MI_LAYOUT, "布局模式（可拖动 / 缩放）", 3),
-        chk(MI_PAUSE, "暂停轮播", 2),
-        chk(MI_FAV_ONLY, "仅播放收藏夹", 3),
-        chk(MI_SHRINK_FIT, "放不下时缩小字号", 3),
-        rad(MI_GLASS, "毛玻璃", 2),
-        rad(MI_TEXT, "纯文字", 2),
-        // ---- 版式
-        sec("版式"),
-        rad(MI_ORIENT_BASE, "横版", 2),
-        rad(MI_ORIENT_BASE + 1, "竖版（卷轴）", 3),
-        // ---- 动效
-        sec("动效"),
-        // 跑马灯占 3 格（比另外两个宽）：竖版下它的文字会变成
-        // 「跑马灯（竖版不支持）」—— 9 个字，2 格（140px）装不下，会顶到隔壁
-        // 「静态」的头上。给宽一点比缩成黑话强。
-        rad(MI_ANIM_BASE, "跑马灯", 3),
-        rad(MI_ANIM_BASE + 1, "静态", 1),
-        rad(MI_ANIM_BASE + 2, "淡入淡出", 2),
-        rad(MI_ANIM_BASE + 3, "呼吸", 2),
-        num(MI_SPEED_DOWN, MI_SPEED_UP, "速度", 4),
-        // ---- 外观
-        sec("外观"),
-        num(MI_SCALE_DOWN, MI_SCALE_UP, "整体字号", 3),
-        num(MI_OP_DOWN, MI_OP_UP, "不透明度", 3),
-        num(MI_CLOCK_DOWN, MI_CLOCK_UP, "时钟字号", 3),
-        num(MI_QUOTE_DOWN, MI_QUOTE_UP, "格言字号", 3),
-        col(MI_COLOR, "文字颜色", 3),
-        col(MI_DATE_COLOR, "日期颜色", 3),
-        col(MI_QUOTE_COLOR, "格言颜色", 3),
-        num(MI_SPACING_DOWN, MI_SPACING_UP, "格言字距", 3),
-        // ---- 操作
-        sec("操作"),
-        act(MI_PREV, "上一条", 2),
-        act(MI_NEXT, "下一条", 2),
-        act(MI_FAV, "收藏当前句", 2),
-        act(MI_CLOCK_RESET, "时钟归位", 2),
-        act(MI_RELOAD, "重载配置 / 格言", 2),
-        act(MI_RESET, "回到右上角", 2),
-        act(MI_TOGGLE, "隐藏 / 显示挂件", 3),
-        W { role: Close, cmd: 0, cmd2: 0, text: "关闭", span: 3 },
-    ]
+    match page {
+        Page::Widget => vec![
+            // ---- 显示内容
+            sec("显示内容"),
+            chk(MI_CLOCK, "时钟", 2),
+            chk(MI_DATE, "日期", 2),
+            chk(MI_SECONDS, "秒", 2),
+            chk(MI_QUOTE, "格言", 2),
+            chk(MI_SHADOW, "文字阴影", 2),
+            // ---- 窗口与行为
+            sec("窗口与行为"),
+            chk(MI_TOPMOST, "总在最前", 2),
+            chk(MI_AUTOHIDE, "全屏时隐藏", 2),
+            chk(MI_AUTOSTART, "开机自启", 2),
+            chk(MI_LAYOUT, "布局模式（可拖动 / 缩放）", 3),
+            chk(MI_PAUSE, "暂停轮播", 2),
+            chk(MI_FAV_ONLY, "仅播放收藏夹", 3),
+            chk(MI_SHRINK_FIT, "放不下时缩小字号", 3),
+            rad(MI_GLASS, "毛玻璃", 2),
+            rad(MI_TEXT, "纯文字", 2),
+            // ---- 版式
+            sec("版式"),
+            rad(MI_ORIENT_BASE, "横版", 2),
+            rad(MI_ORIENT_BASE + 1, "竖版（卷轴）", 3),
+            // ---- 动效
+            sec("动效"),
+            // 跑马灯占 3 格（比另外两个宽）：竖版下它的文字会变成
+            // 「跑马灯（竖版不支持）」—— 9 个字，2 格（140px）装不下，会顶到隔壁
+            // 「静态」的头上。给宽一点比缩成黑话强。
+            rad(MI_ANIM_BASE, "跑马灯", 3),
+            rad(MI_ANIM_BASE + 1, "静态", 1),
+            rad(MI_ANIM_BASE + 2, "淡入淡出", 2),
+            rad(MI_ANIM_BASE + 3, "呼吸", 2),
+            num(MI_SPEED_DOWN, MI_SPEED_UP, "速度", 4),
+            // ---- 外观
+            sec("外观"),
+            num(MI_SCALE_DOWN, MI_SCALE_UP, "整体字号", 3),
+            num(MI_OP_DOWN, MI_OP_UP, "不透明度", 3),
+            num(MI_CLOCK_DOWN, MI_CLOCK_UP, "时钟字号", 3),
+            num(MI_QUOTE_DOWN, MI_QUOTE_UP, "格言字号", 3),
+            col(MI_COLOR, "文字颜色", 3),
+            col(MI_DATE_COLOR, "日期颜色", 3),
+            col(MI_QUOTE_COLOR, "格言颜色", 3),
+            num(MI_SPACING_DOWN, MI_SPACING_UP, "格言字距", 3),
+            // ---- 操作
+            sec("操作"),
+            act(MI_PREV, "上一条", 2),
+            act(MI_NEXT, "下一条", 2),
+            act(MI_FAV, "收藏当前句", 2),
+            act(MI_CLOCK_RESET, "时钟归位", 2),
+            act(MI_RELOAD, "重载配置 / 格言", 2),
+            act(MI_RESET, "回到右上角", 2),
+            act(MI_TOGGLE, "隐藏 / 显示挂件", 3),
+            W { role: Close, cmd: 0, cmd2: 0, text: "关闭", span: 3 },
+        ],
+        Page::Island => vec![
+            sec("灵动岛（与格言并列的独立功能）"),
+            chk(MI_ISLAND, "启用灵动岛", 2),
+            chk(MI_ISLAND_UNREAD, "统计未读", 2),
+            // 归档开关：关掉之后读过的 `.msg` 直接删，未读退回「本次运行累计」
+            chk(MI_ISLAND_KEEP, "保留归档（7 天）", 2),
+            // 六个片段各占 1 格：一行放完，而且**顺序即显示顺序**
+            chk(MI_ISLAND_ITEM_BASE, "时钟", 1),
+            chk(MI_ISLAND_ITEM_BASE + 1, "圆点", 1),
+            chk(MI_ISLAND_ITEM_BASE + 2, "CPU", 1),
+            chk(MI_ISLAND_ITEM_BASE + 3, "内存", 1),
+            chk(MI_ISLAND_ITEM_BASE + 4, "电池", 1),
+            chk(MI_ISLAND_ITEM_BASE + 5, "消息", 1),
+            // 轮播：0 = 不轮播（此时只有装得下的前几项可见）
+            num(MI_ISLAND_ROT_DOWN, MI_ISLAND_ROT_UP, "轮播间隔", 3),
+            num(MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP, "底不透明", 3),
+            col(MI_ISLAND_BODY_COLOR, "胶囊底色", 3),
+            col(MI_ISLAND_ACCENT_COLOR, "强调色", 3),
+            num(MI_ISLAND_W_DOWN, MI_ISLAND_W_UP, "展开宽", 3),
+            num(MI_ISLAND_H_DOWN, MI_ISLAND_H_UP, "展开高", 3),
+        ],
+    }
 }
 
 /// 面板上「点一下会发命令」的全部命令码，按屏幕顺序。
@@ -327,7 +400,7 @@ fn table() -> Vec<W> {
 /// 命令码，`--selftest` 立刻红。
 pub fn table_cmds() -> Vec<u32> {
     let mut out = Vec::new();
-    for w in table() {
+    for w in Page::ALL.iter().flat_map(|p| table(*p)) {
         if !w.role.interactive() {
             continue;
         }
@@ -359,6 +432,10 @@ struct Ctl {
     cmd2: u32,
     text: &'static str,
     rc: RECT,
+    /// 属于哪一页。两页的控件**都建出来**，靠显隐切换 —— 不是销毁重建：
+    /// 重建会让 `ID_SETTINGS_BASE + i` 的 id 与 `ctls` 下标关系在两步之间
+    /// 不一致，而自检正是拿 id 去点的。
+    page: Page,
 }
 
 /// 设置面板的全部状态。挂在 `App` 上（和 `Fonts` / `Frame` 一样），
@@ -394,6 +471,10 @@ pub struct ConfigUi {
     /// 面板当前所在屏的 DPI **百分比**（96 dpi = 100）。所有布局常量按 96 基准写，
     /// `sp()` 是唯一的换算出口。
     dpi: u32,
+    /// 当前显示的是哪一页
+    page: Page,
+    /// 左列那个「切到另一页」的按钮
+    btn_page: HWND,
 }
 
 impl Default for ConfigUi {
@@ -415,6 +496,8 @@ impl Default for ConfigUi {
             frame_brush: null_mut(),
             preview_rc: unsafe { zeroed() },
             dpi: 100,
+            page: Page::Widget,
+            btn_page: null_mut(),
         }
     }
 }
@@ -477,6 +560,7 @@ impl ConfigUi {
         self.bg_brush = null_mut();
         self.frame_brush = null_mut();
         self.hwnd = null_mut();
+        self.btn_page = null_mut();
         self.list = null_mut();
         self.btn_font_default = null_mut();
         self.lbl_font_title = null_mut();
@@ -670,6 +754,18 @@ fn read_bool(a: &App, cmd: u32) -> bool {
         MI_FAV_ONLY => c.fav_only,
         MI_SHRINK_FIT => c.shrink_fit,
         MI_AUTOSTART => crate::autostart::enabled(),
+        // 岛的三个开关：**必须在这里出现**。少了它们的症状是「勾了又弹回未勾」，
+        // 因为 `on_setting_click` 会按 `read_bool` 的结果判断「要不要发命令」，
+        // 读回来的永远是 `false` ⇒ 每点一次都发命令、每画一次都显示未勾。
+        MI_ISLAND => c.island,
+        MI_ISLAND_UNREAD => c.island_unread,
+        MI_ISLAND_KEEP => c.island_events_keep,
+        _ if (MI_ISLAND_ITEM_BASE..MI_ISLAND_ITEM_BASE + 6).contains(&cmd) => {
+            let item = crate::island::content::ALL_ITEMS[(cmd - MI_ISLAND_ITEM_BASE) as usize].1;
+            crate::island::content::Items::parse(&c.island_items)
+                .order
+                .contains(&item)
+        }
         _ => false,
     }
 }
@@ -702,6 +798,17 @@ fn num_text(a: &App, cmd: u32) -> String {
         MI_CLOCK_DOWN | MI_CLOCK_UP => format!("{}%", c.clock_scale),
         MI_QUOTE_DOWN | MI_QUOTE_UP => format!("{}%", c.quote_scale),
         MI_SPACING_DOWN | MI_SPACING_UP => c.letter_spacing.to_string(),
+        // 轮播 0 写「关」而不是「0s」：这一行最容易让人以为「0 秒切一次」
+        MI_ISLAND_ROT_DOWN | MI_ISLAND_ROT_UP => {
+            if c.island_rotate <= 0 {
+                "关".to_string()
+            } else {
+                format!("{}s", c.island_rotate)
+            }
+        }
+        MI_ISLAND_OP_DOWN | MI_ISLAND_OP_UP => c.island_body_alpha.to_string(),
+        MI_ISLAND_W_DOWN | MI_ISLAND_W_UP => format!("{}px", c.island_w),
+        MI_ISLAND_H_DOWN | MI_ISLAND_H_UP => format!("{}px", c.island_h),
         _ => String::new(),
     }
 }
@@ -715,6 +822,8 @@ fn color_info(a: &App, cmd: u32) -> (u32, String) {
         MI_COLOR => (c.color, fmt_color(c.color)),
         MI_DATE_COLOR => (c.date_color, fmt_color(c.date_color)),
         MI_QUOTE_COLOR => (c.quote_paint_color(), config::quote_color_label(c.quote_color)),
+        MI_ISLAND_BODY_COLOR => (c.island_body_color, fmt_color(c.island_body_color)),
+        MI_ISLAND_ACCENT_COLOR => (c.island_accent_color, fmt_color(c.island_accent_color)),
         _ => (0, String::new()),
     }
 }
@@ -758,7 +867,7 @@ fn ctl_enabled(a: &App, c: &Ctl) -> bool {
 /// `_ch` 现在不参与计算：行高是固定的，最小窗口高度（`MIN_TRACK_H`）已经保证
 /// 整张表放得下。留这个参数是为了让签名和 `layout_children` 一致，读代码时不必
 /// 怀疑「高度是不是在别处被用了」。
-fn slots(cw: i32, _ch: i32, k: f32) -> Vec<Slot> {
+fn slots(cw: i32, _ch: i32, k: f32, page: Page) -> Vec<Slot> {
     // 进来先把物理客户区换成**逻辑**尺寸：下面的算式全是 96 dpi 基准的常量。
     let cw = if k > 0.0 {
         (cw as f32 / k).round() as i32
@@ -774,7 +883,7 @@ fn slots(cw: i32, _ch: i32, k: f32) -> Vec<Slot> {
     // 上一段的最后一行上面（画出来的标题和控件叠在一起 —— 打印一遍坐标才看出来）。
     let mut line_used = false;
 
-    for w in table() {
+    for w in table(page) {
         if w.role == Role::Sec {
             if line_used {
                 y += ROW_H;
@@ -876,20 +985,27 @@ fn slots(cw: i32, _ch: i32, k: f32) -> Vec<Slot> {
 unsafe fn layout_children(c: &mut ConfigUi, cw: i32, ch: i32) {
     let k = c.scale();
     // ---- 设置区：表格决定，重新算一遍坐标（控件已在 WM_CREATE 建好）
-    for (i, s) in slots(cw, ch, k).into_iter().enumerate() {
-        let Some(ctl) = c.ctls.get_mut(i) else { break };
-        ctl.rc = s.rc;
-        if ctl.hwnd.is_null() {
-            continue;
+    //
+    // 两页的控件都存在于同一个 `ctls` 里，顺序是「先整页 Widget、再整页 Island」。
+    // 所以这里**按页取各自的槽位**，页内再按顺序配对 —— 不能用全局下标，
+    // 否则第二页的控件会被摆到第一页的坐标上去（隐藏着看不出来，一显形就全乱）。
+    for page in Page::ALL {
+        let mut it = c.ctls.iter_mut().filter(|x| x.page == page);
+        for slot in slots(cw, ch, k, page).into_iter() {
+            let Some(ctl) = it.next() else { break };
+            ctl.rc = slot.rc;
+            if ctl.hwnd.is_null() {
+                continue;
+            }
+            MoveWindow(
+                ctl.hwnd,
+                slot.rc.left,
+                slot.rc.top,
+                (slot.rc.right - slot.rc.left).max(8),
+                (slot.rc.bottom - slot.rc.top).max(8),
+                1,
+            );
         }
-        MoveWindow(
-            ctl.hwnd,
-            s.rc.left,
-            s.rc.top,
-            (s.rc.right - s.rc.left).max(8),
-            (s.rc.bottom - s.rc.top).max(8),
-            1,
-        );
     }
 
     // ---- 左列：标题 → 字体列表 → [恢复默认字体] → 预览
@@ -908,6 +1024,10 @@ unsafe fn layout_children(c: &mut ConfigUi, cw: i32, ch: i32) {
     MoveWindow(c.lbl_preview, c.sp(PAD), lbl_preview_y, c.sp(LIST_W), c.sp(20), 1);
     MoveWindow(c.list, c.sp(PAD), list_top, c.sp(LIST_W), list_h, 1);
     MoveWindow(c.btn_font_default, c.sp(PAD), btn_y, c.sp(BTN_W_FONT_DEFAULT), c.sp(BTN_H), 1);
+    // 切页按钮占左列剩下的宽度：放得下一行中文，也不跟上面那个按钮抢位置
+    let page_x = c.sp(PAD + BTN_W_FONT_DEFAULT + 8);
+    let page_w = (c.sp(PAD + LIST_W) - page_x).max(c.sp(60));
+    MoveWindow(c.btn_page, page_x, btn_y, page_w, c.sp(BTN_H), 1);
 
     c.preview_rc = RECT {
         left: c.sp(PAD),
@@ -1196,36 +1316,54 @@ unsafe fn create_children(a: &mut App, hwnd: HWND) {
         ui,
     );
 
+    // 切页按钮：与「恢复默认字体」同一行（坐标在 `layout_children` 里算）
+    a.config.btn_page = make_child(
+        hwnd,
+        "BUTTON",
+        0,
+        "灵动岛设置 ›",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+        ID_BTN_PAGE,
+        &lb,
+        ui,
+    );
+
     // ---- 设置区：表格说几行就几行，坐标由 `slots()` 算
+    //
+    // **两页都建**（另一页先隐藏）。理由见 `Ctl::page`：销毁重建会让 id 与
+    // `ctls` 下标的关系在两步之间变，而自检是拿 id 点的。
     let k = a.config.scale();
-    for (i, s) in slots(cw, ch, k).iter().enumerate() {
-        let id = ID_SETTINGS_BASE + i as i32;
-        let (class, style) = match s.role {
-            Role::Check => ("BUTTON", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32),
-            Role::Radio => ("BUTTON", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON as u32),
-            Role::NumDown | Role::NumUp | Role::ColorNext | Role::Menu => {
-                ("BUTTON", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32)
-            }
-            Role::Close => ("BUTTON", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON as u32),
-            Role::NumVal | Role::ColorName => ("STATIC", WS_CHILD | WS_VISIBLE | SS_CENTER),
-            Role::Label => ("STATIC", WS_CHILD | WS_VISIBLE),
-            // 分组标题和色块没有控件，自己在 `paint` 里画
-            Role::Sec | Role::ColorSwatch => ("", 0),
-        };
-        let hwnd_ctl = if class.is_empty() {
-            null_mut()
-        } else {
-            make_child(hwnd, class, 0, s.text, style, id, &s.rc, ui)
-        };
-        a.config.ctls.push(Ctl {
-            id,
-            hwnd: hwnd_ctl,
-            role: s.role,
-            cmd: s.cmd,
-            cmd2: s.cmd2,
-            text: s.text,
-            rc: s.rc,
-        });
+    for page in Page::ALL {
+        for slot in slots(cw, ch, k, page) {
+            let id = ID_SETTINGS_BASE + a.config.ctls.len() as i32;
+            let (class, style) = match slot.role {
+                Role::Check => ("BUTTON", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32),
+                Role::Radio => ("BUTTON", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON as u32),
+                Role::NumDown | Role::NumUp | Role::ColorNext | Role::Menu => {
+                    ("BUTTON", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32)
+                }
+                Role::Close => ("BUTTON", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON as u32),
+                Role::NumVal | Role::ColorName => ("STATIC", WS_CHILD | WS_VISIBLE | SS_CENTER),
+                Role::Label => ("STATIC", WS_CHILD | WS_VISIBLE),
+                // 分组标题和色块没有控件，自己在 `paint` 里画
+                Role::Sec | Role::ColorSwatch => ("", 0),
+            };
+            let hwnd_ctl = if class.is_empty() {
+                null_mut()
+            } else {
+                make_child(hwnd, class, 0, slot.text, style, id, &slot.rc, ui)
+            };
+            a.config.ctls.push(Ctl {
+                id,
+                hwnd: hwnd_ctl,
+                role: slot.role,
+                cmd: slot.cmd,
+                cmd2: slot.cmd2,
+                text: slot.text,
+                rc: slot.rc,
+                page,
+            });
+        }
     }
 
     // ---- 灌字体列表
@@ -1250,10 +1388,35 @@ unsafe fn create_children(a: &mut App, hwnd: HWND) {
 /// **任何一次改动之后都要调它**。控件不自己记状态，全部从 `cfg` 回读 ——
 /// 于是「改了 A 顺带把 B 也改了」这种情况（比如切竖版把跑马灯降级）在面板上
 /// 一定看得见，不会出现界面和实际不一致。
+/// 按 `c.page` 决定哪些控件可见，并更新切页按钮上的字。
+///
+/// 两页的控件是**同时存在**的，切页只是换一副面孔（`ShowWindow`）。
+/// 分组标题与色块是自绘的，它们没有控件，靠整窗 `InvalidateRect` 换 —— 所以
+/// 切页之后必须重画，否则上一页的标题会留在屏幕上。
+fn apply_page(c: &mut ConfigUi) {
+    if c.hwnd.is_null() {
+        return;
+    }
+    let page = c.page;
+    unsafe {
+        for ctl in &c.ctls {
+            if ctl.hwnd.is_null() {
+                continue;
+            }
+            ShowWindow(ctl.hwnd, if ctl.page == page { SW_SHOW } else { SW_HIDE });
+        }
+        if !c.btn_page.is_null() {
+            let t = wide(page.switch_label());
+            SetWindowTextW(c.btn_page, t.as_ptr());
+        }
+    }
+}
+
 fn sync_panel(a: &mut App) {
     if !a.config.is_open() {
         return;
     }
+    apply_page(&mut a.config);
     let face = a.font_face().to_string();
     if let Some(i) = a.config.items.iter().position(|f| f.eq_ignore_ascii_case(&face)) {
         unsafe { SendMessageW(a.config.list, LB_SETCURSEL, i, 0) };
@@ -1346,6 +1509,48 @@ pub fn interactive_cmds(a: &App) -> Vec<u32> {
         .filter(|c| c.role.interactive() && c.cmd != 0)
         .map(|c| c.cmd)
         .collect()
+}
+
+/// **仅供自检**：切到另一页，走的与点鼠标**完全相同**的那条路
+/// （`WM_COMMAND` + `ID_BTN_PAGE`，而不是直接改 `page` 字段）。
+pub fn test_page_switch(a: &mut App) {
+    unsafe {
+        if a.config.hwnd.is_null() {
+            return;
+        }
+        let wp = ((BN_CLICKED as usize) << 16) | (ID_BTN_PAGE as usize);
+        SendMessageW(a.config.hwnd, WM_COMMAND, wp, 0);
+    }
+}
+
+/// **仅供自检**：当前**可见**的设置控件个数（`IsWindowVisible`，不是自建标记）。
+///
+/// 分页的全部保证就是「两页的控件都建出来了，但同时只有一页可见」。用系统的
+/// 可见性而不是自己记一个 `page` 字段：自建标记和 `ShowWindow` 可以各走一路，
+/// 而这两路一旦分叉，症状是「点了切页，界面没变」。
+pub fn visible_ctl_count(a: &App) -> usize {
+    a.config
+        .ctls
+        .iter()
+        .filter(|c| !c.hwnd.is_null() && unsafe { IsWindowVisible(c.hwnd) } != 0)
+        .count()
+}
+
+/// **仅供自检**：真正建出来的控件（有窗口句柄的那些）总数。
+///
+/// 与 `visible_ctl_count` 配对用来断言「两页恰好把控件分完」：
+/// 可见数之和 == 有句柄的控件数，说明**没有控件落在两页之外**、也没有
+/// 同一控件在两页里各算一次。
+pub fn windowed_ctl_count(a: &App) -> usize {
+    a.config.ctls.iter().filter(|c| !c.hwnd.is_null()).count()
+}
+
+/// **仅供自检**：当前页的页号（0 = 挂件页，1 = 灵动岛页）。
+pub fn current_page(a: &App) -> u8 {
+    match a.config.page {
+        Page::Widget => 0,
+        Page::Island => 1,
+    }
 }
 
 /// **仅供自检**：点一下「命令码为 `cmd` 的那个控件」。
@@ -1587,7 +1792,7 @@ pub fn is_num_down(a: &App, cmd: u32) -> bool {
 /// 从**表格**里查而不是从控件里查：数值行的 `−` / `+` 两个控件自己的文字就是
 /// 「−」「+」，拿它拼错误信息等于没说是什么控件坏了。
 pub fn cmd_label(cmd: u32) -> String {
-    for w in table() {
+    for w in Page::ALL.iter().flat_map(|p| table(*p)) {
         if w.cmd == cmd || w.cmd2 == cmd {
             return w.text.to_string();
         }
@@ -1615,8 +1820,19 @@ pub fn swatch_rect(a: &App, cmd: u32) -> Option<RECT> {
 /// 不会报错、不崩、probe 也过，只能靠肉眼看出来。
 /// 把需求高度算出来交给断言，加行的人就会被逼着同步常量。
 pub fn plan_min_height() -> i32 {
-    let all = slots(MIN_TRACK_W, MIN_TRACK_H, 1.0);
-    PAD + all.iter().map(|s| s.rc.bottom).max().unwrap_or(0)
+    // **两页取最高**：分页的意义就是各自排、按最高的那页定窗口高度。
+    // 只看当前页的话，切到页 B 才会发现最后一行被切掉。
+    Page::ALL
+        .iter()
+        .map(|p| {
+            PAD + slots(MIN_TRACK_W, MIN_TRACK_H, 1.0, *p)
+                .iter()
+                .map(|s| s.rc.bottom)
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// **仅供自检**：当前最小窗口高度比需求高多少（负数 = 排不下）。
@@ -1638,14 +1854,26 @@ pub fn min_track_h() -> i32 {
 pub fn plan_rects_at(k: f32) -> Vec<RECT> {
     let cw = (MIN_TRACK_W as f32 * k).round() as i32;
     let ch = (MIN_TRACK_H as f32 * k).round() as i32;
-    slots(cw, ch, k).into_iter().map(|s| s.rc).collect()
+    slots(cw, ch, k, Page::Widget).into_iter().map(|s| s.rc).collect()
 }
 
 /// **仅供自检**：按给定 UI 倍率排完之后，客户区至少需要多高（物理像素）。
 pub fn plan_need_height_at(k: f32) -> i32 {
-    let rc = plan_rects_at(k);
-    let bottom = rc.iter().map(|r| r.bottom).max().unwrap_or(0);
-    bottom + (PAD as f32 * k).round() as i32
+    // 两页都排，取更高的一页（与 `plan_min_height` 同一口径）
+    let cw = (MIN_TRACK_W as f32 * k).round() as i32;
+    let ch = (MIN_TRACK_H as f32 * k).round() as i32;
+    Page::ALL
+        .iter()
+        .map(|p| {
+            let bottom = slots(cw, ch, k, *p)
+                .iter()
+                .map(|s| s.rc.bottom)
+                .max()
+                .unwrap_or(0);
+            bottom + (PAD as f32 * k).round() as i32
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// **仅供自检**：布局里有没有两格**矩形交叠**。
@@ -1656,7 +1884,13 @@ pub fn plan_need_height_at(k: f32) -> i32 {
 /// （写这条断言之前，上面那个 bug 是靠手动打印坐标才发现的。教训：能自动查的
 /// 事情不要靠眼睛。）
 pub fn plan_overlaps() -> Option<String> {
-    overlaps_in(&slots(CLIENT_W, CLIENT_H, 1.0))
+    // 逐页查。跨页的矩形**必然**重叠（两页都从同一个 y 起排），那不是缺陷。
+    for p in Page::ALL {
+        if let Some(m) = overlaps_in(&slots(CLIENT_W, CLIENT_H, 1.0, p)) {
+            return Some(m);
+        }
+    }
+    None
 }
 
 /// **仅供自检**：按给定 UI 倍率检查矩形交叠。
@@ -1667,7 +1901,12 @@ pub fn plan_overlaps() -> Option<String> {
 pub fn plan_overlaps_at(k: f32) -> Option<String> {
     let cw = (MIN_TRACK_W as f32 * k).round() as i32;
     let ch = (MIN_TRACK_H as f32 * k).round() as i32;
-    overlaps_in(&slots(cw, ch, k))
+    for p in Page::ALL {
+        if let Some(m) = overlaps_in(&slots(cw, ch, k, p)) {
+            return Some(m);
+        }
+    }
+    None
 }
 
 fn overlaps_in(all: &[Slot]) -> Option<String> {
@@ -1867,7 +2106,11 @@ unsafe fn paint(a: &mut App, hwnd: HWND) {
 
     // 设置区里只有两种东西需要自己画：分组标题和颜色色块。
     // 其余文字（标签 / 值 / 色号）都是真控件 —— 由系统按主题画，不用管。
-    for c in &app.config.ctls {
+    //
+    // **必须按页过滤**：这两类没有窗口句柄，`ShowWindow` 管不到它们。
+    // 不过滤的症状是「切到灵动岛页，底下还留着版式 / 动效 / 外观 / 操作
+    // 四个标题和一堆色块」—— 自绘的东西只能靠这里不画。
+    for c in app.config.ctls.iter().filter(|c| c.page == app.config.page) {
         match c.role {
             Role::Sec => {
                 let old_f = SelectObject(dc, app.config.bold_font as HGDIOBJ);
@@ -2100,6 +2343,11 @@ unsafe fn config_proc_inner(
                         InvalidateRect(hwnd, &a.config.preview_rc, 1);
                     }
                 }
+            } else if id == ID_BTN_PAGE && code == BN_CLICKED {
+                a.config.page = a.config.page.other();
+                apply_page(&mut a.config);
+                // 分组标题是自绘的（`paint` 里按当前页的槽位画），必须整窗重画
+                InvalidateRect(hwnd, null(), 1);
             } else if id == ID_BTN_FONT_DEFAULT && code == BN_CLICKED {
                 let face = FONT_PRESETS[0].to_string();
                 a.set_font(&face);
@@ -2130,3 +2378,4 @@ unsafe fn config_proc_inner(
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
+

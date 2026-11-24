@@ -60,6 +60,27 @@ fn cycle_u32(list: &[u32], cur: u32) -> u32 {
     list[(i.wrapping_add(1)) % list.len()]
 }
 
+/// 灵动岛底色预设。**全是深色**：岛压在壁纸上，浅底配亮字会糊成一片。
+/// 最后一档给白色 —— 有人用亮色壁纸，深色胶囊反而看不清边界。
+pub const ISLAND_BODY_PRESETS: [u32; 6] = [
+    0x0B_0D12, // 近黑（默认）
+    0x1C_1F26, // 深灰蓝
+    0x00_0000, // 纯黑
+    0x12_161F, // 墨蓝
+    0x2B_2B2B, // 近黑灰
+    0xFF_FFFF, // 白
+];
+
+pub fn next_island_body_color(cur: u32) -> u32 {
+    cycle_u32(&ISLAND_BODY_PRESETS, cur)
+}
+
+/// 强调色复用文字色那一组预设（蓝/青/粉/绿/橙…），它们是给「一行字」用的，
+/// 正是消息行的用法。
+pub fn next_island_accent_color(cur: u32) -> u32 {
+    cycle_u32(&COLOR_PRESETS, cur)
+}
+
 pub fn next_color(cur: u32) -> u32 {
     cycle_u32(&COLOR_PRESETS, cur)
 }
@@ -346,6 +367,39 @@ pub struct Config {
     /// 旧版配置没有 `dpi=` 键，不能拿 100 当真相去乘。首次加载时按
     /// 「尺寸已经是当前屏的物理值」迁移一次，不再缩放。
     pub dpi_known: bool,
+
+    // ---- 灵动岛（与格言**并列的独立功能**，见 `src/island/`）
+    //
+    // 这些键与上面那批**没有任何语义重叠**：岛不写 `w/h/x/y`，也不读
+    // `visible` / `orient` / `anim`。两个功能各自开关、各自记住自己的状态。
+    /// 总开关。`false` 时**不创建岛窗口**（`--selftest` 用 `FindWindowW` 验）。
+    pub island: bool,
+    /// 上次端点：`false` = 收起，`true` = 展开
+    pub island_state: bool,
+    /// 收起态片段顺序，csv（`clock,dot,cpu,mem,battery,msg`）
+    pub island_items: String,
+    /// 收起态轮播间隔（秒），0 = 不轮播
+    pub island_rotate: i32,
+    /// 展开端点（**逻辑**像素，运行时乘 DPI）
+    pub island_w: i32,
+    pub island_h: i32,
+    /// 胶囊底色 `0x00RRGGBB`
+    pub island_body_color: u32,
+    /// 胶囊底不透明度 0..=255（再乘 `opacity`）
+    pub island_body_alpha: i32,
+    /// 消息行强调色
+    pub island_accent_color: u32,
+    /// 悬停进入延时（ms）
+    pub island_hover_ms: i32,
+    /// 移开宽限（ms）。**明显长于** `island_hover_ms`：防手抖、防闪回
+    pub island_leave_ms: i32,
+    /// 上次所在屏左上角 `x,y`（多屏识别；空 = 主屏）
+    pub island_screen: String,
+    /// 是否统计未读数（关掉时只显示最近一条，不显示计数）
+    pub island_unread: bool,
+    /// 事件归档：`true` = 读过的 `.msg` 移进 `events\seen\` 留 7 天；
+    /// `false` = 读完即删（也就没有历史可数，未读退回进程内累计）
+    pub island_events_keep: bool,
 }
 
 impl Default for Config {
@@ -393,6 +447,22 @@ impl Default for Config {
             dpi_auto: false,
             dpi: 100,
             dpi_known: false,
+            // 岛默认**关**：新增一个常驻窗口属于强默认，老用户升级不该
+            // 「屏幕上多出一条东西」。首次在设置面板里引导。
+            island: false,
+            island_state: false,
+            island_items: "clock,dot".to_string(),
+            island_rotate: 0,
+            island_w: 420,
+            island_h: 136,
+            island_body_color: 0x0B0D12,
+            island_body_alpha: 220,
+            island_accent_color: 0x4C9AFF,
+            island_hover_ms: crate::island::geom::HOVER_IN_MS as i32,
+            island_leave_ms: crate::island::geom::LEAVE_GRACE_MS as i32,
+            island_screen: String::new(),
+            island_unread: true,
+            island_events_keep: true,
         }
     }
 }
@@ -616,7 +686,23 @@ impl Config {
              h_w={}\n\
              h_h={}\n\
              v_w={}\n\
-             v_h={}\n",
+             v_h={}\n\
+             # ---- 灵动岛（与格言并列的独立功能；关掉时不创建窗口）\n\
+             # island_items 为逗号分隔的片段顺序：clock,dot,cpu,mem,battery,msg\n\
+             island={}\n\
+             island_state={}\n\
+             island_items={}\n\
+             island_rotate={}\n\
+             island_w={}\n\
+             island_h={}\n\
+             island_body_color={}\n\
+             island_body_alpha={}\n\
+             island_accent_color={}\n\
+             island_hover_ms={}\n\
+             island_leave_ms={}\n\
+             island_screen={}\n\
+             island_unread={}\n\
+             island_events_keep={}\n",
             self.x,
             self.y,
             self.w,
@@ -660,6 +746,20 @@ impl Config {
             self.h_h,
             self.v_w,
             self.v_h,
+            self.island,
+            self.island_state,
+            self.island_items,
+            self.island_rotate,
+            self.island_w,
+            self.island_h,
+            fmt_color(self.island_body_color),
+            self.island_body_alpha,
+            fmt_color(self.island_accent_color),
+            self.island_hover_ms,
+            self.island_leave_ms,
+            self.island_screen,
+            self.island_unread,
+            self.island_events_keep,
         );
         match write_atomic(&Self::path(), text.as_bytes()) {
             Ok(()) => LAST_SAVE_ERR.store(0, Ordering::Relaxed),
@@ -781,6 +881,48 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
         "h_h" => cfg.h_h = v.parse().unwrap_or(cfg.h_h).clamp(80, 2000),
         "v_w" => cfg.v_w = v.parse().unwrap_or(cfg.v_w).clamp(240, 4000),
         "v_h" => cfg.v_h = v.parse().unwrap_or(cfg.v_h).clamp(80, 2000),
+
+        // ---- 灵动岛。未知片段名由 `Items::parse` 静默忽略（向前兼容）。
+        "island" => cfg.island = parse_bool(v, cfg.island),
+        "island_state" => cfg.island_state = parse_bool(v, cfg.island_state),
+        "island_items" => {
+            let items = crate::island::content::Items::parse(v);
+            // 规范形式写回：空集合会回落到 `clock`，避免出现「一条空胶囊」
+            cfg.island_items = items.to_csv();
+        }
+        "island_rotate" => cfg.island_rotate = v.parse().unwrap_or(cfg.island_rotate).clamp(0, 600),
+        "island_w" => cfg.island_w = v.parse().unwrap_or(cfg.island_w).clamp(120, 2000),
+        "island_h" => cfg.island_h = v.parse().unwrap_or(cfg.island_h).clamp(48, 900),
+        "island_body_color" => {
+            if let Some(c) = parse_color(v) {
+                cfg.island_body_color = c;
+            }
+        }
+        "island_body_alpha" => {
+            cfg.island_body_alpha = v.parse().unwrap_or(cfg.island_body_alpha).clamp(0, 255)
+        }
+        "island_accent_color" => {
+            if let Some(c) = parse_color(v) {
+                cfg.island_accent_color = c;
+            }
+        }
+        "island_hover_ms" => cfg.island_hover_ms = v.parse().unwrap_or(cfg.island_hover_ms).clamp(20, 5000),
+        "island_leave_ms" => cfg.island_leave_ms = v.parse().unwrap_or(cfg.island_leave_ms).clamp(20, 10000),
+        "island_screen" => {
+            // 只接受 `x,y` 形式，其余（含空串）一律按主屏处理
+            let ok = v.split_once(',').map(|(a, b)| {
+                a.trim().parse::<i32>().is_ok() && b.trim().parse::<i32>().is_ok()
+            });
+            if ok == Some(true) {
+                cfg.island_screen = v.trim().to_string();
+            } else {
+                cfg.island_screen.clear();
+            }
+        }
+        "island_unread" => cfg.island_unread = parse_bool(v, cfg.island_unread),
+        "island_events_keep" => {
+            cfg.island_events_keep = parse_bool(v, cfg.island_events_keep)
+        }
         _ => {}
     }
 }

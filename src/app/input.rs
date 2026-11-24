@@ -14,7 +14,7 @@ use windows_sys::Win32::Graphics::Gdi::{BeginPaint, CreateSolidBrush, DeleteObje
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HCURSOR, KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu};
-use crate::{autostart, clipboard, favorites};
+use crate::{autostart, clipboard, favorites, island};
 use crate::config::{self, Anim, Config, Mode, Orient};
 use crate::config_ui;
 use crate::consts::*;
@@ -365,6 +365,15 @@ fn show_menu(a: &mut App) {
         }
 
         menu_add(menu, MI_TOGGLE, "显示 / 隐藏  (Ctrl+Alt+H)", a.cfg.visible, true);
+        // 灵动岛是**另一个功能**，不是格言的一种形态 —— 所以它是独立一项，
+        // 与「显示/隐藏格言」并列，勾选态读它自己的开关。
+        menu_add(
+            menu,
+            MI_ISLAND,
+            "显示灵动岛（屏幕顶部胶囊）",
+            a.cfg.island,
+            true,
+        );
         // 设置面板是**全部配置的唯一入口**：菜单里不再重复任何设置项。
         // 旧版五个子菜单（版式 / 显示内容 / 外观 / 动效 / 各项微调）与面板
         // 逐项重复，两处各画一份状态纯属维护税；菜单只留高频操作。
@@ -446,12 +455,58 @@ fn show_menu(a: &mut App) {
     }
 }
 
+/// 片段开关：`island_items` 的增删。
+///
+/// # 为什么要「插回原来的邻里位置」而不是简单追加
+///
+/// `island_items` 的 csv 顺序**就是显示顺序**。若一律追加到末尾，
+/// 「关掉时钟再打开」会把它排到最后 —— 界面上是「时间跑到最右边去了」，
+/// 而用户只是想把它开回来。自检也要求「再点一下必须回到原值」，追加会让
+/// csv 从 `clock,dot` 变成 `dot,clock`，往返断言直接红。
+///
+/// 规则：找它**规范顺序里的前一个**已存在片段，插在它后面；没有前驱就插在
+/// **后一个**已存在片段前面；都没有（空集合）就追加。于是对任何「邻里关系
+/// 没被手工打乱」的集合都是精确往返。
+fn toggle_item(a: &mut App, item: crate::island::content::Item) {
+    use crate::island::content::ALL_ITEMS;
+    let mut items = crate::island::content::Items::parse(&a.cfg.island_items);
+    if items.order.contains(&item) {
+        items.order.retain(|x| *x != item);
+        // 关光会回落到 `clock`（`Items::parse` 的空集合兜底）：界面上的表现是
+        // 「最后一项关不掉」。这是有意的 —— 一条什么都没有的胶囊不是功能。
+        a.cfg.island_items = crate::island::content::Items::parse(&items.to_csv()).to_csv();
+    } else {
+        let canon = |it: crate::island::content::Item| -> usize {
+            ALL_ITEMS.iter().position(|(_, x)| *x == it).unwrap_or(0)
+        };
+        let me = canon(item);
+        let pos = items
+            .order
+            .iter()
+            .rposition(|x| canon(*x) < me)
+            .map(|i| i + 1)
+            .or_else(|| items.order.iter().position(|x| canon(*x) > me))
+            .unwrap_or(items.order.len());
+        items.order.insert(pos, item);
+        a.cfg.island_items = crate::island::content::Items::parse(&items.to_csv()).to_csv();
+    }
+    a.island.items = crate::island::content::Items::parse(&a.cfg.island_items);
+    a.island.compact_w = 0; // 内容变了，宽度要重新度量
+    a.island.dirty = true;
+    a.cfg.save();
+}
+
 /// 执行一条菜单命令。
 ///
 /// **托盘菜单和设置面板共用这一条路**（面板从 `config_ui` 里调它）：菜单项和面板
 /// 控件都只是「发命令的界面」，语义只在这里定义一次。新增一个可改的配置项时，
 /// 加一条 `MI_*` + 一个 `match` 分支，面板和菜单就同时支持了。
 pub(crate) fn on_menu(a: &mut App, cmd: u32) {
+    if (MI_ISLAND_ITEM_BASE..MI_ISLAND_ITEM_BASE + 6).contains(&cmd) {
+        let item = crate::island::content::ALL_ITEMS[(cmd - MI_ISLAND_ITEM_BASE) as usize].1;
+        toggle_item(a, item);
+        return;
+    }
     match cmd {
         MI_TOGGLE => set_visible(a, !a.cfg.visible),
         MI_GLASS => {
@@ -595,6 +650,73 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
             render_and_present(a);
         }
         MI_CONFIG => config_ui::open(a),
+        // ---- 灵动岛。**单写路径**：赋值、落地、落盘三件事都在这里，
+        //      设置面板只发命令码，自己不碰 `cfg`。
+        MI_ISLAND => {
+            a.cfg.island = !a.cfg.island;
+            island::apply_enabled(a);
+            a.cfg.save();
+        }
+        MI_ISLAND_UNREAD => {
+            a.cfg.island_unread = !a.cfg.island_unread;
+            a.island.dirty = true;
+            a.cfg.save();
+        }
+        MI_ISLAND_COLLAPSE => {
+            a.cfg.island_state = false;
+            island::collapse(a);
+            a.cfg.save();
+        }
+        MI_ISLAND_EXPAND => {
+            a.cfg.island_state = true;
+            island::expand(a);
+            a.cfg.save();
+        }
+        // ---- 灵动岛设置页（只从设置面板来）
+        //
+        // 每一条都做三件事：改 `cfg` 的**一个**字段、让岛重画、`save()`。
+        // 「单一写路径」在这里的体现是：面板只管发命令码，不知道任何字段名。
+        MI_ISLAND_KEEP => {
+            a.cfg.island_events_keep = !a.cfg.island_events_keep;
+            a.cfg.save();
+        }
+        MI_ISLAND_ROT_DOWN | MI_ISLAND_ROT_UP => {
+            let d = if cmd == MI_ISLAND_ROT_UP { 5 } else { -5 };
+            a.cfg.island_rotate = (a.cfg.island_rotate + d).clamp(0, 600);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
+        MI_ISLAND_OP_DOWN | MI_ISLAND_OP_UP => {
+            let d = if cmd == MI_ISLAND_OP_UP { 8 } else { -8 };
+            a.cfg.island_body_alpha = (a.cfg.island_body_alpha + d).clamp(0, 255);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
+        MI_ISLAND_W_DOWN | MI_ISLAND_W_UP => {
+            let d = if cmd == MI_ISLAND_W_UP { 20 } else { -20 };
+            a.cfg.island_w = (a.cfg.island_w + d).clamp(120, 2000);
+            island::recompute(a);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
+        MI_ISLAND_H_DOWN | MI_ISLAND_H_UP => {
+            let d = if cmd == MI_ISLAND_H_UP { 16 } else { -16 };
+            a.cfg.island_h = (a.cfg.island_h + d).clamp(48, 900);
+            island::recompute(a);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
+        MI_ISLAND_BODY_COLOR => {
+            a.cfg.island_body_color = config::next_island_body_color(a.cfg.island_body_color);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
+        MI_ISLAND_ACCENT_COLOR => {
+            a.cfg.island_accent_color =
+                config::next_island_accent_color(a.cfg.island_accent_color);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
         MI_FONT => {
             a.cfg.font = config::next_font(&a.cfg.font);
             a.rebuild_fonts();
