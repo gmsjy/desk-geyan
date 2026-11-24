@@ -683,10 +683,9 @@ pub(crate) fn selftest() -> i32 {
                 col_ok = false; // 中列瓦片必须无缝相接
             }
         }
-        // 首列右缘贴「居中后的」版心右缘：U5 之后 frame_layout 可能把 br 左移
-        // 一个居中偏移，偏移量读内核缓存（v_center），不自己再推一遍。
-        let (_, v_off) = a.v_center.get();
-        if ncol >= 1 && ql.col_x[0].1 != band.2 - v_off {
+        // 首列右缘贴版心右缘。列瓦片始终按**版心**切分，居中只挪字形在瓦片内的
+        // 位置（`Align::Center` 的 inset），所以这里仍应精确等于 `band.2`。
+        if ncol >= 1 && ql.col_x[0].1 != band.2 {
             col_ok = false; // 首列右缘贴版心右缘
         }
         rows.push((
@@ -698,7 +697,7 @@ pub(crate) fn selftest() -> i32 {
                 ql.glyphs.len(),
                 ql.col_x.first().map(|t| t.0).unwrap_or(-1),
                 ql.col_x.last().map(|t| t.1).unwrap_or(-1),
-                band.2 - v_off
+                band.2
             ),
         ));
 

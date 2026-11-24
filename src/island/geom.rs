@@ -53,8 +53,8 @@ pub const ANCHOR_MARGIN_Y: i32 = 8;
 pub const EXPANDED_W: i32 = 420;
 pub const EXPANDED_H: i32 = 136;
 /// 展开态**内容需求下限**（逻辑像素）。三行内容的 y 是固定常量
-/// （见 `layout::expanded`）：消息行 y=96 + 13px 文字行高（ worst case ≈18）
-/// + 底部内边距 16 ≈ 130，向上取 132。低于它消息行会被窗口底边裁掉 ——
+/// （见 `layout::expanded`）：消息行 y=96 加 13px 文字行高（ worst case ≈18）
+/// 再加底部内边距 16 ≈ 130，向上取 132。低于它消息行会被窗口底边裁掉 ——
 /// `island_h` 的夹取（config 加载 / on_menu）与面板「−」置灰共用这一个值。
 pub const EXPAND_MIN_H: i32 = 132;
 

@@ -80,7 +80,7 @@ unsafe fn load() -> Option<Api> {
         ($name:literal, $ty:ty) => {{
             let p = GetProcAddress(h, concat!($name, "\0").as_ptr());
             let p = p?;
-            std::mem::transmute::<_, $ty>(p)
+            std::mem::transmute::<*const (), $ty>(p as *const ())
         }};
     }
     Some(Api {
@@ -458,17 +458,17 @@ pub mod media {
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows_sys::core::GUID;
 
-    /// `HSTRING` 是 WinRT 的字符串句柄。`windows-sys` 0.59 **没有**
+    /// `HString` 是 WinRT 的字符串句柄。`windows-sys` 0.59 **没有**
     /// `Win32_System_WinRT` feature（只有 `Win32_System_Com`），所以这里
     /// 自己声明一遍 —— 它就是个不透明指针。
-    type HSTRING = *mut c_void;
+    type HString = *mut c_void;
 
     type RoInitializeFn = unsafe extern "system" fn(i32) -> i32;
     type RoGetActivationFactoryFn =
-        unsafe extern "system" fn(HSTRING, *const GUID, *mut *mut c_void) -> i32;
-    type WindowsCreateStringFn = unsafe extern "system" fn(*const u16, u32, *mut HSTRING) -> i32;
-    type WindowsDeleteStringFn = unsafe extern "system" fn(HSTRING) -> i32;
-    type WindowsGetStringRawBufferFn = unsafe extern "system" fn(HSTRING, *mut u32) -> *const u16;
+        unsafe extern "system" fn(HString, *const GUID, *mut *mut c_void) -> i32;
+    type WindowsCreateStringFn = unsafe extern "system" fn(*const u16, u32, *mut HString) -> i32;
+    type WindowsDeleteStringFn = unsafe extern "system" fn(HString) -> i32;
+    type WindowsGetStringRawBufferFn = unsafe extern "system" fn(HString, *mut u32) -> *const u16;
 
     /// `RO_INIT_MULTITHREADED`
     const RO_INIT_MULTITHREADED: i32 = 1;
@@ -502,7 +502,7 @@ pub mod media {
                 ($n:literal, $t:ty) => {{
                     let p = GetProcAddress(h, concat!($n, "\0").as_ptr());
                     let p = p?;
-                    std::mem::transmute::<_, $t>(p)
+                    std::mem::transmute::<*const (), $t>(p as *const ())
                 }};
             }
             Some(WinRt {
@@ -579,7 +579,7 @@ pub mod media {
     }
 
     type FnGet = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32;
-    type FnGetStr = unsafe extern "system" fn(*mut c_void, *mut HSTRING) -> i32;
+    type FnGetStr = unsafe extern "system" fn(*mut c_void, *mut HString) -> i32;
     type FnQI = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32;
 
     /// 引用计数包装，离开作用域即 `Release`。
@@ -599,7 +599,7 @@ pub mod media {
         }
     }
 
-    struct HStr(HSTRING);
+    struct HStr(HString);
     impl Drop for HStr {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -623,13 +623,13 @@ pub mod media {
     unsafe fn hstring(s: &str) -> Option<HStr> {
         let a = api()?;
         let wide: Vec<u16> = s.encode_utf16().collect();
-        let mut h: HSTRING = null_mut();
+        let mut h: HString = null_mut();
         let hr = (a.create_string)(wide.as_ptr(), wide.len() as u32, &mut h);
         (hr >= 0 && !h.is_null()).then(|| HStr(h))
     }
 
     /// 读出内容**并释放**（调用点无一例外都是「取完就不要」）。
-    unsafe fn hstring_value(h: HSTRING) -> String {
+    unsafe fn hstring_value(h: HString) -> String {
         if h.is_null() {
             return String::new();
         }
@@ -728,7 +728,7 @@ pub mod media {
         let sess = Com(sess);
 
         // get_SourceAppUserModelId (Session vtable[6])
-        let mut h: HSTRING = null_mut();
+        let mut h: HString = null_mut();
         let f: FnGetStr = vt(sess.0, 6);
         let app = if f(sess.0, &mut h) >= 0 {
             hstring_value(h)
@@ -768,7 +768,7 @@ pub mod media {
         let props = Com(props);
 
         let title = {
-            let mut h: HSTRING = null_mut();
+            let mut h: HString = null_mut();
             let f: FnGetStr = vt(props.0, 6);
             if f(props.0, &mut h) >= 0 {
                 hstring_value(h)
@@ -777,7 +777,7 @@ pub mod media {
             }
         };
         let artist = {
-            let mut h: HSTRING = null_mut();
+            let mut h: HString = null_mut();
             let f: FnGetStr = vt(props.0, 9);
             if f(props.0, &mut h) >= 0 {
                 hstring_value(h)

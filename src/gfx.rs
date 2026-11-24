@@ -738,6 +738,7 @@ impl Frame {
     /// 1. 无墨、无底、无阴影 ⇒ 跳过（占九成像素）；
     /// 2. 无墨、`cov == 255`、无阴影 ⇒ 一次赋值写预乘底；
     /// 3. 其余（文字 / 边缘 1px）走完整的三层 over。
+    #[allow(clippy::too_many_arguments)] // 合成一趟要的输入本来就多，打包成结构体只是换个地方列
     pub fn compose_ex(
         &mut self,
         opacity: u8,

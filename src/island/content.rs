@@ -553,7 +553,7 @@ impl Samples {
         // 重得多，所以**两秒一采**。换歌是秒级事件，两秒的延迟看不出来，
         // 而 1Hz 采样的成本会占掉 `tick` 预算的一截。
         if items.media && opts.media {
-            if stamp % 2 == 0 {
+            if stamp.is_multiple_of(2) {
                 self.media = crate::island::feed::media::current().map(|m| m.line());
             }
         } else {

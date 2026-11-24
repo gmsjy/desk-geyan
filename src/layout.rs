@@ -397,6 +397,7 @@ pub fn layout_with_attr(
 ///
 /// `attr_from`（横版出处分界）与 `align`（竖版摆法）是两条正交的轴：
 /// 前者只在横版被 `layout_h` 读，后者只在竖版被 `layout_v` 读。
+#[allow(clippy::too_many_arguments)] // 七轴排版接口，拆结构体反而让调用点更难读
 pub fn layout_ex(
     chars: &[char],
     adv: &[i32],

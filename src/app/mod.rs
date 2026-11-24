@@ -551,11 +551,6 @@ pub(crate) struct App {
     clock_cached: Option<Box<ClockBox>>,
     clock_norm_key: (u64, i32, i32, i32, i32, i32, u32, u32, u32, i32, i32, u64),
     /// 竖版「卷轴整体居中」的偏移缓存（审查 U5）：`(指纹, 右缘左移量)`。
-    /// 指纹 = (qi, font_epoch, w, h, cb.w) —— 覆盖偏移的全部输入。
-    /// 命中时 `frame_layout` 直接按缓存偏移排版，只量一次；未命中才两趟
-    /// （先量extent算偏移、再按偏移排）。用 `Cell` 是因为 `frame_layout`
-    /// 拿的是 `&App`，而它每条出帧路径都会走。
-    v_center: Cell<((usize, u64, i32, i32, i32), i32)>,
     /// 主时钟最后出帧时的「时间戳」（时/分/秒），静态画面下用它决定要不要重画
     clock_stamp: u64,
     /// 跑马灯首帧：格言应当已经在带内，而不是让用户先看一段空白
@@ -748,7 +743,6 @@ impl App {
                 0,
             ),
             clock_stamp: u64::MAX,
-            v_center: Cell::new(((usize::MAX, 0, 0, 0, 0), 0)),
             primed: false,
             last_tick: std::time::Instant::now(),
             hover: transition::HoverState::default(),
