@@ -697,6 +697,19 @@ order by n."Order" desc limit 1
     `WindowFromPoint(面板中心)` 的根窗口是不是它本身。另外这轮排查加了 `--trace`
     （关键路径写 `%TEMP%\desk-geyan-trace.log`）——「静默无反应」类故障，唯一的证据就是
     「哪一步没走到」，而这个开关必须能从用户的启动路径（托盘 / 快捷方式）打开。
+24. **`TrackPopupMenu` 的属主必须是「可见、可激活、用户看不见」的独立窗口** —— 菜单靠
+    「属主失去激活」收起，所以属主得**能被激活**。本进程两个顶层窗口都不合格：底板与文字层
+    都带 `WS_EX_NOACTIVATE`（永远不会失去激活），而且只用灵动岛时底板是隐藏的（隐藏窗口连
+    前台资格都没有）。症状是菜单弹得出来、点别处不收、`TrackPopupMenu` 迟迟不返回，之后的
+    托盘点击全排队 —— 又是「点了没反应」。旧实现临时摘掉底板的 `WS_EX_NOACTIVATE` 是治表：
+    隐藏状态下那一步照样失败。现在有一个 1×1 的专用属主（`app/menu_host.rs`）：
+    `WS_EX_TOOLWINDOW`（不进任务栏/Alt-Tab）+ `WS_EX_LAYERED` + `WS_EX_TOPMOST`，
+    整窗 alpha **取 1 而不是 0** —— alpha=0 的分层窗口连命中测试都是透明的，
+    `WindowFromPoint` 会直接跳过它，那样就再没有任何手段证明「它真在屏幕上」。
+    位置跟着光标走（多屏 + 每屏 DPI 都不用额外处理），菜单收起立刻 `SW_HIDE`。
+    一手实测：注入消息触发的菜单拿不到前台资格（`SetForegroundWindow` 恒 0，
+    `SetActiveWindow` / TOPMOST 闪烁 / `ShowWindow` 全都无效），但属主已经持有前台时
+    它立刻成功 —— **资格来自真实输入，不来自手法**。
 
 ---
 
@@ -710,6 +723,7 @@ src/
     render.rs    帧构建与绘制：三通道掩码 → 合批 → ULW 上屏
     frame.rs     帧调度：tick / step / needs_frame / 全屏守卫
     input.rs     窗口过程、拖拽、命中判定、热键、托盘与菜单
+    menu_host.rs 托盘菜单的属主窗口（1×1、可见、可激活、不进任务栏）
     verify/      验证与基准（自检 / 探测 / 岛自检 / 单帧导出 / 性能 / 内存）
   island/        灵动岛（与挂件并列的独立功能）
     mod.rs       状态机：端点 / 悬停 / 拉长 / 轮播 / 已读 / 定时器

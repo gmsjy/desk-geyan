@@ -17,6 +17,7 @@ pub(crate) use islandtest::{dump_island, islandtest};
 pub(crate) use selftest::selftest;
 
 use super::*;
+use super::menu_host;
 
 use std::mem::{size_of, zeroed};
 use std::ptr::null;
@@ -25,8 +26,8 @@ use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO, MonitorFro
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, INPUT, INPUT_KEYBOARD, SendInput};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GA_ROOT, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
-    KillTimer, SetWindowPos, WindowFromPoint,
+    DestroyWindow, GA_ROOT, GetAncestor, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
+    IsWindowVisible, KillTimer, SetWindowPos, WindowFromPoint,
 };
 /// `HWND_BOTTOM`（1）：`SetWindowPos` 的「放到 Z 序最底」句柄值。
 /// `consts` 里只收了 TOPMOST / NOTOPMOST 两个，这个只在自检里制造「被盖住」现场用。
@@ -337,6 +338,44 @@ fn probe_inner() -> i32 {
                 )
             },
         ));
+        // ---- 托盘菜单的属主窗口：必须「平时不占屏幕、弹出时看得见点得到、可被激活」
+        //
+        // 菜单收起靠「属主失去激活」，这条链对属主的资格有硬要求。本进程现成的
+        // 两个顶层窗口都不合格：底板/文字层都带 `WS_EX_NOACTIVATE`（永远不会失去
+        // 激活），而且用户只用灵动岛时底板是隐藏的（隐藏窗口连前台资格都没有）。
+        // 实测症状：菜单弹得出来、点别处不收、`TrackPopupMenu` 不返回，之后每次点
+        // 托盘图标都像「没反应」—— 点击全被那个还挂着的菜单吃掉。
+        //
+        // 三件事全部取系统读回值，不信我们自己的字段：
+        // ① 平时隐藏（不占屏幕）② 弹出时可见 ③ 1px 落点上 `WindowFromPoint`
+        // 命中的就是它 —— ③ 同时证明「真在屏幕上，且压得住同位置的窗口」。
+        // 样式位只验一条 `NOACTIVATE` 不存在；那条一旦出现，功能会**静默**坏掉。
+        {
+            let mut pt: POINT = zeroed();
+            GetCursorPos(&mut pt);
+            let h = menu_host::ensure(a);
+            let idle_hidden = !h.is_null() && IsWindowVisible(h) == 0;
+            menu_host::show_at(h, pt);
+            let shown = !h.is_null() && IsWindowVisible(h) != 0;
+            let act = menu_host::activatable(h);
+            let hit = WindowFromPoint(POINT { x: pt.x, y: pt.y });
+            let hits_self = !hit.is_null() && GetAncestor(hit, GA_ROOT) == h;
+            menu_host::hide(h);
+            let hidden_again = !h.is_null() && IsWindowVisible(h) == 0;
+            rows.push((
+                "托盘菜单属主窗口（可见 · 可激活 · 点得到 · 平时不占屏）",
+                if idle_hidden && shown && act && hits_self && hidden_again {
+                    R::Pass
+                } else {
+                    R::Fail
+                },
+                format!(
+                    "句柄={:?} · 平时隐藏={} · 弹出可见={} · 无 NOACTIVATE={} · 光标点命中自己={} · 收起后隐藏={}",
+                    h, idle_hidden, shown, act, hits_self, hidden_again
+                ),
+            ));
+        }
+
         // ---- 系统集成：开机自启 / 全屏检测。这两项不依赖窗口，
         // 放进来是为了「一次 --probe 覆盖整个桌面集成面」。
         {

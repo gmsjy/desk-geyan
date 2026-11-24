@@ -5,6 +5,7 @@
 
 use super::*;
 
+use super::menu_host;
 use std::ffi::c_void;
 use std::mem::{zeroed};
 use std::ptr::{null, null_mut};
@@ -13,7 +14,7 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT,
 use windows_sys::Win32::Graphics::Gdi::{BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HGDIOBJ, PAINTSTRUCT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
-use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, HCURSOR, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu};
+use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect, HCURSOR, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, SetCursor, SetTimer, TrackPopupMenu};
 use crate::{autostart, clipboard, favorites, island};
 use crate::config::{self, Anim, Config, Mode, Orient, VStyle};
 use crate::config_ui;
@@ -446,35 +447,44 @@ fn show_menu(a: &mut App) {
         let mut pt: POINT = zeroed();
         GetCursorPos(&mut pt);
 
-        // WS_EX_NOACTIVATE 的窗口弹菜单必须临时允许被激活，
-        // 否则菜单不会因为点击别处而收起（经典坑）
-        let ex = GetWindowLongPtrW(a.panel, GWL_EXSTYLE) as u32;
-        SetWindowLongPtrW(a.panel, GWL_EXSTYLE, (ex & !WS_EX_NOACTIVATE) as isize);
+        // 属主必须是「可见、可激活、用户看不见」的窗口 —— 详见 `menu_host` 模块头。
+        // 底板窗口不合格：带 `WS_EX_NOACTIVATE`，永远不会失去激活 → 菜单点了别处
+        // 也收不起来；而且用户只用灵动岛时它是隐藏的，隐藏窗口连前台资格都没有。
+        // 旧实现临时摘掉底板的 `WS_EX_NOACTIVATE` 再 `SetForegroundWindow` 是治
+        // 表不治里：隐藏状态下那一步必定失败，菜单于是挂住。
+        let host = menu_host::ensure(a);
+
         let fg0 = GetForegroundWindow();
-        let ok_fg = SetForegroundWindow(a.panel);
+        menu_host::show_at(host, pt);
+        let ok_fg = menu_host::activate(host);
         trace(
             "menu",
             &format!(
-                "打开: panel={:?} fg_before={fg0:?} 置前结果={ok_fg} fg_after={:?} cfg_open={}",
+                "打开: host={host:?} panel={:?} fg_before={fg0:?} 置前结果={ok_fg} fg_after={:?} cfg_open={}",
                 a.panel,
                 GetForegroundWindow(),
                 a.config.is_open()
             ),
         );
 
+        // 建不出属主也照弹（`TrackPopupMenu` 不挑属主），但要点别处收起就没保证了，
+        // 退回底板并留下记录 —— 这比「菜单根本不出现」对用户更友好。
+        let owner = if host.is_null() { a.panel } else { host };
         let cmd = TrackPopupMenu(
             menu,
             TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
             pt.x,
             pt.y,
             0,
-            a.panel,
+            owner,
             null(),
         ) as u32;
         trace("menu", &format!("收起: cmd={cmd} fg={:?}", GetForegroundWindow()));
 
-        PostMessageW(a.panel, WM_NULL, 0, 0);
-        SetWindowLongPtrW(a.panel, GWL_EXSTYLE, ex as isize);
+        // 文档上的配套动作：给属主补一条空消息，让它把「菜单已结束」这件事
+        // 走完自己的消息队列。少了它，菜单消失后偶发一次「下一次点击被吞」。
+        PostMessageW(owner, WM_NULL, 0, 0);
+        menu_host::hide(host);
         DestroyMenu(menu);
 
         if cmd != 0 {
@@ -921,14 +931,19 @@ fn quit(a: &mut App) {
         a.cfg.save();
         let text = a.text;
         let panel = a.panel;
+        let host = a.menu_host;
         a.text = null_mut();
         a.panel = null_mut();
+        a.menu_host = null_mut();
         if !text.is_null() {
             DestroyWindow(text);
         }
         if !panel.is_null() {
             DestroyWindow(panel);
         }
+        // 属主可能在菜单弹出期间被建出来；退出时照样收掉，
+        // 让诊断里的「窗口计数」在退出路径上也干净。
+        menu_host::destroy(host);
     }
     std::process::exit(0);
 }

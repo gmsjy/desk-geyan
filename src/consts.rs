@@ -26,6 +26,8 @@ pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOZORDER: u32 = 0x0004;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
+/// 顺带显示窗口（`SetWindowPos` 里代替一次 `ShowWindow`）
+pub const SWP_SHOWWINDOW: u32 = 0x0040;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
 pub const SWP_NOOWNERZORDER: u32 = 0x0200;
 pub const SWP_NOSENDCHANGING: u32 = 0x0400;

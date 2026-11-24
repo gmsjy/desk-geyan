@@ -23,6 +23,7 @@
 mod diagnostics;
 mod frame;
 mod input;
+mod menu_host;
 mod render;
 mod verify;
 mod window;
@@ -464,6 +465,11 @@ pub(crate) struct App {
     hinst: *mut c_void,
     panel: HWND,
     text: HWND,
+    /// 托盘菜单的属主窗口（懒建，见 `menu_host`）。
+    ///
+    /// 底板与文字层都是 `WS_EX_NOACTIVATE`、且可能隐藏，两者都当不了菜单属主：
+    /// 属主不会「失去激活」→ 菜单点了别处也收不起来，之后的托盘点击全排队。
+    menu_host: HWND,
     cfg: Config,
     list: Vec<Quote>,
 
@@ -695,6 +701,7 @@ impl App {
             hinst: null_mut(),
             panel: null_mut(),
             text: null_mut(),
+            menu_host: null_mut(),
             qi: 0,
             qn: 1 % list.len(),
             m: 0.0,
