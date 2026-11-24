@@ -384,7 +384,9 @@ fn table(page: Page) -> Vec<W> {
             chk(MI_ISLAND_UNREAD, "统计未读", 2),
             // 归档开关：关掉之后读过的 `.msg` 直接删，未读退回「本次运行累计」
             chk(MI_ISLAND_KEEP, "保留归档（7 天）", 2),
-            // 六个片段各占 1 格：一行放完，而且**顺序即显示顺序**
+            // ---- 显示内容：七个片段各占 1 格，一行放 6 个
+            //（顺序即显示顺序，最后一项 media 是 `ALL_ITEMS` 的尾部）
+            sec("收起态显示内容（勾选顺序即显示顺序）"),
             chk(MI_ISLAND_ITEM_BASE, "时钟", 1),
             chk(MI_ISLAND_ITEM_BASE + 1, "圆点", 1),
             chk(MI_ISLAND_ITEM_BASE + 2, "CPU", 1),
@@ -394,15 +396,25 @@ fn table(page: Page) -> Vec<W> {
             chk(MI_ISLAND_ITEM_BASE + 6, "媒体", 1),
             // 轮播：0 = 不轮播（此时只有装得下的前几项可见）
             num(MI_ISLAND_ROT_DOWN, MI_ISLAND_ROT_UP, "轮播间隔", 3),
-            num(MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP, "底不透明", 3),
+            // ---- 外观：透明度与三种颜色放同一组
+            // 「底不透明度」而不是「透明度」：数值越大越实，与配置文件里的
+            // `island_body_alpha` 同向，改 ini 的人不会把方向搞反。文字不在
+            // 这条通道里（逐像素 alpha 独立），所以调低只影响胶囊底。
+            sec("外观（只压胶囊底，文字始终清晰）"),
+            // 标签必须 ≤4 字：数值行的标签区是定宽（`num` 的 `− 值 +` 三段
+            // 也要地方），5 个字会被 GDI 直接裁掉尾巴 —— 实测「底不透明度」
+            // 画出来只剩「底不透明」。分组标题已经交代了「胶囊底」，这里
+            // 用 4 字就够。
+            num(MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP, "不透明度", 3),
             col(MI_ISLAND_BODY_COLOR, "胶囊底色", 3),
             col(MI_ISLAND_ACCENT_COLOR, "强调色", 3),
+            col(MI_ISLAND_DOT_COLOR, "提示点色", 3),
+            // ---- 几何与行为
+            sec("几何与行为"),
             num(MI_ISLAND_W_DOWN, MI_ISLAND_W_UP, "展开宽", 3),
             num(MI_ISLAND_H_DOWN, MI_ISLAND_H_UP, "展开高", 3),
             // 新消息的两件事：拉长多久（时长）与提示点用什么颜色。
-            // 它们是一组：一个决定「能看到多久」，一个决定「看不看得见」。
             num(MI_ISLAND_PEEK_DOWN, MI_ISLAND_PEEK_UP, "拉长时长", 3),
-            col(MI_ISLAND_DOT_COLOR, "提示点色", 3),
         ],
     }
 }

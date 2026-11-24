@@ -528,7 +528,10 @@ impl Default for Config {
             island_w: 420,
             island_h: 136,
             island_body_color: 0x0B0D12,
-            island_body_alpha: 220,
+            // 180/255 ≈ 71%（再乘整体 `opacity` ≈ 59%）：胶囊要能看见，
+            // 但它是**贴在壁纸上的**，不该像一块实心黑板。旧默认 220 在
+            // 深色壁纸上几乎看不出透明，用户反馈「岛太实」。
+            island_body_alpha: 180,
             island_accent_color: 0x4C9AFF,
             island_hover_ms: crate::island::geom::HOVER_IN_MS as i32,
             island_leave_ms: crate::island::geom::LEAVE_GRACE_MS as i32,

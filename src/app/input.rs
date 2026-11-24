@@ -729,8 +729,11 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
             a.cfg.save();
         }
         MI_ISLAND_OP_DOWN | MI_ISLAND_OP_UP => {
-            let d = if cmd == MI_ISLAND_OP_UP { 8 } else { -8 };
-            a.cfg.island_body_alpha = (a.cfg.island_body_alpha + d).clamp(0, 255);
+            // 步长 13 ≈ 5%（面板显示的是 alpha×100/255）。下限 16 而不是 0：
+            // 调到 0 胶囊彻底看不见，而岛是**鼠标穿透**的 —— 用户只能靠
+            // 设置面板找回来。留 6% 至少还能看出「这儿有个东西」。
+            let d = if cmd == MI_ISLAND_OP_UP { 13 } else { -13 };
+            a.cfg.island_body_alpha = (a.cfg.island_body_alpha + d).clamp(16, 255);
             a.island.dirty = true;
             a.cfg.save();
         }

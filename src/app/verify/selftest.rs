@@ -698,11 +698,39 @@ pub(crate) fn selftest() -> i32 {
         ));
 
         // 选一条有出处的格言（出处列随格言过渡要有对象可验）
-        a.trans.settle();
-        a.phase = 0.0;
-        let op = a.text_alpha();
-        build_frame(&mut a, op);
-        let v1: Vec<u32> = a.frame.out_pixels().to_vec();
+
+        // v1 / v2 是**两次独立 build**，而每次 build 都重新读墙钟
+        //（`render.rs` 里 `fmt_clock(&local_time())`）。两次之间跨过秒进位，
+        // 下面「时钟通道逐位相同」就会把**秒位数字换了**记成「动效动了时钟」
+        // —— 实测 1/10 概率假红，而本条要验的恰恰是「动效不碰时钟」。
+        //
+        // 采信前先比 `clock_stamp`（秒粒度）：变了就整套重来。过渡推进是
+        // 纯逻辑、不吃墙钟，重来零副作用；连跨 5 次才认输（正常一次就过）。
+        let (mut v1, mut v2, mut t_arrive): (Vec<u32>, Vec<u32>, f32);
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            let stamp = clock_stamp(&a.cfg);
+            a.trans.settle();
+            a.phase = 0.0;
+            let op = a.text_alpha();
+            build_frame(&mut a, op);
+            v1 = a.frame.out_pixels().to_vec();
+
+            // 驱到 Arrive 35%：右列已过半、左列刚起步，错峰最可辨的时刻。
+            // **一拍到位**：`step(LEAVE+GAP+ε)` 已经把 Leave/Gap 穿完、落在
+            // Arrive 起点，再补一拍 GAP 就会多走 0.14s（t=0.231 时两列 k 都
+            // 归 1，错峰不可辨 —— 这里曾经踩过）。
+            a.trans.start_leave(0);
+            a.trans.step(transition::LEAVE_S + transition::GAP_S + 1e-4);
+            a.trans.step(transition::ARRIVE_S * 0.35);
+            t_arrive = a.trans.phase_t();
+            build_frame(&mut a, op);
+            v2 = a.frame.out_pixels().to_vec();
+            if clock_stamp(&a.cfg) == stamp || tries >= 5 {
+                break;
+            }
+        }
         let m0 = a.frame.channel_mask(0);
         let m1 = a.frame.channel_mask(1);
         let m2 = a.frame.channel_mask(2);
@@ -714,17 +742,6 @@ pub(crate) fn selftest() -> i32 {
         let cb = hug_sign(&a.cfg, cb0, &ql0);
         let ql = frame_layout(&a, &cb);
         let ncol = ql.col_ranges.len();
-
-        // 驱到 Arrive 35%：右列已过半、左列刚起步，错峰最可辨的时刻。
-        // **一拍到位**：`step(LEAVE+GAP+ε)` 已经把 Leave/Gap 穿完、落在
-        // Arrive 起点，再补一拍 GAP 就会多走 0.14s（t=0.231 时两列 k 都
-        // 归 1，错峰不可辨 —— 这里曾经踩过）。
-        a.trans.start_leave(0);
-        a.trans.step(transition::LEAVE_S + transition::GAP_S + 1e-4);
-        a.trans.step(transition::ARRIVE_S * 0.35);
-        let t_arrive = a.trans.phase_t();
-        build_frame(&mut a, op);
-        let v2: Vec<u32> = a.frame.out_pixels().to_vec();
 
         // ⑥ 逐列错峰：按列带统计「纯格言像素」的 alpha 比值，必须
         //    右列 > 左列，且每列 ≈ 该列的 column_k。
@@ -804,11 +821,12 @@ pub(crate) fn selftest() -> i32 {
             "PR3·竖版入场按列错峰（右列先亮，逐带读 alpha）",
             stagger_ok,
             format!(
-                "{} 列比值 [{}] · 时钟 {} px 逐位相同（异常 {}）",
+                "{} 列比值 [{}] · 时钟 {} px 逐位相同（异常 {}）· 采样 {} 轮",
                 ncol,
                 ratio_s.join(", "),
                 clock_n,
-                clock_bad
+                clock_bad,
+                tries
             ),
         ));
 
@@ -1699,6 +1717,8 @@ pub(crate) fn selftest() -> i32 {
             MI_ISLAND_OP_UP,
             MI_ISLAND_BODY_COLOR,
             MI_ISLAND_ACCENT_COLOR,
+            // 外观组：透明度 + 底色 + 强调色 + 提示点色（2026-11-24 重排岛页）
+            MI_ISLAND_DOT_COLOR,
             MI_ISLAND_W_DOWN,
             MI_ISLAND_W_UP,
             MI_ISLAND_H_DOWN,
@@ -1708,7 +1728,6 @@ pub(crate) fn selftest() -> i32 {
             // 必须有人签字」，自动跟随等于把签字环节删掉。
             MI_ISLAND_PEEK_DOWN,
             MI_ISLAND_PEEK_UP,
-            MI_ISLAND_DOT_COLOR,
         ];
         let got = config_ui::table_cmds();
         let mut uniq = got.clone();

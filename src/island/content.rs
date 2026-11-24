@@ -789,8 +789,8 @@ pub const PEEK_BODY_CHARS: usize = 28;
 /// 是同一个思路：宽度是稀缺资源，先给「此刻最该看的那个」。
 ///
 /// 实测（13px、默认字体、`items` 全勾、数值全满值）：
-/// * 无事件档：时钟 + 三格 + 媒体 = 449px
-/// * 有事件档：再加 `MSG 99+` 与绿点 = 552px（上限 560）
+/// * 无事件档：时钟 + 三格 + 媒体（20 字）= 463px
+/// * 有事件档：再加 `MSG 99+` = 527px；绿点占位再 +26px ⇒ 553px（上限 560）
 pub const MEDIA_CHARS_IDLE: usize = 20;
 /// 有事件（`MSG n` / 通知正文）占位时的媒体长度，见 [`MEDIA_CHARS_IDLE`]。
 pub const MEDIA_CHARS_BUSY: usize = 11;
