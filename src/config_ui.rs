@@ -59,11 +59,12 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_SELECTED, ODT_LISTBOX,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect,
-    GetCursorPos, GetSystemMetrics, GetWindowRect, GetWindowTextW, IsWindow, LoadCursorW,
+    AdjustWindowRectEx, BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowTextW,
+    IsWindow, LoadCursorW,
     MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
     SetWindowTextW, ShowWindow, WNDCLASSW, HICON,
     // 控件专用常量（consts 未收录）仍走 windows_sys，单一来源：
@@ -95,7 +96,7 @@ use crate::app::{
 use crate::config::{self, Anim, Mode, Orient, VStyle, FONT_PRESETS};
 use crate::consts::*;
 use crate::gfx;
-use crate::util::{fmt_color, wide};
+use crate::util::{fmt_color, trace, wide};
 
 // ---------------------------------------------------------------- 尺寸与 id
 
@@ -1191,8 +1192,18 @@ unsafe fn window_size_for_client(lw: i32, lh: i32, k: f32, dpi_raw: u32) -> (i32
 
 /// 打开设置面板。已经开着就置前，不重复建。
 pub fn open(a: &mut App) {
+    trace(
+        "cfg",
+        &format!(
+            "open 进入: hwnd={:?} is_open={} fg={:?}",
+            a.config.hwnd,
+            a.config.is_open(),
+            unsafe { GetForegroundWindow() }
+        ),
+    );
     if a.config.is_open() {
         bring_to_front(a.config.hwnd);
+        trace("cfg", "已开着 → 置前返回");
         return;
     }
     // 句柄非空、窗口却已经不在了（外部销毁 / 会话切换 / 桌面重建）：
@@ -1258,6 +1269,7 @@ pub fn open(a: &mut App) {
             null(),
         );
         if h.is_null() {
+            trace("cfg", "CreateWindowExW 失败");
             return;
         }
         // CreateWindowExW 的嵌套 WM_CREATE 在 `with_app` 闸门下会被交回
@@ -1283,6 +1295,15 @@ pub fn open(a: &mut App) {
         SendMessageW(h, WM_SETICON, 0, icon_small as LPARAM); // ICON_SMALL
         SendMessageW(h, WM_SETICON, 1, icon_big as LPARAM); // ICON_BIG
         bring_to_front(h);
+        trace(
+            "cfg",
+            &format!(
+                "open 完成: hwnd={:?} 可见={} 成为前台={}",
+                h,
+                IsWindowVisible(h),
+                GetForegroundWindow() == h
+            ),
+        );
     }
 }
 
@@ -1297,6 +1318,24 @@ pub fn open(a: &mut App) {
 /// 变更认作「用户意图」，随后 `SetForegroundWindow` 才有资格生效。这不是绕
 /// 安全策略 —— 面板本来就是用户按热键/菜单叫出来的，本来就该到最前。
 ///
+/// **但这招只在「我们已经是前台进程」时管用。** 从托盘菜单进来的路径恰好不是：
+/// 点的是托盘图标，输入事件落在 `explorer` 的窗口上，本进程没拿到「最后输入」
+/// 资格；`show_menu` 里那句 `SetForegroundWindow(a.panel)` 本身就会失败
+/// （挂件被隐藏时更必然失败，隐藏窗口不能成为前台）。于是面板在 Chrome 后面
+/// 建出来、可见、拿不到焦点 —— 全程无返回值可查，症状是「点了没反应」。
+///
+/// 所以收口分两层：
+///
+/// 1. **能拿前台就拿**：`SetForegroundWindow` 有资格时是对的，不惊动别人；
+/// 2. **拿不到就保证「看得见、点得到」**：把窗口顶到非置顶带的最高层。
+///    系统限制的是「激活」，不限制 z 序 —— 所以这一步必定生效，
+///    用户看见面板、点它一下自然就激活了。
+///
+/// 为什么不硬抢激活：`SwitchToThisWindow`（Alt+Tab 的内部实现）和
+/// `AttachThreadInput` 都试过实测，在「本进程既不是前台、也没有最后输入」时
+/// 一个空转一个直接返回失败 —— 强抢激活在这条路径上本来就无解，
+/// 把力气花在「至少看得见」上才是可交付的。
+///
 /// `SW_RESTORE` 而不是 `SW_SHOWNORMAL`：面板被最小化时前者会还原，
 /// 后者在已最小化的情况下不保证展开到可用尺寸。
 fn bring_to_front(hwnd: HWND) {
@@ -1304,7 +1343,27 @@ fn bring_to_front(hwnd: HWND) {
         ShowWindow(hwnd, SW_RESTORE);
         SetWindowPos(hwnd, HWND_TOPMOST as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         SetWindowPos(hwnd, HWND_NOTOPMOST as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
         SetForegroundWindow(hwnd);
+        // z 序与键盘焦点都要单独收：`SetForegroundWindow` 成功时它们自然到位，
+        // 失败时这两个调用至少把窗口顶到最上、让键盘焦点落过来。
+        BringWindowToTop(hwnd);
+        SetFocus(hwnd);
+
+        let fg_before_switch = GetForegroundWindow();
+        if fg_before_switch != hwnd {
+            // 拿不到前台资格（本进程不是前台、也没有「最后输入」）：
+            // 这时**不要**继续去抢激活，而是保证「看得见、点得到」——
+            // 把窗口顶到非置顶带的最高层。系统只限制「激活」，
+            // 不限制 z 序，所以这一步必定生效；用户点它一下自然就激活了。
+            SetWindowPos(hwnd, HWND_TOP as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            trace(
+                "raise",
+                &format!(
+                    "hwnd={hwnd:?} 抢前台失败 fg={fg_before_switch:?} 已顶到 HWND_TOP"
+                ),
+            );
+        }
     }
 }
 
@@ -2529,6 +2588,7 @@ unsafe fn config_proc_inner(
         }
 
         WM_CLOSE => {
+            trace("cfg", "WM_CLOSE");
             a.config.free_resources();
             DestroyWindow(hwnd);
             a.config.release_owned_after_destroy();
@@ -2536,6 +2596,10 @@ unsafe fn config_proc_inner(
         }
 
         WM_DESTROY => {
+            trace(
+                "cfg",
+                &format!("WM_DESTROY hwnd={hwnd:?} 记录的={:?}", a.config.hwnd),
+            );
             // ⚠️ 这里**不能** PostQuitMessage —— 这是设置面板，不是主窗口。
             // 正常关闭路径已在 WM_CLOSE / close() 里释放；这里兜底处理
             // 由父窗口销毁等外部路径，重复调用是幂等的。

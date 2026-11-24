@@ -23,6 +23,12 @@ mod util;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 诊断追踪（`%TEMP%\desk-geyan-trace.log`）。做成命令行开关而不是只认环境变量：
+    // 托盘/快捷方式启动的进程拿不到我们临时设的 `DG_TRACE`，而排查「点了没反应」
+    // 这类问题恰恰要用**用户那条启动路径**复现 —— 两种入口都得能用。
+    if args.iter().any(|a| a == "--trace") {
+        util::trace_enable();
+    }
     if args.iter().any(|a| a == "--selftest") {
         std::process::exit(app::selftest());
     }

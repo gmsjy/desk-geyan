@@ -330,6 +330,7 @@ echo "CI · 构建完成" > "%APPDATA%\DeskGeyan\events\ci.msg"
 ```bash
 desk-geyan.exe                            # 正常启动
 desk-geyan.exe --autostart on|off|query   # 开机自启的查询 / 设置
+desk-geyan.exe --trace                    # 诊断追踪：关键路径写 %TEMP%\desk-geyan-trace.log
 
 # 自检与行为探测：都不常驻、跑完即退，零副作用（配置先快照再原样写回）
 --selftest     # 渲染管线 + 动效状态机 + 排版 + 竖排三形态 + 设置面板控件清单（85 条断言）
@@ -683,6 +684,19 @@ order by n."Order" desc limit 1
     「句柄非空」改成 `IsWindow`（销毁后的句柄照样非零，只看它就会一直「显示一个死窗口」）；
     判据也不能用 `IsWindowVisible`（被盖住时它照样是 true），只能问「面板中心点上最上层的
     那个窗口是不是它」——`--probe` 里那条断言先把面板压到 Z 序最底再唤出，两个方向都验。
+23. **上一招只在「我们已经是前台进程」时才成立** —— 从托盘菜单进来时，点的是托盘图标，
+    输入事件落在 `explorer` 的窗口上；而挂件被隐藏（`visible=false`）时 `show_menu` 里那句
+    `SetForegroundWindow(a.panel)` 必然失败（隐藏窗口不能成为前台）。于是整个进程没有
+    「最后输入」资格，`SetForegroundWindow` 一路被拒，设置面板**建出来、可见、却压在 Chrome
+    后面** —— 又是「点了没反应」。硬抢激活的路都试过并且都不通：`AttachThreadInput`
+    跨进程挂接直接返回失败，`SwitchToThisWindow`（Alt+Tab 的内部实现）在本进程里空转，
+    但从别的进程调它又是成功的 —— 判据是「输入资格」，不是手法。结论：**别再想着抢激活，
+    改成保证「看得见、点得到」** —— 抢不到前台就 `SetWindowPos(HWND_TOP)` 把窗口顶到
+    非置顶带的最高层（系统只限制激活，不限制 z 序），用户看见面板点一下自然就激活了。
+    验证口径也得换：`GetForegroundWindow()==面板` 在无资格时永远是 false，要看
+    `WindowFromPoint(面板中心)` 的根窗口是不是它本身。另外这轮排查加了 `--trace`
+    （关键路径写 `%TEMP%\desk-geyan-trace.log`）——「静默无反应」类故障，唯一的证据就是
+    「哪一步没走到」，而这个开关必须能从用户的启动路径（托盘 / 快捷方式）打开。
 
 ---
 

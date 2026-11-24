@@ -34,6 +34,37 @@ pub fn scaled_px(px: i32, scale: i32, ratio: i32) -> i32 {
     ((px * scale / 100) * ratio / 100).max(6)
 }
 
+/// 追踪开关（`--trace` 或 `DG_TRACE`）。用 `AtomicBool` 而不是每次查环境变量：
+/// 环境变量在 `explorer` 启动的进程里读不到我们临时设的值，命令行开关才是
+/// 「用用户那条启动路径复现」时唯一可靠的入口。
+static TRACE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn trace_enable() {
+    TRACE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn trace_on() -> bool {
+    TRACE_ON.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("DG_TRACE").is_some()
+}
+
+/// 诊断追踪：打开开关时把一行追加到 `%TEMP%\desk-geyan-trace.log`。
+///
+/// 为什么是「按需写文件」而不是常开日志：挂件是长期驻留的托盘程序，
+/// 常开日志既占盘又会让「用户机器上找不到日志」变成新的抱怨点。诊断一个
+/// 「静默无反应」类故障时，唯一的证据就是「哪一步没走到」，所以这条通道
+/// 只需要能临时打开。不开时零开销（一次原子读 + 一次环境变量查询）。
+pub fn trace(tag: &str, msg: &str) {
+    if !trace_on() {
+        return;
+    }
+    use std::io::Write;
+    let path = std::env::temp_dir().join("desk-geyan-trace.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "[{tag}] {msg}");
+    }
+}
+
 pub fn local_time() -> SYSTEMTIME {
     unsafe {
         let mut st: SYSTEMTIME = std::mem::zeroed();

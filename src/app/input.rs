@@ -13,7 +13,7 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT,
 use windows_sys::Win32::Graphics::Gdi::{BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HGDIOBJ, PAINTSTRUCT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
-use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HCURSOR, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu};
+use windows_sys::Win32::UI::WindowsAndMessaging::{AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, HCURSOR, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu};
 use crate::{autostart, clipboard, favorites, island};
 use crate::config::{self, Anim, Config, Mode, Orient, VStyle};
 use crate::config_ui;
@@ -450,7 +450,17 @@ fn show_menu(a: &mut App) {
         // 否则菜单不会因为点击别处而收起（经典坑）
         let ex = GetWindowLongPtrW(a.panel, GWL_EXSTYLE) as u32;
         SetWindowLongPtrW(a.panel, GWL_EXSTYLE, (ex & !WS_EX_NOACTIVATE) as isize);
-        SetForegroundWindow(a.panel);
+        let fg0 = GetForegroundWindow();
+        let ok_fg = SetForegroundWindow(a.panel);
+        trace(
+            "menu",
+            &format!(
+                "打开: panel={:?} fg_before={fg0:?} 置前结果={ok_fg} fg_after={:?} cfg_open={}",
+                a.panel,
+                GetForegroundWindow(),
+                a.config.is_open()
+            ),
+        );
 
         let cmd = TrackPopupMenu(
             menu,
@@ -461,6 +471,7 @@ fn show_menu(a: &mut App) {
             a.panel,
             null(),
         ) as u32;
+        trace("menu", &format!("收起: cmd={cmd} fg={:?}", GetForegroundWindow()));
 
         PostMessageW(a.panel, WM_NULL, 0, 0);
         SetWindowLongPtrW(a.panel, GWL_EXSTYLE, ex as isize);

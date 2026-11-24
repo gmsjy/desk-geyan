@@ -32,6 +32,8 @@ pub const SWP_NOSENDCHANGING: u32 = 0x0400;
 
 pub const HWND_TOPMOST: isize = -1;
 pub const HWND_NOTOPMOST: isize = -2;
+/// z 序最高（**非**置顶带内）。用于「拿不到前台资格时至少别被盖住」。
+pub const HWND_TOP: isize = 0;
 
 // ---------------------------------------------------------------- 窗口消息
 pub const WM_DESTROY: u32 = 0x0002;
