@@ -236,9 +236,19 @@ pub struct IslandEnv {
     pub top: i32,
     /// 收起态宽度（由内容度量得出）
     pub compact_w: i32,
+    /// 收起态高度。**物理像素**，与 `expanded_h` 同口径 —— 调用方按 DPI 乘过。
+    ///
+    /// 这里必须由环境量给，不能像早期那样在 `geom()` 里直接读 `COMPACT_H`：
+    /// `COMPACT_H` 是逻辑像素的**设计值**，150% 缩放下真实高度是 51。写死常量
+    /// 会让窗口比内容矮 17px（`layout` 侧是按 DPI 缩放的），症状是文字被
+    /// 窗口底边裁掉一条 —— 而且只在非 100% 缩放的机器上出现。
+    pub compact_h: i32,
     /// 展开态宽高
     pub expanded_w: i32,
     pub expanded_h: i32,
+    /// 展开态圆角（物理像素）。理由同 `compact_h`：`EXPAND_RADIUS` 是 100%
+    /// 缩放下的设计值，150% 下该是 27。写死 18 的胶囊在大字号屏上会偏「方」。
+    pub expand_r: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -256,19 +266,26 @@ fn lerp_i(a: i32, b: i32, t: f32) -> i32 {
 
 /// 展开度为 `t` 时的窗口矩形。**纯函数**。
 ///
+/// * 两端高度都取自环境量（`compact_h` / `expanded_h`），本函数**不读**
+///   `COMPACT_H` —— 那两个常量是 100% 缩放下的设计值，具体高度由调用方
+///   按 DPI 折算后传进来。纯函数的坐标系是物理像素。
 /// * `x` 由「水平中线不动」推出来：`x = cx - w/2`。视觉上是胶囊向两侧鼓出来，
 ///   而不是从左上角长开 —— 这是「岛」与「小窗口」的分界。
 /// * `y` 恒为 `env.top`：从顶部向下垂。
-/// * 圆角从 `h/2`（真胶囊）线性过渡到 18，并夹在 `h/2` 以内 ——
-///   中间态高 60px 时若用 18 会显得「方」，用 h/2 才一直是胶囊感。
+/// * 圆角从 `h/2`（真胶囊）线性过渡到 `env.expand_r`，并夹在 `h/2` 以内 ——
+///   中间态高 60px 时若用展开圆角会显得「方」，用 h/2 才一直是胶囊感。
 pub fn geom(t: f32, env: &IslandEnv) -> IslandRect {
     let t = t.clamp(0.0, 1.0);
-    let compact_h = COMPACT_H.max(8);
-    let w = lerp_i(env.compact_w.max(COMPACT_MIN_W), env.expanded_w.max(COMPACT_MIN_W), t)
-        .max(1);
+    let compact_h = env.compact_h.max(8);
+    // 下限（`COMPACT_MIN_W`）已由调用方按 DPI 折算进 `compact_w`，这里只兜
+    // 「不能是 0 或负数」。同理展开宽度不窄于收起宽度 —— 否则 lerp 会出现
+    // 「先缩后涨」，动画中途窄一下。
+    let cw = env.compact_w.max(1);
+    let ew = env.expanded_w.max(cw);
+    let w = lerp_i(cw, ew, t);
     let h = lerp_i(compact_h, env.expanded_h.max(compact_h), t).max(1);
     let r0 = compact_h / 2;
-    let r = lerp_i(r0, EXPAND_RADIUS.max(2), t).min(h / 2).max(1);
+    let r = lerp_i(r0, env.expand_r.max(2), t).min(h / 2).max(1);
     IslandRect {
         x: env.cx - w / 2,
         y: env.top,
@@ -378,8 +395,10 @@ mod tests {
             cx: 960,
             top: 8,
             compact_w: 140,
+            compact_h: COMPACT_H,
             expanded_w: EXPANDED_W,
             expanded_h: EXPANDED_H,
+            expand_r: EXPAND_RADIUS,
         }
     }
 

@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::*;
 use crate::bench::with_config_guard;
 use crate::island::content::Items;
-use crate::island::geom::State;
+use crate::island::geom::{State, COMPACT_H};
 use crate::island::{self, ISLAND_CLASS};
 
 pub(crate) fn islandtest() -> i32 {
@@ -131,7 +131,7 @@ fn islandtest_inner() -> i32 {
     })
     .unwrap_or_default();
     let k = dpi as f32 / 100.0;
-    let want_h = (34.0 * k).round() as i32;
+    let want_h = (COMPACT_H as f32 * k).round() as i32;
     all &= row(
         rect.h == want_h && rect.w >= (96.0 * k) as i32,
         "② 收起端点几何",
@@ -617,7 +617,7 @@ fn islandtest_inner() -> i32 {
     // 不弹面板；悬停才展开；展开停留够久（`READ_MS`）后绿点熄灭、宽度回缩。
     // 三条判据各自会红：宽度没变（拉长没接上）、高度跟着变（等于偷偷展开）、
     // 绿点不是绿的（通道借错了，会显示成主色白点）。
-    let (w_idle, w_peek, h_peek, green, w_back) = with_app(|a| {
+    let (w_idle, w_peek, h_peek, green, w_back, dpi) = with_app(|a| {
         a.cfg.island = true;
         unsafe { island::create(a) };
         a.island.consume_events = false;
@@ -668,15 +668,17 @@ fn islandtest_inner() -> i32 {
         a.island.peek = false;
         a.island.dot_a = 0;
         settle(a);
-        (w0, w1, h1, green, a.island.rect.w)
+        // dpi 一并带出：收起高度**按 DPI 缩放**，判据不能写死 34。
+        (w0, w1, h1, green, a.island.rect.w, a.island.dpi)
     })
-    .unwrap_or((0, 0, 0, 0, 0));
+    .unwrap_or((0, 0, 0, 0, 0, 100));
+    let want_peek_h = (COMPACT_H as f32 * dpi as f32 / 100.0).round() as i32;
     all &= row(
-        w_peek > w_idle + 40 && h_peek == 34 && green > 8 && w_back == w_idle,
+        w_peek > w_idle + 40 && h_peek == want_peek_h && green > 8 && w_back == w_idle,
         "⑲ 新消息拉长：变宽不变高 · 绿点真绿 · 已读回缩",
         format!(
-            "宽 {} → {} → {}（须增 >40 且回到原值）· 高 {}（须 34）· 绿像素 {}（须 >8）",
-            w_idle, w_peek, w_back, h_peek, green
+            "宽 {} → {} → {}（须增 >40 且回到原值）· 高 {}（须 {} = {}×dpi/100）· 绿像素 {}（须 >8）",
+            w_idle, w_peek, w_back, h_peek, want_peek_h, COMPACT_H, green
         ),
     );
 
@@ -951,7 +953,7 @@ struct Frozen {
     /// 收起态第几页（越界按取模回绕）。展开态无意义，恒 0
     page: usize,
     /// `peek=1`：导出「新消息拉长态」——胶囊变宽显示来源·正文 + 绿点常亮。
-    /// 它**不是**展开态：高度仍是 34。
+    /// 它**不是**展开态：高度仍是收起态的 `COMPACT_H`（按 DPI 折算）。
     peek: bool,
 }
 

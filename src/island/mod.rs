@@ -268,9 +268,13 @@ fn make_rect(dpi: i32, cfg_screen: &str, geo_t: f32, compact_w: i32, expanded_w:
         cx: (wa.left + wa.right) / 2,
         top: wa.top + margin,
         compact_w: if compact_w > 0 { compact_w } else { ((geom::COMPACT_MIN_W as f32) * k) as i32 },
+        // 收起高度**同样要乘 k**（与 `layout::compact` 里的 `sp(COMPACT_H, k)` 对口径）。
+        // 漏这一条，150% 缩放下窗口高仍是 34 而内容按 51 排 —— 底部被裁。
+        compact_h: ((geom::COMPACT_H as f32) * k).round() as i32,
         // 展开宽度不超过工作区（留 32px 边距）
         expanded_w: expanded_w.min(avail_w - ((32.0 * k).round() as i32).max(8)),
         expanded_h,
+        expand_r: ((geom::EXPAND_RADIUS as f32) * k).round() as i32,
     };
     geom::geom(geo_t, &env)
 }
