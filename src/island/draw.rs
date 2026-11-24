@@ -12,11 +12,11 @@ use std::mem::zeroed;
 
 use windows_sys::Win32::Foundation::{RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    DeleteObject, Ellipse, FillRect, GetStockObject, GetTextExtentPoint32W, SelectObject,
-    SetBkMode, SetTextColor, TextOutW, HDC, HFONT, HGDIOBJ, NULL_PEN,
+    DeleteObject, FillRect, GetTextExtentPoint32W, SelectObject,
+    SetBkMode, SetTextColor, TextOutW, HDC, HFONT, HGDIOBJ,
 };
 
-use super::geom::COMPACT_MAX_W;
+use super::geom::{COMPACT_MAX_W, COMPACT_PEEK_MAX_W};
 use super::layout::{self, Chan, Layout};
 use crate::app::App;
 use crate::consts::*;
@@ -97,25 +97,10 @@ fn paint_pass(dc: HDC, lay: &Layout, fonts: &IslandFonts, clock_px: i32, shadow:
                 TextOutW(dc, r.x + off, r.y + off, w.as_ptr(), w.len() as i32 - 1);
             }
         }
-        // 圆点用 `Ellipse` 而不是 `FillRect`：6px 的方块在一条胶囊里读起来
-        // 是「一个色块」，不像未读标记。画笔要换成 `NULL_PEN`，否则默认的
-        // 1px 黑边会把 6px 的圆吃掉一圈，看起来是个更小的黑点。
-        for d in &lay.dots {
-            let col = if shadow { 0 } else { chan_color(Chan::Main) };
-            let brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(col);
-            let old_b = SelectObject(dc, brush as HGDIOBJ);
-            let old_p = SelectObject(dc, GetStockObject(NULL_PEN));
-            Ellipse(
-                dc,
-                d.x + off,
-                d.y + off,
-                d.x + d.d + off,
-                d.y + d.d + off,
-            );
-            SelectObject(dc, old_p);
-            SelectObject(dc, old_b);
-            DeleteObject(brush as HGDIOBJ);
-        }
+        // 圆点**不在这里画**（2026-11-24 改）：它需要一个独立的语义色
+        // （新消息绿）+ 独立的呼吸 alpha，而掩码只有三条颜色通道，借任何
+        // 一条都会跟别的元素同色。改由 `dot_overlay` 在合成之后直接写像素。
+        // 这里只负责把位置算进 `lay.dots`。
         // 分隔线仍是 1px 矩形：`FillRect` 一次写完，没有比它更便宜的路
         for l in &lay.lines {
             let col = if shadow { 0 } else { chan_color(Chan::Main) };
@@ -133,12 +118,58 @@ fn paint_pass(dc: HDC, lay: &Layout, fonts: &IslandFonts, clock_px: i32, shadow:
     }
 }
 
+/// 把新消息提示点画在**合成结果**上（预乘 ARGB，source-over）。
+///
+/// 1px 抗锯齿边缘：6px 的点在 150%/200% DPI 下会被放大，
+/// 硬边会显得像「一个色块」而不是「一颗灯」。
+fn dot_overlay(px: &mut [u32], w: i32, h: i32, dots: &[layout::Dot], color: u32, a8: u8) {
+    let (cr, cg, cb) = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+    let aa = a8 as u32;
+    for d in dots {
+        let cx = d.x as f32 + d.d as f32 * 0.5;
+        let cy = d.y as f32 + d.d as f32 * 0.5;
+        let rad = d.d as f32 * 0.5;
+        let y0 = (d.y - 1).max(0);
+        let y1 = (d.y + d.d + 1).min(h);
+        let x0 = (d.x - 1).max(0);
+        let x1 = (d.x + d.d + 1).min(w);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let dx = x as f32 + 0.5 - cx;
+                let dy = y as f32 + 0.5 - cy;
+                let cov = (rad + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+                let sa = (cov * 255.0).round() as u32 * aa / 255;
+                if sa == 0 {
+                    continue;
+                }
+                let inv = 255 - sa;
+                let i = (y * w + x) as usize;
+                if i >= px.len() {
+                    continue;
+                }
+                let old = px[i];
+                let (oa, orr, og, ob) = (
+                    (old >> 24) & 0xFF,
+                    (old >> 16) & 0xFF,
+                    (old >> 8) & 0xFF,
+                    old & 0xFF,
+                );
+                let na = sa + oa * inv / 255;
+                let nr = cr * sa / 255 + orr * inv / 255;
+                let ng = cg * sa / 255 + og * inv / 255;
+                let nb = cb * sa / 255 + ob * inv / 255;
+                px[i] = (na.min(255) << 24) | (nr.min(255) << 16) | (ng.min(255) << 8) | nb.min(255);
+            }
+        }
+    }
+}
+
 /// 出一帧并上屏。返回是否真的画了。
 ///
 /// 调用方负责「该不该出帧」的判定（`needs_frame`）—— 这里只管画。
 pub(crate) fn render(a: &mut App) -> bool {
     // 先把 cfg 里要用的值抄成局部量：`&mut a.island` 与 `&a.cfg` 不能同时借。
-    let (op, main_c, dim_c, accent_c, shadow, body_c, body_a) = {
+    let (op, main_c, dim_c, accent_c, shadow, body_c, body_a, dot_c, dot_a8) = {
         let c = a.cfg();
         (
             c.opacity,
@@ -148,6 +179,8 @@ pub(crate) fn render(a: &mut App) -> bool {
             c.shadow,
             c.island_body_color,
             c.island_body_alpha,
+            c.island_dot_color,
+            a.island.dot_a,
         )
     };
     let face = {
@@ -210,12 +243,21 @@ pub(crate) fn render(a: &mut App) -> bool {
     let (lay, pages) = if is_compact {
         // 收起内容永远按**收起端点**排（34px 高、宽度上限 260），水平居中于
         // 当前窗口 —— 动画中窗口在变宽，内容不能跟着重排，否则会看到文字横向抖一下。
-        let segs = super::content::segments(&samples, &items, true);
+        // `peek`：新消息后的拉长态要把正文（来源·正文）并进收起内容，
+        // 窗口宽度由 `recompute` 按内容平滑放大 —— 这里只负责「画什么」。
+        let segs = super::content::segments(&samples, &items, true, a.island.peek);
         layout::compact_page(
             &segs,
             &measure,
             k,
-            layout::sp(COMPACT_MAX_W as f32, k),
+            layout::sp(
+                if a.island.peek {
+                    COMPACT_PEEK_MAX_W as f32
+                } else {
+                    COMPACT_MAX_W as f32
+                },
+                k,
+            ),
             a.island.rot.page,
         )
     } else if ek > 0.0 {
@@ -227,7 +269,13 @@ pub(crate) fn render(a: &mut App) -> bool {
     // 把真实度量宽度回写给 `mod.rs`：下一拍算几何时用它，胶囊就正好裹住内容。
     // （`estimate_compact_w` 只是首帧之前的兜底，中英混排下会差十几像素。）
     if is_compact && lay.width > 0 {
-        a.island.compact_w = lay.width;
+        a.island.compact_w = if a.island.peek {
+            // 拉长态不比常态窄（见 `Island::base_w` 的注释）
+            lay.width.max(a.island.base_w)
+        } else {
+            a.island.base_w = lay.width;
+            lay.width
+        };
     }
     // 页数也要回写：`tick` 靠它判断「要不要轮播」，只有一页时永远不轮播 ——
     // 于是「不轮播」与「内容只有一页」都退化成零出帧，不需要额外的开关。
@@ -300,6 +348,16 @@ pub(crate) fn render(a: &mut App) -> bool {
         tk8,
         Some((body_c, body_a8)),
     );
+
+    // ---- ④b 新消息提示点：**合成之后**才定色。
+    //
+    // 掩码只有三条颜色通道（时钟/日期/格言），圆点借任何一条都会跟别的元素
+    // 同色；而它要的是独立语义色（新消息绿）＋独立的呼吸 alpha。6×6 的点，
+    // 合成后直接按 source-over 写预乘值最便宜，也不用开第四条通道。
+    if dot_a8 > 0 && !lay_draw.dots.is_empty() {
+        let (w, h) = (rect.w, rect.h);
+        dot_overlay(frame.out_pixels_mut(), w, h, &lay_draw.dots, dot_c, dot_a8);
+    }
 
     // ---- ⑤ 上屏：位置 + 尺寸 + 内容一次提交
     let ok = frame.present(hwnd, rect.x, rect.y);

@@ -39,8 +39,8 @@ pub(crate) use window::*;
 // 实现散在各个子模块里，在此集中再导出，免得调用方要知道内部怎么分。
 pub(crate) use input::on_menu;
 pub(crate) use verify::{
-    clicktest, dragbench, dragtest, dump, dump_island, favtest, islandtest, memtest, perf, probe,
-    selftest,
+    cfgshot, clicktest, dragbench, dragtest, dump, dump_island, favtest, islandtest, memtest, perf,
+    probe, selftest,
 };
 
 use std::cell::Cell;
@@ -312,23 +312,37 @@ pub(crate) const MI_ISLAND_COLLAPSE: u32 = 85;
 pub(crate) const MI_ISLAND_EXPAND: u32 = 86;
 
 // 灵动岛设置页的命令码。**只出现在设置面板里**（菜单里不重复，与其它设置项
-// 同一口径）。片段开关用 `BASE + 0..6`，顺序与 `content::ALL_ITEMS` 一致。
+// 同一口径）。片段开关用 `BASE + 0..6`（**七项**），顺序与
+// `content::ALL_ITEMS` 一致。
+//
+// ⚠️ 加第七项（媒体）时踩过一次：`BASE + 6` 正好等于 `ROT_DOWN = 110`，
+// 自检报的是「命令码重复」，而症状会是「媒体勾选框调的是轮播间隔」。
+// 所以后面这一段整体后移了一位，`BASE` 段要有**与 `ALL_ITEMS` 等长**的空间。
 // ⚠️ 起始值必须**大于现有最大命令码**（`MI_QUIT = 99`）。第一版从 87 起排，
 // 排到 99 正好撞上 `MI_QUIT` —— 症状是「退出」项变成「展开宽 +20」，
 // 而 clippy 报的是 `MI_QUIT` 那条 match 分支不可达。命令码是手工分配的，
 // 加新段落时先看一眼这个文件的尾部。
 pub(crate) const MI_ISLAND_ITEM_BASE: u32 = 104;
-pub(crate) const MI_ISLAND_ROT_DOWN: u32 = 110;
-pub(crate) const MI_ISLAND_ROT_UP: u32 = 111;
-pub(crate) const MI_ISLAND_OP_DOWN: u32 = 112;
-pub(crate) const MI_ISLAND_OP_UP: u32 = 113;
-pub(crate) const MI_ISLAND_BODY_COLOR: u32 = 114;
-pub(crate) const MI_ISLAND_ACCENT_COLOR: u32 = 115;
-pub(crate) const MI_ISLAND_W_DOWN: u32 = 116;
-pub(crate) const MI_ISLAND_W_UP: u32 = 117;
-pub(crate) const MI_ISLAND_H_DOWN: u32 = 118;
-pub(crate) const MI_ISLAND_H_UP: u32 = 119;
-pub(crate) const MI_ISLAND_KEEP: u32 = 120;
+pub(crate) const MI_ISLAND_ROT_DOWN: u32 = 111;
+pub(crate) const MI_ISLAND_ROT_UP: u32 = 112;
+pub(crate) const MI_ISLAND_OP_DOWN: u32 = 113;
+pub(crate) const MI_ISLAND_OP_UP: u32 = 114;
+pub(crate) const MI_ISLAND_BODY_COLOR: u32 = 115;
+pub(crate) const MI_ISLAND_ACCENT_COLOR: u32 = 116;
+pub(crate) const MI_ISLAND_W_DOWN: u32 = 117;
+pub(crate) const MI_ISLAND_W_UP: u32 = 118;
+pub(crate) const MI_ISLAND_H_DOWN: u32 = 119;
+pub(crate) const MI_ISLAND_H_UP: u32 = 120;
+pub(crate) const MI_ISLAND_KEEP: u32 = 121;
+/// 新消息拉长时长（`island_peek_ms`，按整秒调）
+pub(crate) const MI_ISLAND_PEEK_DOWN: u32 = 122;
+pub(crate) const MI_ISLAND_PEEK_UP: u32 = 123;
+/// 新消息提示点颜色（`island_dot_color`）
+pub(crate) const MI_ISLAND_DOT_COLOR: u32 = 124;
+/// 桌面适配一键切换（自定义 → 浅底 → 深底 → 自定义）。
+/// **别叫 `MI_FIT`** —— 那个名字是「适应当前屏幕」（78），两者语义不同，
+/// 撞名会让按钮静默跑到缩放逻辑上去。
+pub(crate) const MI_DESK_FIT: u32 = 125;
 
 /// 时间日期块拖动命中的最小判定范围（避免块很小时抓不住）
 pub(crate) const CLOCK_MIN_GRAB: i32 = 28;
@@ -521,6 +535,12 @@ pub(crate) struct App {
     /// 时间/日期字符串；漏掉它就会出现「定时器在跳、画面上的时间永远不动」。
     clock_cached: Option<Box<ClockBox>>,
     clock_norm_key: (u64, i32, i32, i32, i32, i32, u32, u32, u32, i32, i32, u64),
+    /// 竖版「卷轴整体居中」的偏移缓存（审查 U5）：`(指纹, 右缘左移量)`。
+    /// 指纹 = (qi, font_epoch, w, h, cb.w) —— 覆盖偏移的全部输入。
+    /// 命中时 `frame_layout` 直接按缓存偏移排版，只量一次；未命中才两趟
+    /// （先量extent算偏移、再按偏移排）。用 `Cell` 是因为 `frame_layout`
+    /// 拿的是 `&App`，而它每条出帧路径都会走。
+    v_center: Cell<((usize, u64, i32, i32, i32), i32)>,
     /// 主时钟最后出帧时的「时间戳」（时/分/秒），静态画面下用它决定要不要重画
     clock_stamp: u64,
     /// 跑马灯首帧：格言应当已经在带内，而不是让用户先看一段空白
@@ -711,6 +731,7 @@ impl App {
                 0,
             ),
             clock_stamp: u64::MAX,
+            v_center: Cell::new(((usize::MAX, 0, 0, 0, 0), 0)),
             primed: false,
             last_tick: std::time::Instant::now(),
             hover: transition::HoverState::default(),
@@ -902,7 +923,7 @@ impl App {
     /// 字号 / 字体变了就重建字体对象（GDI 字体不可变），
     /// 并刷新跑马灯的宽度度量 —— 不刷新的话滚动节奏会跟字形对不上。
     fn rebuild_fonts(&mut self) {
-        self.fonts.destroy();
+        // 旧字体由 `Fonts::drop` 自动释放（P2-F），不再手工 destroy
         self.fonts = Fonts::build(
             &self.cfg.font,
             self.cfg.eff_scale_pct(),
@@ -1095,5 +1116,53 @@ pub(crate) fn run() -> i32 {
             }
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod command_id_tests {
+    use super::*;
+
+    /// 命令码全局唯一（审查 P1-B）。
+    ///
+    /// 历史事故：岛命令从 87 起排，撞上 `MI_QUIT = 99`。靠「加新段落先看
+    /// 一眼文件尾部」的口头纪律迟早再撞。这条测试把**全部** `MI_*` 收进
+    /// 一个数组断言无重复 —— 新增命令码忘了避让，这里立刻红。
+    ///
+    /// 新增 `MI_*` 时：把常量加进 `named`；若它是一段连续码的基址，
+    /// 把段内其余成员也展开（见下方三个循环），避免段与命名常量重叠漏检。
+    #[test]
+    fn 命令码全局唯一() {
+        let mut ids: Vec<u32> = vec![
+            MI_TOGGLE, MI_GLASS, MI_TEXT, MI_ANIM_BASE, MI_OP_UP, MI_OP_DOWN,
+            MI_TOPMOST, MI_LAYOUT, MI_SECONDS, MI_SHADOW, MI_SPEED_UP, MI_SPEED_DOWN,
+            MI_PREV, MI_NEXT, MI_RELOAD, MI_RESET, MI_CLOCK, MI_DATE, MI_QUOTE,
+            MI_SCALE_UP, MI_SCALE_DOWN, MI_CLOCK_UP, MI_CLOCK_DOWN, MI_QUOTE_UP,
+            MI_QUOTE_DOWN, MI_COLOR, MI_DATE_COLOR, MI_FONT, MI_CLOCK_RESET, MI_QUIT,
+            MI_AUTOSTART, MI_AUTOHIDE, MI_FAV, MI_ORIENT_BASE, MI_ORIENT_V,
+            MI_SPACING_UP, MI_SPACING_DOWN, MI_QUOTE_COLOR, MI_SHRINK_FIT, MI_CONFIG,
+            MI_DPI, MI_FIT, MI_PAUSE, MI_FAV_ONLY, MI_BACKUP, MI_DIAG, MI_ISLAND,
+            MI_ISLAND_UNREAD, MI_ISLAND_COLLAPSE, MI_ISLAND_EXPAND, MI_ISLAND_ITEM_BASE,
+            MI_ISLAND_ROT_DOWN, MI_ISLAND_ROT_UP, MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP,
+            MI_ISLAND_BODY_COLOR, MI_ISLAND_ACCENT_COLOR, MI_ISLAND_W_DOWN,
+            MI_ISLAND_W_UP, MI_ISLAND_H_DOWN, MI_ISLAND_H_UP, MI_ISLAND_KEEP,
+            MI_ISLAND_PEEK_DOWN, MI_ISLAND_PEEK_UP, MI_ISLAND_DOT_COLOR, MI_DESK_FIT,
+        ];
+        // 连续段展开（基址已在 named 里，这里只补段内其余成员）：
+        // 动效 4 档、岛条目 7 项。版式 2 档（70/71）已全命名，无需展开。
+        for k in 1..4 {
+            ids.push(MI_ANIM_BASE + k);
+        }
+        for k in 1..7 {
+            ids.push(MI_ISLAND_ITEM_BASE + k);
+        }
+        ids.sort_unstable();
+        for w in ids.windows(2) {
+            assert_ne!(
+                w[0], w[1],
+                "命令码 {} 重复 —— 新增 MI_* 撞了已有值（历史事故：岛命令撞 MI_QUIT=99）",
+                w[0]
+            );
+        }
     }
 }

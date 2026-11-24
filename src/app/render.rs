@@ -250,9 +250,13 @@ pub(crate) fn build_frame(a: &mut App, opacity: u8) {
 /// 生产代码一律调 `build_frame` —— 那儿的 `None` 让 `draw_glyphs` 回退到
 /// `DevFlags`（生产构建里恒 `false`）。
 pub(crate) fn build_frame_ex(a: &mut App, opacity: u8, no_batch: Option<bool>) {
-    let shadow = a.cfg.shadow;
-    let (color, date_color) = (a.cfg.color, a.cfg.date_color);
-    let quote_color = a.cfg.quote_paint_color();
+    // **取色只走 `fit_paint()`**：桌面适配档位（浅底 / 深底）在这里生效。
+    // 别再单独读 `cfg.color` / `cfg.shadow` —— 两处各读一份，档位就会在
+    // 某些绘制路径上悄悄失效，而画面照样好看、只是颜色不对。
+    let paint = a.cfg.fit_paint();
+    let shadow = paint.shadow;
+    let (color, date_color) = (paint.color, paint.date);
+    let quote_color = paint.quote;
     let shk: u8 = if shadow { 170 } else { 0 };
 
     // 时间日期块的几何先算出来：绘制要用它排版，wndproc 要用它做拖动命中。
@@ -427,6 +431,8 @@ pub(crate) struct SigCol {
     /// true → **出处列**：换句过渡时随格言一起淡（PR3，老板定的语义）。
     /// 时间列是时钟（主职、静帧锚点）、日期列是落款配角，都不动。
     pub(crate) is_author: bool,
+    /// true → 整串旋转 90° 绘制（时间列，审查 U4），而非逐字下落。
+    pub(crate) rot: bool,
 }
 
 /// 量一次时间日期块的几何（无缓存，见 `layout_clock`）。
@@ -579,7 +585,7 @@ fn layout_sign(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox 
         cols.push((wide(&quote.author), false, true));
     }
     if cfg.show_date {
-        cols.push((wide(&fmt_date(&local_time())), false, false));
+        cols.push((wide(&fmt_date_short(&local_time())), false, false));
     }
 
     let mut cb = ClockBox {
@@ -624,7 +630,19 @@ fn layout_sign(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox 
         .max()
         .unwrap_or(0) as i32;
     let bw = (ncol - 1) * pitch + cw;
-    let bh = (rows - 1).max(0) * cell + ch;
+    let mut bh = (rows - 1).max(0) * cell + ch;
+    // 时间列整串旋转（U4）：纵向跨度 = 旋转字体的串宽，取它与逐字高度的较大者，
+    // 保证长串（如带秒的 8 字符）不被落款条底边裁掉。量完把字体选回 date。
+    if cfg.show_clock {
+        if let Some((s, _, _)) = cols.first() {
+            unsafe {
+                SelectObject(dc, fonts.date_rot as HGDIOBJ);
+                let (tw, _) = gfx::measure_text(dc, s);
+                bh = bh.max(tw);
+                SelectObject(dc, fonts.date as HGDIOBJ);
+            }
+        }
+    }
 
     // 默认位置：贴左侧、垂直居中；再叠用户拖动偏移，夹进窗口
     let x0 = pad;
@@ -642,6 +660,8 @@ fn layout_sign(cfg: &Config, fonts: &Fonts, dc: HDC, quote: &Quote) -> ClockBox 
             x,
             main_color: mc,
             is_author: au,
+            // 时间列 = 主色且非出处 → 整串旋转（U4）
+            rot: mc && !au,
         });
     }
     cb.x = bx;
@@ -675,8 +695,9 @@ pub(crate) fn hug_sign(cfg: &Config, mut cb: ClockBox, ql: &QuoteLayout) -> Cloc
     }
     let pad = cfg.pad();
     let band = frame_band(cfg, &cb);
-    // 主文右起贴 br ⇒ 主文块左缘 = br - ext_w（band 元组是 (bl, bt, br, bb)）
-    let main_left = band.2 - ql.extent.0;
+    // 主文块左缘取**真实字形最小 x**：居中（U5）之后主文不再贴 br，
+    // 用 band.2 - extent 推会偏一个居中偏移量。
+    let main_left = ql.glyphs.iter().map(|g| g.x).min().unwrap_or(band.2);
     let want_bx = (main_left - pad - cb.w + cfg.clock_dx)
         .clamp(pad, (cfg.w - cb.w - pad).max(pad));
     if want_bx > cb.x {
@@ -758,7 +779,7 @@ pub(crate) fn frame_band(cfg: &Config, cb: &ClockBox) -> (i32, i32, i32, i32) {
 
 /// 当前这一帧的排版结果。
 pub(crate) fn frame_layout(a: &App, cb: &ClockBox) -> QuoteLayout {
-    let band = frame_band(&a.cfg, cb);
+    let mut band = frame_band(&a.cfg, cb);
     // 度量时字距必须为 0 —— 字距由排版层自己加进定位表
     unsafe { SetTextCharacterExtra(a.frame.dc(), 0) };
     // 竖版主文**不带出处尾巴**：「正文　——　作者」在竖排里会变成一列
@@ -766,12 +787,47 @@ pub(crate) fn frame_layout(a: &App, cb: &ClockBox) -> QuoteLayout {
     // 古籍正文从不夹署名 —— 出处归落款条（仿古排版，2026-10-15 老板拍板）。
     // 横版维持 display()（跑马灯一行带出处）。
     let q = &a.list[a.qi];
-    let text = if a.cfg.orient == Orient::Vertical {
-        q.text.clone()
+    let (text, attr_from) = if a.cfg.orient == Orient::Vertical {
+        (q.text.clone(), None)
     } else {
-        q.display()
+        // 横版：出处（「——　作者」）独立成行右对齐（审查 U3）。
+        // display() = 正文 + 「　——　」 + 作者，分界跳过那个全角空格，
+        // 让出处行从「——」起画。无出处时 None = 整段正文。
+        let af = if q.author.is_empty() {
+            None
+        } else {
+            Some(q.text.chars().count() + 1)
+        };
+        (q.display(), af)
     };
-    layout_quote(&a.cfg, &a.fonts, a.frame.dc(), band, &text)
+    // ---- 竖版「卷轴整体居中」（审查 U5）：正文右起贴右缘 + 落款跟排之后，
+    // 短句时整个内容簇贴右、左侧近半窗口空白。把版心右缘左移 offset，
+    // 让「落款 + 正文」簇水平居中；hug_sign 按真实字形左缘贴排，关系不变。
+    // 用户拖过时钟（clock_dx != 0）时不碰 —— 用户意图压过自动行为。
+    // 偏移按指纹缓存：命中只排一趟，未命中才两趟（先量 extent 再定偏移）。
+    if a.cfg.orient == Orient::Vertical && cb.show && a.cfg.clock_dx == 0 && a.cfg.show_quote {
+        let pad = a.cfg.pad();
+        let key = (a.qi, a.font_epoch, a.cfg.w, a.cfg.h, cb.w);
+        let (ck, off) = a.v_center.get();
+        if ck == key {
+            band.2 -= off;
+        } else {
+            let probe = layout_quote(&a.cfg, &a.fonts, a.frame.dc(), band, &text, attr_from);
+            let avail = a.cfg.w - 2 * pad;
+            let cluster = cb.w + pad + probe.extent.0;
+            let off = if !probe.is_empty() && cluster < avail {
+                (avail - cluster) / 2
+            } else {
+                0
+            };
+            a.v_center.set((key, off));
+            if off == 0 {
+                return probe;
+            }
+            band.2 -= off;
+        }
+    }
+    layout_quote(&a.cfg, &a.fonts, a.frame.dc(), band, &text, attr_from)
 }
 
 /// 排一次格言，走「缩字阶梯」。
@@ -787,6 +843,7 @@ fn layout_quote(
     dc: HDC,
     band: (i32, i32, i32, i32),
     text: &str,
+    attr_from: Option<usize>,
 ) -> QuoteLayout {
     let s = wide(text);
     // 排版单位是 Unicode 标量值，不是 UTF-16 code unit：代理对必须留在同一个
@@ -824,7 +881,7 @@ fn layout_quote(
         }
         let (cw, ch) = gfx::measure_text(dc, &wide("国"));
         let m = Metrics::new(cw.max(1), ch.max(1));
-        let mut ql = layout::layout(&chars, &adv, m, cfg.orient, band, spacing);
+        let mut ql = layout::layout_with_attr(&chars, &adv, m, cfg.orient, band, spacing, attr_from);
         ql.shrink = pct;
         if !ql.overflow {
             return ql;
@@ -890,16 +947,28 @@ fn paint_main(rc: &mut RC, dc: HDC, cb: &ClockBox, pass: Pass, ql: &QuoteLayout)
 
     // ---- 时钟（横版：左上角的时间块；竖版：落款里走主色通道的那一列）
     if cfg.orient == Orient::Vertical {
-        unsafe { SelectObject(dc, rc.fonts.date as HGDIOBJ) };
         for c in cb.sig.iter().filter(|c| c.main_color) {
-            gfx::draw_vtext(
-                dc,
-                &c.s,
-                c.x + ox,
-                cb.y + oy,
-                cb.sig_cell,
-                pass.paint_color(gfx::CH_CLOCK),
-            );
+            if c.rot {
+                // 时间列整串旋转 90°（U4）：一列读作一条时间，而非逐字格子
+                unsafe { SelectObject(dc, rc.fonts.date_rot as HGDIOBJ) };
+                gfx::draw_text(
+                    dc,
+                    &c.s,
+                    c.x + ox,
+                    cb.y + oy,
+                    pass.paint_color(gfx::CH_CLOCK),
+                );
+            } else {
+                unsafe { SelectObject(dc, rc.fonts.date as HGDIOBJ) };
+                gfx::draw_vtext(
+                    dc,
+                    &c.s,
+                    c.x + ox,
+                    cb.y + oy,
+                    cb.sig_cell,
+                    pass.paint_color(gfx::CH_CLOCK),
+                );
+            }
         }
     } else if cb.show {
         if let Some(s) = &cb.time {

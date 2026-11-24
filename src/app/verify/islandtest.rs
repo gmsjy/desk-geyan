@@ -15,7 +15,10 @@
 use std::ptr::null;
 use std::time::Instant;
 
-use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowExW, GetWindowThreadProcessId,
+};
 
 use super::*;
 use crate::bench::with_config_guard;
@@ -37,11 +40,31 @@ fn row(ok: bool, name: &str, detail: String) -> bool {
     ok
 }
 
-fn window_exists() -> bool {
+/// 本进程的岛窗口（没有就返回空）。
+///
+/// **不能只用 `FindWindowW`**：用户自己的挂件实例随时可能在跑，窗口类名
+/// 完全一样，`FindWindowW` 返回的是 Z 序最上那个 —— 于是「关掉后窗口不存在」
+/// 会读成 true，"开关一轮句柄不涨" 也会跟着红。自检必须能带着一个正在用的
+/// 实例跑，否则它只能在「先把用户程序关掉」的前提下才可信。
+fn own_island_window() -> HWND {
     unsafe {
         let cls = wide(ISLAND_CLASS);
-        !FindWindowW(cls.as_ptr(), null()).is_null()
+        let me = GetCurrentProcessId();
+        let mut h = FindWindowExW(std::ptr::null_mut(), std::ptr::null_mut(), cls.as_ptr(), std::ptr::null_mut());
+        while !h.is_null() {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid == me {
+                return h;
+            }
+            h = FindWindowExW(std::ptr::null_mut(), h, cls.as_ptr(), std::ptr::null_mut());
+        }
+        std::ptr::null_mut()
     }
+}
+
+fn window_exists() -> bool {
+    !own_island_window().is_null()
 }
 
 fn islandtest_inner() -> i32 {
@@ -430,8 +453,12 @@ fn islandtest_inner() -> i32 {
     let (pages_n, saw_out, saw_in, page_after, renders_up) = with_app(|a| {
         a.cfg.island_rotate = 1;
         // 不计数 ⇒ Msg 片段显示**正文**（长），而不是 4 个字符的 `MSG n`。
-        // 正文 20 个汉字必然超过一页的可用宽度，于是「至少两页」是结构性的，
-        // 不依赖这台机器有没有电池 / CPU 采样到没有。
+        // 正文必须长到一页装不下，于是「至少两页」是结构性的，不依赖这台
+        // 机器有没有电池 / CPU 采样到没有。
+        //
+        // 长度跟着 `COMPACT_MAX_W` 走：上限 260 时 20 个字就够，上限 400 时
+        // 20 字（260px + 内边距）反而**装得下**，这条就会以「共 1 页」失败 ——
+        // 而它失败的原因跟轮播毫无关系。42 个字 ≈ 546px，对 400 上限有 140px 余量。
         a.cfg.island_unread = false;
         // 进入延时钉到上限 5000ms：`tick` 每拍都会重新判定悬停，若光标正好
         // 落在胶囊上，1.4s 内就会展开 —— 展开态**不轮播**（用户在看面板），
@@ -444,7 +471,10 @@ fn islandtest_inner() -> i32 {
         a.cfg.island_items = "clock,msg".to_string();
         a.island.items = Items::parse(&a.cfg.island_items);
         a.island.samples.counting = false;
-        a.island.samples.msg = Some("轮播测试的一句话要足够长才能撑出第二页".into());
+        a.island.samples.msg = Some(
+            "轮播测试的这段话必须足够长，长到一页装不下，否则这条断言会因为它验的东西以外的东西变绿"
+                .into(),
+        );
         island::collapse(a);
         island::draw::render(a); // 让 draw 把页数回写
         let pages = a.island.pages;
@@ -581,6 +611,259 @@ fn islandtest_inner() -> i32 {
         format!("重开一轮窗口后 consume_events 仍为 false={no_consume}"),
     );
 
+    // ⑲ 新消息 → 拉长（宽变、高不变、绿点亮）→ 已读回缩
+    //
+    // 这是 2026-11-24 的产品逻辑：新消息只让胶囊**横向拉长**并亮绿点，
+    // 不弹面板；悬停才展开；展开停留够久（`READ_MS`）后绿点熄灭、宽度回缩。
+    // 三条判据各自会红：宽度没变（拉长没接上）、高度跟着变（等于偷偷展开）、
+    // 绿点不是绿的（通道借错了，会显示成主色白点）。
+    let (w_idle, w_peek, h_peek, green, w_back) = with_app(|a| {
+        a.cfg.island = true;
+        unsafe { island::create(a) };
+        a.island.consume_events = false;
+        a.island.items = Items::parse("clock,dot,msg");
+        a.island.samples.clock = "09:41".into();
+        a.island.samples.msg =
+            Some("微信 · 张三：明天上午十点评审，记得带原型".into());
+        a.island.samples.unread = 0;
+        a.island.samples.counting = true;
+
+        let settle = |a: &mut App| {
+            a.island.compact_w = 0;
+            a.island.anim_w = 0;
+            island::draw::render(a);
+            a.island.anim_w = 0;
+            island::recompute(a);
+            island::draw::render(a);
+        };
+
+        a.island.fresh = false;
+        a.island.peek = false;
+        a.island.dot_a = 0;
+        island::force_state(a, State::Collapsed);
+        settle(a);
+        let w0 = a.island.rect.w;
+
+        a.island.fresh = true;
+        a.island.fresh_at = std::time::Instant::now();
+        a.island.dot_a = 255;
+        a.island.peek = true;
+        settle(a);
+        let w1 = a.island.rect.w;
+        let h1 = a.island.rect.h;
+        // 绿点：G 通道明显高过 R/B。用**相对判据**（而不是「等于 #34D399」），
+        // 这样换主题色 / 不透明度不会误伤，而「借错通道画成白点」必然被抓。
+        let mut green = 0usize;
+        {
+            let (px, _pw, _ph) = a.island.frame_pixels();
+            for p in px.iter() {
+                let (r, g, b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                if g > 120 && g > r + 40 && g > b + 20 {
+                    green += 1;
+                }
+            }
+        }
+
+        a.island.fresh = false;
+        a.island.peek = false;
+        a.island.dot_a = 0;
+        settle(a);
+        (w0, w1, h1, green, a.island.rect.w)
+    })
+    .unwrap_or((0, 0, 0, 0, 0));
+    all &= row(
+        w_peek > w_idle + 40 && h_peek == 34 && green > 8 && w_back == w_idle,
+        "⑲ 新消息拉长：变宽不变高 · 绿点真绿 · 已读回缩",
+        format!(
+            "宽 {} → {} → {}（须增 >40 且回到原值）· 高 {}（须 34）· 绿像素 {}（须 >8）",
+            w_idle, w_peek, w_back, h_peek, green
+        ),
+    );
+
+    // ⑳ 绿点呼吸 10s → 退化常亮，并且**停止出帧**
+    //
+    // 一条用户不读的消息不该让进程永远 40ms 拍一帧。这条同时钉两件事：
+    // ① 10s 后 alpha 固定成 `DOT_STEADY_A`（不再随相位变）；
+    // ② `needs_frame()` 变假 —— 只看 alpha 不够，恒呼吸时 alpha 也可能
+    //    偶然撞上常亮值，而「还在出帧」是最尖锐的判据。
+    let (young_frames, steady_a, steady_frames) = with_app(|a| {
+        a.cfg.island = true;
+        if !a.island.on() {
+            unsafe { island::create(a) };
+        }
+        // 轮播会周期性置脏，把「稳态不出帧」的判据搅浑 —— 这一条里关掉它。
+        a.cfg.island_rotate = 0;
+        a.island.consume_events = false;
+        a.island.items = Items::parse("clock,dot");
+        a.island.samples.clock = "09:41".into();
+        a.island.samples.msg = None;
+        a.island.samples.unread = 0;
+        a.island.samples.counting = true;
+        island::force_state(a, State::Collapsed);
+
+        // 先把几何收敛：⑲ 结束时胶囊刚回缩，`anim_w` 还在逐拍逼近目标。
+        // 不收敛就断言「不出帧」，会在平滑途中的某一拍上假红。
+        a.island.fresh = false;
+        a.island.peek = false;
+        a.island.dot_a = 0;
+        for _ in 0..24 {
+            island::tick(a);
+        }
+
+        // 呼吸期：应当出帧
+        a.island.fresh = true;
+        a.island.fresh_at = std::time::Instant::now();
+        a.island.dot_steady = false;
+        a.island.dirty = false;
+        island::tick(a);
+        let young = a.island.needs_frame();
+
+        // 11s 后：常亮 + 不再出帧
+        a.island.fresh = true;
+        a.island.fresh_at =
+            std::time::Instant::now() - std::time::Duration::from_millis(11_000);
+        a.island.dot_steady = false;
+        a.island.dirty = false;
+        island::tick(a); // 这一拍补 dirty，把 alpha 精确落到常亮值
+        let steady = a.island.dot_a;
+        island::tick(a); // 稳态拍
+        let nf = a.island.needs_frame();
+        (young, steady, nf)
+    })
+    .unwrap_or((false, 0, true));
+    let steady_want = crate::island::geom::DOT_STEADY_A;
+    all &= row(
+        young_frames && steady_a == steady_want && !steady_frames,
+        "⑳ 绿点呼吸 10s 后退化常亮并停止出帧",
+        format!(
+            "呼吸期出帧 {}（须 true）· 11s 后 alpha {}（须 {}）· 稳态出帧 {}（须 false）",
+            young_frames, steady_a, steady_want, steady_frames
+        ),
+    );
+
+    // ㉑ 电脑状态三格**定宽**：数值变化不该改变胶囊宽度
+    //
+    // 这条钉的是 `Seg::widest` 那条机制。判据取「两次不同采样值下的
+    // `compact_w` 逐像素相等」，而不是「字符串里补了空格」—— 第一版就是
+    // 补空格，字符串长度确实变了却又没等宽（雅黑的空格 ≈4px、数字 ≈8px），
+    // 胶囊照样 384→392 地跳。只有量出来的宽度相等才算数。
+    let (w_small, w_big) = with_app(|a| {
+        a.cfg.island_items = "clock,dot,cpu,mem,battery,msg,media".to_string();
+        a.island.items = Items::parse(&a.cfg.island_items);
+        a.island.samples.media = Some("一二三四五六七八九十".to_string());
+        a.cfg.island_unread = true;
+        a.island.samples.counting = true;
+        a.island.samples.clock = "09:41".to_string();
+        a.island.samples.unread = 3;
+        a.island.samples.msg = Some("定宽夹具".to_string());
+        a.island.peek = false;
+        island::collapse(a);
+        a.island.samples.cpu = Some(1);
+        a.island.samples.mem = Some(2);
+        a.island.samples.battery = Some((3, false));
+        island::draw::render(a);
+        let small = a.island.compact_w;
+        a.island.samples.cpu = Some(100);
+        a.island.samples.mem = Some(100);
+        a.island.samples.battery = Some((100, true));
+        island::draw::render(a);
+        (small, a.island.compact_w)
+    })
+    .unwrap_or((0, -1));
+    all &= row(
+        w_small > 0 && w_small == w_big,
+        "㉑ 状态三格定宽（数值变化不改宽度）",
+        format!("CPU/MEM/BAT=1/2/3% 时 {w_small}px · 100/100/100% 时 {w_big}px（须相等）"),
+    );
+
+    // ㉒ 七个片段**一页装得下** + 拉长态不比常态窄
+    //
+    // 前一版上限是 260：六项会被切成两页，而 `island_rotate=0`（默认）时
+    // 第 2 页永不出现 —— 用户勾了「电池」却在胶囊上找不到它。所以这里
+    // 必须在**最坏值**（全 100% + `MSG 99+`）下验「只有一页」。
+    // 拉长态那条配的是短消息：正文比状态三格窄得多，没有 `base_w` 下限时
+    // 「拉长」会变成「缩短」。
+    let (p_all, base_w, peek_w) = with_app(|a| {
+        a.island.samples.unread = 99;
+        island::draw::render(a);
+        let pages = a.island.pages;
+        let base = a.island.base_w;
+        a.island.fresh = true;
+        a.island.fresh_at = std::time::Instant::now();
+        a.island.dot_a = 255;
+        a.island.samples.msg = Some("CI · 构建完成".to_string());
+        a.island.peek = true;
+        island::draw::render(a);
+        (pages, base, a.island.compact_w)
+    })
+    .unwrap_or((9, 0, -1));
+    all &= row(
+        p_all == 1 && peek_w >= base_w && base_w > 0,
+        "㉒ 七片段一页装下 + 拉长不比常态窄",
+        format!("共 {p_all} 页（须 1）· 常态 {base_w}px · 拉长 {peek_w}px（须 ≥ 常态）"),
+    );
+
+    // ㉓ 媒体片段：常态有、拉长态让位
+    //
+    // 让位是**与状态三格同一条规则**：常态已经很宽，拉长态如果把媒体也留着，
+    // 正文就没地方了 —— 用户看到的是「拉长了但没变宽」，等于没提示。
+    //
+    // 判据取「片段里有没有 ♪ 前缀」，不是「宽度变了没有」：宽度还会被
+    // 正文长度影响，量宽度验不出「该让位时让没让」。
+    let (has_media, peek_has_media) = with_app(|a| {
+        a.island.samples.media = Some("晴天".to_string());
+        let normal = island::content::segments(&a.island.samples, &a.island.items, true, false);
+        let peeked = island::content::segments(&a.island.samples, &a.island.items, true, true);
+        let hit = |segs: &[island::content::Seg]| segs.iter().any(|x| x.text.contains('♪'));
+        (hit(&normal), hit(&peeked))
+    })
+    .unwrap_or((false, true));
+    all &= row(
+        has_media && !peek_has_media,
+        "㉓ 媒体片段：常态显示 · 拉长态让位",
+        format!("常态含 ♪={has_media} · 拉长态含 ♪={peek_has_media}（须 false）"),
+    );
+
+    // ㉔ 通知正文只活在呼吸期
+    //
+    // 系统通知**不计入 `unread`**（那个数只数 `events\seen\` 里的文件），
+    // 所以「刚弹了一条通知」落在 `unread == 0 && dot_breathing == true` 这一档。
+    //
+    // 判据分三段，因为「圆点还在」与「刚到了」是两个语义（`dot_visible` /
+    // `dot_breathing`）：呼吸 10s 后圆点退化成常亮 178，此时点还在、正文必须
+    // 收 —— 否则用户看过了那句话也一直挂在胶囊上。三段全过才算对：
+    // 呼吸中要写、转常亮要收、熄灭也不写。
+    //
+    // 判据取「片段里有没有正文关键字」，而不是「宽度变了没有」：
+    // 宽度会被别的项影响，量宽度验不出「该说的话说了没有」。
+    let (said, after_breathe, gone) = with_app(|a| {
+        a.island.samples.counting = true;
+        a.island.samples.unread = 0;
+        a.island.samples.msg = Some("张三：明天评审".to_string());
+        let has = |s: &island::content::Samples| {
+            island::content::segments(s, &a.island.items, true, false)
+                .iter()
+                .any(|x| x.text.contains("张三"))
+        };
+        // ① 呼吸期（刚到了）
+        a.island.samples.dot_visible = true;
+        a.island.samples.dot_breathing = true;
+        let on = has(&a.island.samples);
+        // ② 呼吸结束、圆点转常亮：点还在，但「刚到了」这段过去了
+        a.island.samples.dot_breathing = false;
+        let steady = has(&a.island.samples);
+        // ③ 已读：点也灭了
+        a.island.samples.dot_visible = false;
+        let off = has(&a.island.samples);
+        (on, steady, off)
+    })
+    .unwrap_or((false, true, true));
+    all &= row(
+        said && !after_breathe && !gone,
+        "㉔ 通知正文只活在呼吸期（转常亮即收）",
+        format!("呼吸中含正文={said}（须 true）· 转常亮后={after_breathe}（须 false）· 熄灭后={gone}（须 false）"),
+    );
+
     // 收尾：关窗
     with_app(|a| {
         a.cfg.island = false;
@@ -590,7 +873,7 @@ fn islandtest_inner() -> i32 {
     println!(
         "\n{}",
         if all {
-            "灵动岛自检 19 步全 PASS（⓪ + ①~⑱）"
+            "灵动岛自检 25 步全 PASS（⓪ + ①~㉔）"
         } else {
             "存在失败项"
         }
@@ -660,11 +943,16 @@ struct Frozen {
     mem: Option<u32>,
     battery: Option<(u32, bool)>,
     msg: Option<String>,
+    /// 正在播放的媒体行；`None` = 没有媒体（该格不出现）
+    media: Option<String>,
     unread: u32,
     /// `None` = 六项全开（基线默认）；`Some("cfg")` = 服从 `island_items`
     items: Option<String>,
     /// 收起态第几页（越界按取模回绕）。展开态无意义，恒 0
     page: usize,
+    /// `peek=1`：导出「新消息拉长态」——胶囊变宽显示来源·正文 + 绿点常亮。
+    /// 它**不是**展开态：高度仍是 34。
+    peek: bool,
 }
 
 impl Default for Frozen {
@@ -676,9 +964,11 @@ impl Default for Frozen {
             mem: Some(62),
             battery: Some((88, false)),
             msg: Some("今晚八点归档 v0.2".to_string()),
+            media: Some("晴天 - 周杰伦".to_string()),
             unread: 3,
             items: None,
             page: 0,
+            peek: false,
         }
     }
 }
@@ -707,9 +997,11 @@ fn freeze(overrides: &[(String, String)]) -> Frozen {
             "mem" => f.mem = num_or_none(v),
             "battery" => f.battery = parse_battery(v),
             "msg" => f.msg = Some(v.clone()).filter(|s| !s.is_empty() && s != "-"),
+            "media" => f.media = Some(v.clone()).filter(|s| !s.is_empty() && s != "-"),
             "unread" => f.unread = v.trim().parse::<u32>().unwrap_or(0),
             "items" => f.items = Some(v.clone()),
             "page" => f.page = v.trim().parse().unwrap_or(0),
+            "peek" => f.peek = !matches!(v.as_str(), "0" | "false" | "off" | "-"),
             _ => {}
         }
     }
@@ -796,11 +1088,21 @@ pub(crate) fn dump_island(path: &str, overrides: &[(String, String)]) -> i32 {
         now.wSecond = 0;
         // `consume: false` —— 导出**绝不**搬动用户的真实消息文件
         // （`--dump-island` 会跑线上的 `update`，把这条显式关掉才谈得上零副作用）。
+        //
+        // `unread` **必须跟配置**（曾经写死 `false`）：它决定 `Samples::counting`，
+        // 而计数模式画的是 `MSG n`、不计数模式画的是正文 —— 两条不同的排版路径。
+        // 写死 false 时导出的收起态永远是非计数形态，真机却是 `MSG 3`：
+        // 像素基线测的和用户看的是两幅画，量出来的宽度也就对不上。
         let opts = crate::island::content::Opts {
             seconds,
-            unread: false,
+            unread: a.cfg.island_unread,
             consume: false,
             keep: a.cfg.island_events_keep,
+            // 导出**不许**读真实系统通知或真实媒体：否则同一份配置在不同
+            // 时刻导出两张不同的图（通知库随时在变、歌单随时在换），
+            // 像素基线就没意义了。要用媒体就显式传 `media=...`。
+            notice: false,
+            media: false,
         };
         a.island.samples.update(&items, opts, &now);
     }
@@ -808,6 +1110,7 @@ pub(crate) fn dump_island(path: &str, overrides: &[(String, String)]) -> i32 {
     a.island.samples.mem = fz.mem;
     a.island.samples.battery = fz.battery;
     a.island.samples.msg = fz.msg.clone();
+    a.island.samples.media = fz.media.clone();
     a.island.samples.unread = fz.unread;
     if let Some(c) = &fz.clock {
         a.island.samples.clock = c.clone();
@@ -825,9 +1128,26 @@ pub(crate) fn dump_island(path: &str, overrides: &[(String, String)]) -> i32 {
         State::Expanded
     };
     island::force_state(&mut a, want);
+    if fz.peek {
+        // 先出一帧**常态**：拉长态的宽度下限是常态宽（`Island::base_w`），
+        // 而这个值只有画过常态帧才有。真机上"上一拍就是常态"是天然成立的，
+        // 导出里必须显式补这一帧，否则导出的拉长态会比真机窄一大截。
+        island::draw::render(&mut a);
+        // 拉长态：`fresh` 让绿点亮着，`peek` 让收起内容并入正文。
+        // `anim_w = 0` 是让 `recompute` **首拍就对齐全宽**，不做平滑 ——
+        // 导出要的是稳态，不是动画中间帧。
+        a.island.fresh = true;
+        a.island.fresh_at = std::time::Instant::now();
+        a.island.dot_a = 255;
+        a.island.samples.dot_visible = true;
+        a.island.peek = true;
+        a.island.compact_w = 0;
+        a.island.anim_w = 0;
+    }
     // 页号要在出帧之前定：收起态的排版按 `rot.page` 选页
     a.island.rot.page = fz.page;
     island::draw::render(&mut a);
+    a.island.anim_w = 0;
     island::recompute(&mut a);
     island::draw::render(&mut a);
 

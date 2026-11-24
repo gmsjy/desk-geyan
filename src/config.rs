@@ -288,6 +288,39 @@ impl fmt::Display for Orient {
 /// 默认就是跟随主色，而 `color` 的取值范围是 `0x00RRGGBB`，永远不会撞上这个值。
 pub const COLOR_UNSET: u32 = 0xFFFF_FFFF;
 
+/// 桌面适配档位的两套配色。**只作用于挂件渲染**（`app/render.rs` 取色处），
+/// 不改 `color` / `shadow` 本身 —— 切回「自定义」时原值仍在。
+///
+/// 取色依据是实测（2026-11-24，真实屏幕）：浅底 `#E2E8ED` + opacity 191 下，
+/// 浅金 `#F5D98B` 的 WCAG 对比度只有 **1.03:1**（正文要 4.5:1，灰度上完全糊掉）；
+/// `#3E2E0C` 在同一条件下 **5.16:1**。深底 `#0B0D12` 上 `#FFE9A8` 为 9.2:1。
+///
+/// 日期比正文弱一档是既有设计（`date_color` 与 `color` 本来就是两个键），
+/// 所以浅底档的日期色也单独给，而不是偷懒复用正文色。
+pub const FIT_DARK_INK: u32 = 0x3E2E0C;
+pub const FIT_DARK_INK_DIM: u32 = 0x4A3E28;
+pub const FIT_LIGHT_INK: u32 = 0xFFE9A8;
+pub const FIT_LIGHT_INK_DIM: u32 = 0xC8C0B0;
+
+/// 一帧实际要用的一组颜色。由 `Config::fit_paint` 从 `cfg` 推出来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paint {
+    pub color: u32,
+    pub date: u32,
+    pub quote: u32,
+    pub shadow: bool,
+}
+
+/// 档位的中文短名。面板按钮、托盘菜单、toast 共用这一份，避免三处各写一遍
+/// 然后有一处忘了改。
+pub fn fit_label(fit: i32) -> &'static str {
+    match fit {
+        1 => "浅底",
+        2 => "深底",
+        _ => "自定",
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub x: i32,
@@ -310,6 +343,14 @@ pub struct Config {
     pub fav_only: bool,
     /// 文字阴影：浅色壁纸下把白字托起来
     pub shadow: bool,
+    /// 桌面适配档位：0 = 自定义（`color` / `shadow` 原样）
+    /// 1 = 浅色桌面（深墨金 + 强制描边）　2 = 深色桌面（亮金 + 不描边）
+    ///
+    /// **存在的理由**：浅色壁纸 + 浅金字的对比度实测只有 1.03:1（正文要求
+    /// 4.5:1），可同一套浅金在深色壁纸上很好看 —— 与其让用户每次手改两个
+    /// 颜色再赔上一个开关，不如换挡。**档位只在渲染时覆盖，不动
+    /// `color` / `shadow`**，所以切回「自定义」原值还在。
+    pub fit: i32,
     /// 跑马灯速度 px/s
     pub speed: i32,
     /// 字号缩放百分比（整体，时钟/日期/格言一起放大）
@@ -377,9 +418,25 @@ pub struct Config {
     /// 上次端点：`false` = 收起，`true` = 展开
     pub island_state: bool,
     /// 收起态片段顺序，csv（`clock,dot,cpu,mem,battery,msg`）
+    ///
+    /// 默认**全开**：这一排就是「电脑状态」，用户装它就是想在屏幕上看到
+    /// 那三个数。缺省只给 `clock,dot` 的结果是「装完了，但得先自己翻到
+    /// 设置第二页、再猜哪几个勾选框才是状态」—— 一项能力默认关着，
+    /// 等于没有。不可用的项由 `content::segments` 自动剔除：台式机没有
+    /// 电池就只是不画 `BAT`，不会留下一个空位或 `--` 占位。
     pub island_items: String,
     /// 收起态轮播间隔（秒），0 = 不轮播
     pub island_rotate: i32,
+    /// 新消息到达后**拉长**显示来源·正文的时长（ms）。0 = 不拉长。
+    ///
+    /// 注意语义：拉长 ≠ 展开 —— 高度仍是收起态的 34px，只有宽度变大。
+    /// 展开仍然只由悬停驱动（见 `island/mod.rs` tick 的 ②b）。
+    pub island_peek_ms: i32,
+    /// 新消息提示点颜色（收起态胶囊里的那个圆点）。
+    ///
+    /// 默认绿 `#34D399`：它表达的是「有新东西」，与强调色（信息/链接）不是
+    /// 同一个语义，所以单独一个色，不借主色或强调色通道。
+    pub island_dot_color: u32,
     /// 展开端点（**逻辑**像素，运行时乘 DPI）
     pub island_w: i32,
     pub island_h: i32,
@@ -400,6 +457,11 @@ pub struct Config {
     /// 事件归档：`true` = 读过的 `.msg` 移进 `events\seen\` 留 7 天；
     /// `false` = 读完即删（也就没有历史可数，未读退回进程内累计）
     pub island_events_keep: bool,
+    /// 是否采集**系统通知**（`wpndatabase.db`）。
+    ///
+    /// 与 `events\*.msg` 是两条并列的入口：文件是给别人留的协议口，通知是
+    /// 给「本来就弹在屏幕上的那些」用的。关掉后胶囊只认文件。
+    pub island_notify: bool,
 }
 
 impl Default for Config {
@@ -420,6 +482,7 @@ impl Default for Config {
             paused: false,
             fav_only: false,
             shadow: true,
+            fit: 0,
             speed: 60,
             scale: 100,
             clock_scale: 100,
@@ -451,8 +514,17 @@ impl Default for Config {
             // 「屏幕上多出一条东西」。首次在设置面板里引导。
             island: false,
             island_state: false,
-            island_items: "clock,dot".to_string(),
+            // 岛本身默认关（强默认），但**开了就要有东西看**：默认给
+            // 时钟 + 绿点 + 三格电脑状态。不可用的（台式机没电池）由采样层
+            // 自动跳过，不会留下空位。
+            //
+            // 默认**不含 `msg`**：`MSG n` 会把常态再撑宽约 50px，而消息本身
+            // 已经有绿点（有新消息就亮）与拉长态正文两条提示路径 —— 计数
+            // 属于「我还想额外知道有多少条」的可选项，留在设置里自己勾。
+            island_items: "clock,dot,cpu,mem,battery,media".to_string(),
             island_rotate: 0,
+            island_peek_ms: 3000,
+            island_dot_color: 0x34D399,
             island_w: 420,
             island_h: 136,
             island_body_color: 0x0B0D12,
@@ -463,6 +535,9 @@ impl Default for Config {
             island_screen: String::new(),
             island_unread: true,
             island_events_keep: true,
+            // 默认开：用户勾了 `msg` 就是想要「有事就告诉我」，
+            // 而系统通知是这条链路上唯一不依赖外部脚本的来源。
+            island_notify: true,
         }
     }
 }
@@ -517,11 +592,45 @@ impl Config {
         }
     }
 
+    /// 档位 → 本帧真正要用的色组。**纯函数**（自检直接拿它算对比度，
+    /// 不必起窗口 —— 这样「换了档位对比度到底够不够」可以在毫秒内验完）。
+    ///
+    /// 三档语义：
+    /// - `0` 自定义：完全按 `color` / `date_color` / `quote_color` / `shadow`；
+    /// - `1` 浅底：深墨金 + **强制描边**。描边不是装饰 —— 背景不可控时它是
+    ///   唯一能保证轮廓可见的手段（WCAG 不把描边算进对比度，但人眼认得出）；
+    /// - `2` 深底：比默认亮一档的金 + 不描边（深底上描边只会让字发脏）。
+    ///
+    /// **只影响挂件**：灵动岛的时钟用自己的 `cfg.color`（`island/draw.rs`），
+    /// 不经过这里 —— 岛的胶囊永远是深色，跟着换色只会把时钟画糊。
+    pub fn fit_paint(&self) -> Paint {
+        match self.fit {
+            1 => Paint {
+                color: FIT_DARK_INK,
+                date: FIT_DARK_INK_DIM,
+                quote: FIT_DARK_INK,
+                shadow: true,
+            },
+            2 => Paint {
+                color: FIT_LIGHT_INK,
+                date: FIT_LIGHT_INK_DIM,
+                quote: FIT_LIGHT_INK,
+                shadow: false,
+            },
+            _ => Paint {
+                color: self.color,
+                date: self.date_color,
+                quote: self.quote_paint_color(),
+                shadow: self.shadow,
+            },
+        }
+    }
+
     /// 格言基准字号（px）—— 与 `gfx::Fonts::build` 里的 `s(20, quote_scale)`
     /// 是同一把尺子（缩字阶梯另说）。过渡滑入距离等「一个 em」的量都从它推，
     /// 两边走偏就会「滑入距离和字号脱钩」。
     pub fn quote_font_px(&self) -> i32 {
-        ((20 * self.eff_scale_pct() / 100) * self.quote_scale / 100).max(6)
+        crate::util::scaled_px(20, self.eff_scale_pct(), self.quote_scale)
     }
 
     /// **有效缩放百分比**：用户字号 × 显示器 DPI（`dpi_auto` 关闭时 DPI 恒 100）。
@@ -664,6 +773,7 @@ impl Config {
              paused={}\n\
              fav_only={}\n\
              shadow={}\n\
+             fit={}\n\
              speed={}\n\
              scale={}\n\
              clock_scale={}\n\
@@ -693,6 +803,8 @@ impl Config {
              island_state={}\n\
              island_items={}\n\
              island_rotate={}\n\
+             island_peek_ms={}\n\
+             island_dot_color={}\n\
              island_w={}\n\
              island_h={}\n\
              island_body_color={}\n\
@@ -702,7 +814,8 @@ impl Config {
              island_leave_ms={}\n\
              island_screen={}\n\
              island_unread={}\n\
-             island_events_keep={}\n",
+             island_events_keep={}\n\
+             island_notify={}\n",
             self.x,
             self.y,
             self.w,
@@ -718,6 +831,7 @@ impl Config {
             self.paused,
             self.fav_only,
             self.shadow,
+            self.fit,
             self.speed,
             self.scale,
             self.clock_scale,
@@ -750,6 +864,8 @@ impl Config {
             self.island_state,
             self.island_items,
             self.island_rotate,
+            self.island_peek_ms,
+            fmt_color(self.island_dot_color),
             self.island_w,
             self.island_h,
             fmt_color(self.island_body_color),
@@ -760,6 +876,7 @@ impl Config {
             self.island_screen,
             self.island_unread,
             self.island_events_keep,
+            self.island_notify,
         );
         match write_atomic(&Self::path(), text.as_bytes()) {
             Ok(()) => LAST_SAVE_ERR.store(0, Ordering::Relaxed),
@@ -833,6 +950,7 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
         "paused" => cfg.paused = parse_bool(v, cfg.paused),
         "fav_only" => cfg.fav_only = parse_bool(v, cfg.fav_only),
         "shadow" => cfg.shadow = parse_bool(v, cfg.shadow),
+        "fit" => cfg.fit = v.trim().parse().unwrap_or(0).clamp(0, 2),
         "speed" => cfg.speed = v.parse().unwrap_or(cfg.speed).clamp(10, 400),
         "scale" => cfg.scale = v.parse().unwrap_or(cfg.scale).clamp(30, 600),
         "clock_scale" => cfg.clock_scale = v.parse().unwrap_or(cfg.clock_scale).clamp(30, 600),
@@ -891,8 +1009,14 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
             cfg.island_items = items.to_csv();
         }
         "island_rotate" => cfg.island_rotate = v.parse().unwrap_or(cfg.island_rotate).clamp(0, 600),
+        "island_peek_ms" => cfg.island_peek_ms = v.parse().unwrap_or(cfg.island_peek_ms).clamp(0, 60000),
+        "island_dot_color" => {
+            if let Some(c) = parse_color(v) {
+                cfg.island_dot_color = c;
+            }
+        }
         "island_w" => cfg.island_w = v.parse().unwrap_or(cfg.island_w).clamp(120, 2000),
-        "island_h" => cfg.island_h = v.parse().unwrap_or(cfg.island_h).clamp(48, 900),
+        "island_h" => cfg.island_h = v.parse().unwrap_or(cfg.island_h).clamp(crate::island::geom::EXPAND_MIN_H, 900),
         "island_body_color" => {
             if let Some(c) = parse_color(v) {
                 cfg.island_body_color = c;
@@ -920,6 +1044,7 @@ pub fn apply_kv(cfg: &mut Config, k: &str, v: &str) {
             }
         }
         "island_unread" => cfg.island_unread = parse_bool(v, cfg.island_unread),
+        "island_notify" => cfg.island_notify = parse_bool(v, cfg.island_notify),
         "island_events_keep" => {
             cfg.island_events_keep = parse_bool(v, cfg.island_events_keep)
         }

@@ -151,10 +151,22 @@ pub fn compact_page(
             }
         })
         .collect();
+    // 每一项的**占位宽度**：数值型片段取 `max(实际, 基准串)`（见 `Seg::widest`），
+    // 于是同一格在不同采样值下宽度不变 —— 胶囊不会随 CPU 读数抽动。
+    // 基准串本身也要夹在 `avail` 以内，否则它会把整页撑出窗外。
     let widths: Vec<i32> = segs
         .iter()
         .enumerate()
-        .map(|(i, s)| if s.dot { dot_d } else { measure(&texts[i], px).0 })
+        .map(|(i, s)| {
+            if s.dot {
+                return dot_d;
+            }
+            let w = measure(&texts[i], px).0;
+            match s.widest {
+                Some(base) => w.max(measure(base, px).0.min(avail)),
+                None => w,
+            }
+        })
         .collect();
     let pages = super::geom::pack_pages(&widths, gap, avail);
     let count = pages.len().max(1);
@@ -220,6 +232,10 @@ pub fn expanded(s: &Samples, items: &Items, measure: Measure, k: f32, w: i32, h:
     let clock_px = sp(EXPAND_CLOCK_PX, k).max(8);
     let text_px = sp(EXPAND_TEXT_PX, k).max(6);
     let avail = (w - 2 * pad).max(1);
+    // 用户把展开高调大时，内容块整体垂直居中，而不是底部留一片空白。
+    // 默认高度（EXPANDED_H）时偏移恒 0 —— 默认外观逐像素不变。
+    // 调小由 `EXPAND_MIN_H` 夹取兜住（config / on_menu / 面板置灰），这里不处理。
+    let y_off = ((h - sp(EXPANDED_H as f32, k)) / 2).max(0);
 
     let mut out = Layout {
         runs: Vec::new(),
@@ -234,7 +250,7 @@ pub fn expanded(s: &Samples, items: &Items, measure: Measure, k: f32, w: i32, h:
         out.runs.push(Run {
             text: s.clock.clone(),
             x: pad,
-            y: sp(EXPAND_CLOCK_Y, k),
+            y: sp(EXPAND_CLOCK_Y, k) + y_off,
             px: clock_px,
             ch: Chan::Main,
         });
@@ -249,7 +265,7 @@ pub fn expanded(s: &Samples, items: &Items, measure: Measure, k: f32, w: i32, h:
         out.runs.push(Run {
             text: s.date.clone(),
             x: w - pad - date_w,
-            y: sp(EXPAND_DATE_Y, k),
+            y: sp(EXPAND_DATE_Y, k) + y_off,
             px: text_px,
             ch: Chan::Dim,
         });
@@ -261,7 +277,7 @@ pub fn expanded(s: &Samples, items: &Items, measure: Measure, k: f32, w: i32, h:
         out.runs.push(Run {
             text: t,
             x: w - pad - tw,
-            y: sp(EXPAND_DATE_Y, k),
+            y: sp(EXPAND_DATE_Y, k) + y_off,
             px: text_px,
             ch: Chan::Dim,
         });
@@ -271,7 +287,7 @@ pub fn expanded(s: &Samples, items: &Items, measure: Measure, k: f32, w: i32, h:
     out.lines.push(Line {
         x0: pad,
         x1: w - pad,
-        y: sp(EXPAND_LINE_Y, k),
+        y: sp(EXPAND_LINE_Y, k) + y_off,
     });
 
     // ---- 行 2：三个指标三等分。顺序固定 CPU / MEM / 电池，与 `island_items`
@@ -301,7 +317,7 @@ pub fn expanded(s: &Samples, items: &Items, measure: Measure, k: f32, w: i32, h:
             out.runs.push(Run {
                 text: truncate_to(t, col_w - sp(6.0, k), text_px, measure),
                 x,
-                y: sp(EXPAND_METRIC_Y, k),
+                y: sp(EXPAND_METRIC_Y, k) + y_off,
                 px: text_px,
                 ch: Chan::Dim,
             });
@@ -313,7 +329,7 @@ pub fn expanded(s: &Samples, items: &Items, measure: Measure, k: f32, w: i32, h:
         out.runs.push(Run {
             text: truncate_to(&m, avail, text_px, measure),
             x: pad,
-            y: sp(EXPAND_MSG_Y, k),
+            y: sp(EXPAND_MSG_Y, k) + y_off,
             px: text_px,
             ch: Chan::Accent,
         });
@@ -353,7 +369,7 @@ mod tests {
             unread: 0,
             ..Default::default()
         };
-        crate::island::content::segments(&s, &Items::parse(items), false)
+        crate::island::content::segments(&s, &Items::parse(items), false, false)
     }
 
     #[test]
@@ -361,11 +377,17 @@ mod tests {
         let ss = segs("clock,cpu", "09:41");
         let k = 1.0;
         let l = compact(&ss, &measure, k, COMPACT_MAX_W);
-        let inner: i32 = ss
-            .iter()
-            .map(|s| measure(&s.text, sp(COMPACT_PX, k)).0)
-            .sum::<i32>()
-            + sp(COMPACT_GAP as f32, k);
+        // 每项占的宽度是「实际文本」与「占位基准串」取大（`Seg::widest`），
+        // 所以这里必须按同一条规则算 —— 直接量 text 会漏掉 CPU 那格按
+        // `CPU 100%` 预留出来的余量。
+        let slot = |s: &Seg| -> i32 {
+            let w = measure(&s.text, sp(COMPACT_PX, k)).0;
+            match s.widest {
+                Some(base) => w.max(measure(base, sp(COMPACT_PX, k)).0),
+                None => w,
+            }
+        };
+        let inner: i32 = ss.iter().map(slot).sum::<i32>() + sp(COMPACT_GAP as f32, k);
         assert_eq!(l.width, (inner + 2 * sp(COMPACT_PAD_X as f32, k)).max(sp(COMPACT_MIN_W as f32, k)));
         assert_eq!(l.height, sp(COMPACT_H as f32, k));
         // 最后一项的右缘不超出窗口
@@ -390,22 +412,28 @@ mod tests {
 
     #[test]
     fn compact_never_overflows_at_max_width() {
-        // 内容总宽远超上限：宽度必须顶在 260，且每一项都还在窗内
+        // 内容总宽远超上限：宽度必须顶在上限附近，且每一项都还在窗内
         let wide = |n: usize| Seg {
             text: "字".repeat(n),
             main: false,
             dot: false,
+            widest: None,
         };
-        // 单项就超宽（30 字 = 390px > 232 可用宽）⇒ 截断后正好顶满 260
-        let l = compact(&[wide(30)], &measure, 1.0, COMPACT_MAX_W);
+        // 上限**用局部固定值**而不是线上的 `COMPACT_MAX_W`：这条验的是
+        // 「截断与溢出保护」这套机制，不是「线上能装多少」。绑常量的话，
+        // 上限一调（400 → 460）30 字就不再超宽，「单项超宽」的前提没了，
+        // 测试会以「没顶满」失败 —— 而失败原因跟机制毫无关系。
+        let max_w = 260;
+        // 单项就超宽（30 字 = 390px > 可用宽）⇒ 截断后正好顶满上限
+        let l = compact(&[wide(30)], &measure, 1.0, max_w);
         // 截断按整字取整，所以会比上限少最多一个字的宽度
         assert!(
-            l.width <= COMPACT_MAX_W && l.width > COMPACT_MAX_W - 26,
+            l.width <= max_w && l.width > max_w - 26,
             "单项超宽应当接近顶满上限，实际 {}",
             l.width
         );
         // 多项各自都不超宽、但加起来超 ⇒ 分页，宽度由内容定，绝不溢出
-        let l = compact(&[wide(10), wide(10), wide(10)], &measure, 1.0, COMPACT_MAX_W);
+        let l = compact(&[wide(10), wide(10), wide(10)], &measure, 1.0, max_w);
         for r in &l.runs {
             assert!(
                 r.x + measure(&r.text, r.px).0 <= l.width,
@@ -544,19 +572,25 @@ mod tests {
             text: t.to_string(),
             main: false,
             dot: false,
+            widest: None,
         };
+        // 上限**故意用一个小值**（260）而不是线上的 `COMPACT_MAX_W`：
+        // 这条测的是「分页机制」，不是「线上能装多少」。绑到常量上的话，
+        // 每次调上限（260 → 400）都会让夹具失去分页前提，测试就从
+        // 「验分页」退化成「验一页装得下」，还偏偏是绿的。
+        let max_w = 260;
         // 8 个汉字 = 104px（假度量全宽 13px）；可用宽 = 260 - 2*14 = 232
         // ⇒ 104+8+104 = 216 装得下两项，第三项单独一页
         let ss = [wide("一二三四五六七八"), wide("ABCDEFGH一二三四"), wide("九十")];
-        let (p0, count) = compact_page(&ss, &measure, 1.0, COMPACT_MAX_W, 0);
-        let (p1, count1) = compact_page(&ss, &measure, 1.0, COMPACT_MAX_W, 1);
+        let (p0, count) = compact_page(&ss, &measure, 1.0, max_w, 0);
+        let (p1, count1) = compact_page(&ss, &measure, 1.0, max_w, 1);
         assert_eq!(count, 2, "分页数不对");
         assert_eq!(count1, 2, "页数与请求的页无关");
         assert_eq!(p0.runs.len(), 2, "第一页应装两项");
         assert_eq!(p1.runs.len(), 1, "第二页应只剩一项");
         assert_eq!(p0.width, p1.width, "两页宽度不一致 ⇒ 切页时胶囊会长短跳");
         // 页号超界按取模回绕（轮播与手改配置都可能给出越界值）
-        let (wrap, _) = compact_page(&ss, &measure, 1.0, COMPACT_MAX_W, 2);
+        let (wrap, _) = compact_page(&ss, &measure, 1.0, max_w, 2);
         assert_eq!(wrap, p0, "越界页号没有回绕到第一页");
         for l in [&p0, &p1] {
             for r in &l.runs {
@@ -583,6 +617,7 @@ mod tests {
                     ..Default::default()
                 },
                 &Items::parse("cpu,clock"),
+                false,
                 false,
             ),
             &measure,

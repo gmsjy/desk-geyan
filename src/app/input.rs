@@ -62,6 +62,9 @@ const HK_CONFIG: i32 = 119;
 
 const HK_PAUSE: i32 = 120;
 
+/// 桌面适配一键切换（自定 → 浅底 → 深底）
+const HK_FIT: i32 = 121;
+
 // ---------------------------------------------------------------- 热键
 
 /// 全部全局热键：`(id, 虚拟键)`，统一 `Ctrl+Alt+<键>`。
@@ -69,7 +72,7 @@ const HK_PAUSE: i32 = 120;
 /// 抽成模块级常量是为了让「注册」和「`--probe` 的期望值」**同源**：
 /// 曾经期望值是文案里写死的 `17`，加了收藏热键之后它变成了
 /// 「18/17 注册成功」—— 一个自己打自己脸的输出。
-const HOTKEY_TABLE: [(i32, u32); 20] = [
+const HOTKEY_TABLE: [(i32, u32); 21] = [
     (HK_TOGGLE, VK_H),
     (HK_ANIM, VK_M),
     (HK_MODE, VK_T),
@@ -89,6 +92,7 @@ const HOTKEY_TABLE: [(i32, u32); 20] = [
         (HK_FAV, VK_F),
         (HK_CONFIG, VK_O),
         (HK_PAUSE, VK_SPACE),
+        (HK_FIT, VK_A),
         (HK_QUIT, VK_X),
     ];
 
@@ -186,6 +190,7 @@ fn on_hotkey(a: &mut App, id: i32) {
         HK_SIZE_UP => on_menu(a, MI_SCALE_UP),
         HK_SIZE_DOWN => on_menu(a, MI_SCALE_DOWN),
         HK_COLOR => on_menu(a, MI_COLOR),
+        HK_FIT => on_menu(a, MI_DESK_FIT),
         HK_CONFIG => config_ui::open(a),
         HK_QUIT => quit(a),
         _ => {}
@@ -399,6 +404,18 @@ fn show_menu(a: &mut App) {
         // 用户找的时候在同一处。
         menu_add(menu, MI_FAV, "收藏当前句子  (Ctrl+Alt+F)", false, true);
         sep(menu);
+        // 桌面适配放在「重新载入」上方：两者都是「让挂件适配当前环境」的动作，
+        // 文案带当前档位 —— 用户不用打开面板就知道自己现在是哪一档。
+        menu_add(
+            menu,
+            MI_DESK_FIT,
+            &format!(
+                "桌面适配：{}  (Ctrl+Alt+A)",
+                crate::config::fit_label(a.cfg.fit)
+            ),
+            false,
+            true,
+        );
         menu_add(menu, MI_RELOAD, "重新载入格言 / 配置  (Ctrl+Alt+R)", false, true);
         menu_add(menu, MI_RESET, "挂件回到右上角", false, true);
         menu_add(menu, MI_BACKUP, "备份配置与收藏…", false, true);
@@ -502,7 +519,7 @@ fn toggle_item(a: &mut App, item: crate::island::content::Item) {
 /// 控件都只是「发命令的界面」，语义只在这里定义一次。新增一个可改的配置项时，
 /// 加一条 `MI_*` + 一个 `match` 分支，面板和菜单就同时支持了。
 pub(crate) fn on_menu(a: &mut App, cmd: u32) {
-    if (MI_ISLAND_ITEM_BASE..MI_ISLAND_ITEM_BASE + 6).contains(&cmd) {
+    if (MI_ISLAND_ITEM_BASE..MI_ISLAND_ITEM_BASE + 7).contains(&cmd) {
         let item = crate::island::content::ALL_ITEMS[(cmd - MI_ISLAND_ITEM_BASE) as usize].1;
         toggle_item(a, item);
         return;
@@ -596,6 +613,17 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
             a.cfg.save();
             render_and_present(a);
         }
+        // 桌面适配：一键在「自定 → 浅底 → 深底」之间循环。
+        //
+        // 只改 `fit` 一个键，`color` / `shadow` 原值一律不动 —— 所以转一圈
+        // 回到「自定」就是原样，不存在「切一次就找不回来」。
+        // 这是它能当「一键」用的前提：档位是视图，不是破坏性编辑。
+        MI_DESK_FIT => {
+            a.cfg.fit = (a.cfg.fit + 1) % 3;
+            a.cfg.save();
+            render_and_present(a);
+            toast(a, &format!("桌面适配：{}", crate::config::fit_label(a.cfg.fit)));
+        }
         // ---- 显示内容
         MI_CLOCK => {
             a.cfg.show_clock = !a.cfg.show_clock;
@@ -680,6 +708,20 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
             a.cfg.island_events_keep = !a.cfg.island_events_keep;
             a.cfg.save();
         }
+        // 新消息拉长时长：0..20s，步进 1s。0 = 不拉长（绿点仍然提示）。
+        // 上限 20s 而不是 60s：拉长是「瞟一眼」的机制，超过 20 秒它就从
+        // 「提示」变成「遮挡」了。
+        MI_ISLAND_PEEK_DOWN | MI_ISLAND_PEEK_UP => {
+            let d = if cmd == MI_ISLAND_PEEK_UP { 1000 } else { -1000 };
+            a.cfg.island_peek_ms = (a.cfg.island_peek_ms + d).clamp(0, 20000);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
+        MI_ISLAND_DOT_COLOR => {
+            a.cfg.island_dot_color = config::next_color(a.cfg.island_dot_color);
+            a.island.dirty = true;
+            a.cfg.save();
+        }
         MI_ISLAND_ROT_DOWN | MI_ISLAND_ROT_UP => {
             let d = if cmd == MI_ISLAND_ROT_UP { 5 } else { -5 };
             a.cfg.island_rotate = (a.cfg.island_rotate + d).clamp(0, 600);
@@ -701,7 +743,9 @@ pub(crate) fn on_menu(a: &mut App, cmd: u32) {
         }
         MI_ISLAND_H_DOWN | MI_ISLAND_H_UP => {
             let d = if cmd == MI_ISLAND_H_UP { 16 } else { -16 };
-            a.cfg.island_h = (a.cfg.island_h + d).clamp(48, 900);
+            // 下限 = 内容需求（消息行 + 底边距），低于它展开态会裁行。
+            // 与 config 加载、面板「−」置灰共用 `EXPAND_MIN_H` 一个定义。
+            a.cfg.island_h = (a.cfg.island_h + d).clamp(crate::island::geom::EXPAND_MIN_H, 900);
             island::recompute(a);
             a.island.dirty = true;
             a.cfg.save();

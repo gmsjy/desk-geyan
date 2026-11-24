@@ -72,12 +72,13 @@ fn cfg_fingerprint(a: &App) -> String {
          col={col:06X} dcol={dcol:06X} qcol={qcol:06X} font={font} \
          island={isl} isl_state={isl_state} isl_items={isl_items} isl_rot={isl_rot} \
          isl_w={isl_w} isl_h={isl_h} isl_bc={isl_bc:06X} isl_ba={isl_ba} isl_ac={isl_ac:06X} \
-         isl_hov={isl_hov} isl_leave={isl_leave} isl_scr={isl_scr} isl_unread={isl_unread} \
-         isl_keep={isl_keep}",
+         isl_hov={isl_hov} isl_leave={isl_leave} isl_scr={isl_scr} isl_unread={isl_unread} isl_notify={isl_notify} \
+         isl_keep={isl_keep} isl_dot={isl_dot:06X} isl_peek={isl_peek} fit={fit}",
         clock = c.show_clock,
         date = c.show_date,
         quote = c.show_quote,
         shadow = c.shadow,
+        fit = c.fit,
         sec = c.seconds,
         top = c.always_on_top,
         autohide = c.auto_hide_fs,
@@ -109,10 +110,13 @@ fn cfg_fingerprint(a: &App) -> String {
         isl_bc = c.island_body_color,
         isl_ba = c.island_body_alpha,
         isl_ac = c.island_accent_color,
+        isl_dot = c.island_dot_color,
+        isl_peek = c.island_peek_ms,
         isl_hov = c.island_hover_ms,
         isl_leave = c.island_leave_ms,
         isl_scr = c.island_screen,
         isl_unread = c.island_unread,
+        isl_notify = c.island_notify,
         isl_keep = c.island_events_keep,
     )
 }
@@ -2416,4 +2420,103 @@ fn dragtest_inner() -> i32 {
             3
         }
     }
+}
+
+/// `--cfgshot <目录>`：把设置面板**两页**各导出一张 PNG。
+///
+/// **为什么需要这个入口**：面板是「真控件 + 两处自绘」混排的普通窗口，
+/// `--dump` / `--dump-island` 只导挂件与岛（离屏像素），抓不到它。
+/// 于是仓库里的 `shots/4_settings_panel.png` 长期靠人工 `PrintWindow` 重截，
+/// 已经停在几轮改动之前（审查 U7）。审查与宣传都要「当前这份代码长什么样」
+/// 的证据，把人肉步骤做成入口。
+///
+/// **零副作用**：用用户真实配置打开面板、只切页、不点任何会改 `cfg` 的控件，
+/// 截完即关（`close` 会 `save`? 不会 —— 面板关闭不写盘，改动才写）。
+pub(crate) fn cfgshot(dir: &str) -> i32 {
+    let Some(a) = App::new() else {
+        println!("FAIL  初始化失败");
+        return 3;
+    };
+    // 与 `run()` 同一条登记路径：窗口回调通过 TLS 里的裸指针拿 `&mut App`，
+    // 所以 App 必须活到进程结束、不能放在栈上。`--dump` 不需要这一步
+    // （它不建窗、不出消息循环），但只要走 `bootstrap` 就必须先登记。
+    app_ptr_set(Box::into_raw(Box::new(a)));
+    let a = unsafe { &mut *app_ptr_raw() };
+
+    a.list = quotes::library();
+    a.qi = 0;
+    a.qn = 1 % a.list.len();
+    a.rebuild_fonts();
+    a.trans.settle();
+
+    if !unsafe { bootstrap(a) } {
+        println!("FAIL  bootstrap 失败（窗口建不起来）");
+        return 4;
+    }
+
+    config_ui::open(a);
+    let hwnd = a.config.hwnd_handle();
+    if hwnd.is_null() {
+        println!("FAIL  面板没建起来");
+        return 4;
+    }
+
+    let mut fail = 0;
+    for pass in 0..2 {
+        // 窗口必须**真的被绘制过**才能 PrintWindow：`open` 建完控件就返回，
+        // WM_PAINT 还在队列里，此刻抓到的是空面。pump + 等一拍是既有口径
+        // （`--selftest` 抓预览区、色块都走这一套）。
+        unsafe { pump() };
+        std::thread::sleep(std::time::Duration::from_millis(140));
+        unsafe { pump() };
+
+        let mut r: windows_sys::Win32::Foundation::RECT = unsafe { zeroed() };
+        let ok_rect = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r)
+        } != 0;
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if !ok_rect || w <= 0 || h <= 0 {
+            println!("FAIL  读不到面板尺寸（{}x{}）", w, h);
+            fail = 5;
+            break;
+        }
+
+        let Some(px) = gfx::capture_window(hwnd, w, h) else {
+            println!("FAIL  PrintWindow 读不回面板（可能被遮挡或未绘制）");
+            fail = 6;
+            break;
+        };
+        // `capture_window` 给的是 0xAARRGGBB（DIB 的 BGRA 内存序按 u32 读）。
+        // 面板是不透明窗口，alpha 恒 255 —— 这里不猜预乘，只按分量搬。
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for p in &px {
+            rgba.extend_from_slice(&[(*p >> 16) as u8, (*p >> 8) as u8, *p as u8, 255]);
+        }
+        let name = if pass == 0 { "cfg_widget" } else { "cfg_island" };
+        let path = format!("{dir}/{name}.png");
+        match crate::png::write_png(&path, w as u32, h as u32, &rgba) {
+            Ok(()) => println!("已写入 {path}  ({w}x{h})"),
+            Err(e) => {
+                println!("FAIL  写 {path} 失败: {e}");
+                fail = 7;
+                break;
+            }
+        }
+        if pass == 0 {
+            // 切到灵动岛页。走 `test_page_switch`（= 面板自己的切页路径），
+            // 不直接改 `page` 字段 —— 否则截出来的可能是一张「字段切了、
+            // ShowWindow 没跟上」的假页面。
+            config_ui::test_page_switch(a);
+        }
+    }
+
+    config_ui::close(a);
+    unsafe {
+        DestroyWindow(a.text);
+        DestroyWindow(a.panel);
+    }
+    if fail == 0 {
+        println!("面板两页已导出（用真实 config.ini，未改动任何设置）");
+    }
+    fail
 }

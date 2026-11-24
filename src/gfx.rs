@@ -79,6 +79,9 @@ pub struct Fonts {
     pub clock: HFONT,
     pub clock_small: HFONT,
     pub date: HFONT,
+    /// 竖版落款时间列：整串旋转 90°（审查 U4）。逐字竖排把「14:44:45」
+    /// 拆成 8 个格子没法瞟读；旋转后一列读作一条时间。
+    pub date_rot: HFONT,
     pub quote: HFONT,
     pub hint: HFONT,
     /// **固定 13px** 的一句提示字体（「窗口装不下 · 请放大窗口或降低字号」）。
@@ -110,12 +113,13 @@ pub const QUOTE_SHRINK_STEPS: [i32; 3] = [100, 85, 70];
 impl Fonts {
     pub fn build(face: &str, scale: i32, clock_ratio: i32, quote_ratio: i32) -> Fonts {
         let f = crate::util::wide(face);
-        let s = |px: i32, ratio: i32| ((px * scale / 100) * ratio / 100).max(6);
+        let s = |px: i32, ratio: i32| crate::util::scaled_px(px, scale, ratio);
         let quote_px = s(20, quote_ratio);
         Fonts {
             clock: make_font(s(46, clock_ratio), FW_SEMIBOLD, &f),
             clock_small: make_font(s(34, clock_ratio), FW_SEMIBOLD, &f),
             date: make_font(s(16, clock_ratio), FW_NORMAL, &f),
+            date_rot: make_font_ex(s(16, clock_ratio), FW_NORMAL, &f, 900),
             quote: make_font(quote_px, FW_NORMAL, &f),
             hint: make_font(s(12, 100), FW_NORMAL, &f),
             hint_fixed: make_font(13, FW_NORMAL, &f),
@@ -169,6 +173,7 @@ impl Fonts {
                 self.clock,
                 self.clock_small,
                 self.date,
+                self.date_rot,
                 self.quote,
                 self.hint,
                 self.hint_fixed,
@@ -184,6 +189,18 @@ impl Fonts {
                 }
             }
         }
+    }
+}
+
+/// 句柄随 `Fonts` 生命周期自动释放（审查 P2-F）。
+///
+/// 旧实现靠 `destroy()` + 注释警告「新增句柄必须加进数组」，重建时手工
+/// 先 destroy 再赋值 —— 漏调一次就泄漏。改成 `Drop` 后，`self.fonts =
+/// Fonts::build(...)` 赋值会自动析构旧值，「建了不删」从纪律问题变成
+/// 结构上不可能。**调用方不要再手工 destroy**（会双重 DeleteObject）。
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 
@@ -803,6 +820,18 @@ impl Frame {
     }
 
     /// 合成后的预乘 ARGB，供自检与调试读取
+    /// 合成之后的像素（**可写**）：给「必须在合成之后才能定色」的少量元素用。
+    ///
+    /// 目前唯一的用户是灵动岛的绿点：掩码只有三条颜色通道（时钟/日期/格言），
+    /// 圆点借任何一条都会跟别的元素同色，而它需要一个独立的语义色（新消息绿）。
+    /// 6×6 的点，合成后直接写预乘值比新开第四条通道便宜得多，也不动 `compose`。
+    pub fn out_pixels_mut(&mut self) -> &mut [u32] {
+        match self.ink.as_mut() {
+            Some(d) => d.pixels(),
+            None => &mut [],
+        }
+    }
+
     pub fn out_pixels(&self) -> &[u32] {
         match self.ink.as_ref() {
             Some(d) => unsafe { std::slice::from_raw_parts(d.bits, (d.w * d.h) as usize) },

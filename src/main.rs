@@ -71,6 +71,36 @@ fn main() {
     if args.iter().any(|a| a == "--perf") {
         std::process::exit(app::perf());
     }
+    // --notifprobe：读当前系统通知（不建窗、不读配置、零副作用）。
+    // 排查「通知没显示」时先跑这一条 —— 能分清是采集不到还是画不出来。
+
+    if args.iter().any(|a| a == "--notifprobe") {
+        match island::feed::latest() {
+            Some(n) => {
+                println!("id    = {}", n.id);
+                println!("app   = {}", n.app);
+                println!("title = {}", n.title);
+                println!("body  = {}", n.body);
+                println!("line  = {}", n.line());
+            }
+            None => println!("(读不到通知：库不存在 / 打不开 / 没有记录)"),
+        }
+        std::process::exit(0);
+    }
+    // --mediaprobe：读当前媒体会话（同上，零副作用）。
+    if args.iter().any(|a| a == "--mediaprobe") {
+        match island::feed::media::current() {
+            Some(m) => {
+                println!("app    = {}", m.app);
+                println!("title  = {}", m.title);
+                println!("artist = {}", m.artist);
+                println!("playing= {}", m.playing);
+                println!("line   = {}", m.line());
+            }
+            None => println!("(没有媒体会话 / 拿不到)"),
+        }
+        std::process::exit(0);
+    }
     // --dump-island <png> [key=value ...]：导出岛的一帧（透明底），供像素回归
     if let Some(i) = args.iter().position(|a| a == "--dump-island") {
         let Some(path) = args.get(i + 1) else {
@@ -83,6 +113,14 @@ fn main() {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         std::process::exit(app::dump_island(path, &overrides));
+    }
+    // --cfgshot <目录>：把设置面板两页各导出一张 PNG（审查 / 宣传用的当前外观）
+    if let Some(i) = args.iter().position(|a| a == "--cfgshot") {
+        let Some(dir) = args.get(i + 1) else {
+            println!("用法: desk-geyan --cfgshot <输出目录>");
+            std::process::exit(2);
+        };
+        std::process::exit(app::cfgshot(dir));
     }
     // --dump <png> [key=value ...]：渲染一帧存成图片，可临时覆盖任意配置项
     if let Some(i) = args.iter().position(|a| a == "--dump") {

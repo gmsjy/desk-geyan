@@ -64,17 +64,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
     GetCursorPos, GetSystemMetrics, GetWindowRect, GetWindowTextW, LoadCursorW,
     LoadIconW, MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SetWindowTextW,
-    ShowWindow, BM_CLICK, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
+    SetWindowTextW, ShowWindow, WNDCLASSW,
+    // 控件专用常量（consts 未收录）仍走 windows_sys，单一来源：
+    BM_CLICK, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX,
     BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, LBN_SELCHANGE, LB_ADDSTRING,
     LB_GETCURSEL, LB_SETCURSEL, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER,
-    WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_GETMINMAXINFO, WM_MEASUREITEM,
-    WM_PAINT,
-    WM_SETFONT, WM_SETICON, WM_SIZE, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL, WNDCLASSW,
+    LBS_NOTIFY, LBS_OWNERDRAWFIXED, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
+    WM_COMMAND, WM_CREATE,
+    WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_GETMINMAXINFO, WM_MEASUREITEM,
+    WM_SETFONT, WM_SETICON, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
+    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    // 与 crate::consts 重叠的标量（SW_HIDE/SWP_*/WM_CLOSE/WM_DESTROY/WM_DPICHANGED/
+    // WM_PAINT/WM_SIZE/WS_CHILD/WS_VISIBLE）已移除，统一由 `use crate::consts::*`
+    // 提供（审查 P2-E），与 app/* 同一来源。
 };
 
 use crate::app::{
@@ -83,8 +85,9 @@ use crate::app::{
     MI_OP_UP, MI_ORIENT_BASE, MI_PAUSE, MI_FAV_ONLY, MI_PREV, MI_QUOTE, MI_QUOTE_COLOR,
     MI_QUOTE_DOWN, MI_QUOTE_UP, MI_RELOAD, MI_RESET, MI_SCALE_DOWN, MI_SCALE_UP, MI_SECONDS,
     MI_SHADOW, MI_SHRINK_FIT, MI_SPACING_DOWN, MI_SPACING_UP, MI_SPEED_DOWN, MI_SPEED_UP,
-    MI_TEXT, MI_TOGGLE, MI_TOPMOST, MI_ISLAND, MI_ISLAND_UNREAD,
-    MI_ISLAND_ACCENT_COLOR, MI_ISLAND_BODY_COLOR, MI_ISLAND_H_DOWN, MI_ISLAND_H_UP,
+    MI_TEXT, MI_TOGGLE, MI_TOPMOST, MI_ISLAND, MI_ISLAND_UNREAD, MI_DESK_FIT,
+    MI_ISLAND_ACCENT_COLOR, MI_ISLAND_BODY_COLOR, MI_ISLAND_DOT_COLOR, MI_ISLAND_H_DOWN,
+    MI_ISLAND_H_UP, MI_ISLAND_PEEK_DOWN, MI_ISLAND_PEEK_UP,
     MI_ISLAND_ITEM_BASE, MI_ISLAND_KEEP, MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP,
     MI_ISLAND_ROT_DOWN, MI_ISLAND_ROT_UP, MI_ISLAND_W_DOWN, MI_ISLAND_W_UP,
 };
@@ -322,7 +325,10 @@ fn table(page: Page) -> Vec<W> {
             chk(MI_DATE, "日期", 2),
             chk(MI_SECONDS, "秒", 2),
             chk(MI_QUOTE, "格言", 2),
-            chk(MI_SHADOW, "文字阴影", 2),
+            // 桌面适配一键切换。**放这里而不是「外观」组**：外观组每行都占满
+            // 6 格，加控件必然多一行（+28px），而面板高度只剩 39px 的边框余量，
+            // 768 屏会静默截断最后一行。这一行只用了 2 格，正好放得下。
+            act(MI_DESK_FIT, "桌面适配", 2),
             // ---- 窗口与行为
             sec("窗口与行为"),
             chk(MI_TOPMOST, "总在最前", 2),
@@ -332,8 +338,6 @@ fn table(page: Page) -> Vec<W> {
             chk(MI_PAUSE, "暂停轮播", 2),
             chk(MI_FAV_ONLY, "仅播放收藏夹", 3),
             chk(MI_SHRINK_FIT, "放不下时缩小字号", 3),
-            rad(MI_GLASS, "毛玻璃", 2),
-            rad(MI_TEXT, "纯文字", 2),
             // ---- 版式
             sec("版式"),
             rad(MI_ORIENT_BASE, "横版", 2),
@@ -350,6 +354,11 @@ fn table(page: Page) -> Vec<W> {
             num(MI_SPEED_DOWN, MI_SPEED_UP, "速度", 4),
             // ---- 外观
             sec("外观"),
+            // 渲染模式与阴影是外观属性，不是行为 —— 与版式/动效/颜色同一组。
+            // 三个控件正好一行（2+2+2），不增加面板高度预算。
+            rad(MI_GLASS, "毛玻璃", 2),
+            rad(MI_TEXT, "纯文字", 2),
+            chk(MI_SHADOW, "文字阴影", 2),
             num(MI_SCALE_DOWN, MI_SCALE_UP, "整体字号", 3),
             num(MI_OP_DOWN, MI_OP_UP, "不透明度", 3),
             num(MI_CLOCK_DOWN, MI_CLOCK_UP, "时钟字号", 3),
@@ -382,6 +391,7 @@ fn table(page: Page) -> Vec<W> {
             chk(MI_ISLAND_ITEM_BASE + 3, "内存", 1),
             chk(MI_ISLAND_ITEM_BASE + 4, "电池", 1),
             chk(MI_ISLAND_ITEM_BASE + 5, "消息", 1),
+            chk(MI_ISLAND_ITEM_BASE + 6, "媒体", 1),
             // 轮播：0 = 不轮播（此时只有装得下的前几项可见）
             num(MI_ISLAND_ROT_DOWN, MI_ISLAND_ROT_UP, "轮播间隔", 3),
             num(MI_ISLAND_OP_DOWN, MI_ISLAND_OP_UP, "底不透明", 3),
@@ -389,6 +399,10 @@ fn table(page: Page) -> Vec<W> {
             col(MI_ISLAND_ACCENT_COLOR, "强调色", 3),
             num(MI_ISLAND_W_DOWN, MI_ISLAND_W_UP, "展开宽", 3),
             num(MI_ISLAND_H_DOWN, MI_ISLAND_H_UP, "展开高", 3),
+            // 新消息的两件事：拉长多久（时长）与提示点用什么颜色。
+            // 它们是一组：一个决定「能看到多久」，一个决定「看不看得见」。
+            num(MI_ISLAND_PEEK_DOWN, MI_ISLAND_PEEK_UP, "拉长时长", 3),
+            col(MI_ISLAND_DOT_COLOR, "提示点色", 3),
         ],
     }
 }
@@ -505,6 +519,14 @@ impl Default for ConfigUi {
 impl ConfigUi {
     pub fn is_open(&self) -> bool {
         !self.hwnd.is_null()
+    }
+
+    /// 面板窗口句柄。给 `--cfgshot` 抓图用（`open` 之后才有值）。
+    ///
+    /// 只暴露句柄、不暴露整张 `ConfigUi`：抓图是**只读**动作，
+    /// 拿得到 HWND 就够 `PrintWindow` 了，不需要改动任何控件状态。
+    pub fn hwnd_handle(&self) -> HWND {
+        self.hwnd
     }
 
     /// 列表里的字体项数。给 `--probe` 证明「窗口真的建起来了、列表真的填进去了」用
@@ -760,7 +782,7 @@ fn read_bool(a: &App, cmd: u32) -> bool {
         MI_ISLAND => c.island,
         MI_ISLAND_UNREAD => c.island_unread,
         MI_ISLAND_KEEP => c.island_events_keep,
-        _ if (MI_ISLAND_ITEM_BASE..MI_ISLAND_ITEM_BASE + 6).contains(&cmd) => {
+        _ if (MI_ISLAND_ITEM_BASE..MI_ISLAND_ITEM_BASE + 7).contains(&cmd) => {
             let item = crate::island::content::ALL_ITEMS[(cmd - MI_ISLAND_ITEM_BASE) as usize].1;
             crate::island::content::Items::parse(&c.island_items)
                 .order
@@ -806,9 +828,20 @@ fn num_text(a: &App, cmd: u32) -> String {
                 format!("{}s", c.island_rotate)
             }
         }
-        MI_ISLAND_OP_DOWN | MI_ISLAND_OP_UP => c.island_body_alpha.to_string(),
+        // 与挂件「不透明度」同一量纲（百分比）。ini 里仍存 0..255 裸值，
+        // 只有显示层换算 —— 同一面板两种量纲会让用户无法对照。
+        MI_ISLAND_OP_DOWN | MI_ISLAND_OP_UP => {
+            format!("{}%", c.island_body_alpha * 100 / 255)
+        }
         MI_ISLAND_W_DOWN | MI_ISLAND_W_UP => format!("{}px", c.island_w),
         MI_ISLAND_H_DOWN | MI_ISLAND_H_UP => format!("{}px", c.island_h),
+        MI_ISLAND_PEEK_DOWN | MI_ISLAND_PEEK_UP => {
+            if c.island_peek_ms <= 0 {
+                "关".to_string()
+            } else {
+                format!("{}s", c.island_peek_ms / 1000)
+            }
+        }
         _ => String::new(),
     }
 }
@@ -824,6 +857,7 @@ fn color_info(a: &App, cmd: u32) -> (u32, String) {
         MI_QUOTE_COLOR => (c.quote_paint_color(), config::quote_color_label(c.quote_color)),
         MI_ISLAND_BODY_COLOR => (c.island_body_color, fmt_color(c.island_body_color)),
         MI_ISLAND_ACCENT_COLOR => (c.island_accent_color, fmt_color(c.island_accent_color)),
+        MI_ISLAND_DOT_COLOR => (c.island_dot_color, fmt_color(c.island_dot_color)),
         _ => (0, String::new()),
     }
 }
@@ -847,6 +881,11 @@ fn ctl_expected_text(a: &App, c: &Ctl) -> Option<String> {
             let anim = Anim::all()[(c.cmd - MI_ANIM_BASE) as usize];
             Some(anim_label(anim, a.cfg().orient == Orient::Vertical))
         }
+        // 桌面适配按钮当「读数」用：不打开面板也知道现在是哪一档。
+        // 只有这一个 Role::Menu 需要动态文本，其余按钮文案是固定的。
+        Role::Menu if c.cmd == MI_DESK_FIT => {
+            Some(format!("桌面适配·{}", config::fit_label(a.cfg().fit)))
+        }
         _ => None,
     }
 }
@@ -854,7 +893,18 @@ fn ctl_expected_text(a: &App, c: &Ctl) -> Option<String> {
 /// 这个控件此刻该不该是可用的。
 fn ctl_enabled(a: &App, c: &Ctl) -> bool {
     // 竖版下跑马灯不可选（点了也不会生效）
-    !(c.role == Role::Radio && c.cmd == MI_ANIM_BASE && a.cfg().orient == Orient::Vertical)
+    if c.role == Role::Radio && c.cmd == MI_ANIM_BASE && a.cfg().orient == Orient::Vertical {
+        return false;
+    }
+    // 展开高已到内容下限：再减只会裁掉消息行，「−」置灰给出信号
+    //（与 on_menu / config 加载的夹取共用 `EXPAND_MIN_H`）。
+    if c.role == Role::NumDown
+        && c.cmd == MI_ISLAND_H_DOWN
+        && a.cfg().island_h <= crate::island::geom::EXPAND_MIN_H
+    {
+        return false;
+    }
+    true
 }
 
 // ---------------------------------------------------------------- 布局
@@ -2116,15 +2166,24 @@ unsafe fn paint(a: &mut App, hwnd: HWND) {
                 let old_f = SelectObject(dc, app.config.bold_font as HGDIOBJ);
                 let sh = app.config.sp(SEC_H);
                 text_out(dc, c.rc.left, c.rc.top + app.config.sp(2), c.text);
-                // 标题下面一条细线，把分组切开
+                // 分组线从**标题实测宽度之后**起画（经典 group-header 样式）。
+                // 旧实现从行首画到行尾，而线位（top+16）落在 15px 标题字形的
+                // 下三分之一处 —— 六个组标题全部呈删除线效果。线必须避开文字：
+                // 量一次标题宽度 + 8px 间隙，剩余宽度不足就不画。
                 if !app.config.frame_brush.is_null() {
-                    let line = RECT {
-                        left: c.rc.left,
-                        top: c.rc.top + sh - app.config.sp(4),
-                        right: c.rc.right,
-                        bottom: c.rc.top + sh - app.config.sp(3),
-                    };
-                    FillRect(dc, &line, app.config.frame_brush);
+                    let w = wide(c.text);
+                    let mut sz: SIZE = zeroed();
+                    GetTextExtentPoint32W(dc, w.as_ptr(), w.len() as i32 - 1, &mut sz);
+                    let line_l = c.rc.left + sz.cx + app.config.sp(8);
+                    if line_l < c.rc.right {
+                        let line = RECT {
+                            left: line_l,
+                            top: c.rc.top + sh - app.config.sp(4),
+                            right: c.rc.right,
+                            bottom: c.rc.top + sh - app.config.sp(3),
+                        };
+                        FillRect(dc, &line, app.config.frame_brush);
+                    }
                 }
                 SelectObject(dc, old_f);
             }

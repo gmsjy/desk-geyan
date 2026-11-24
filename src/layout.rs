@@ -317,6 +317,23 @@ pub fn layout(
     band: (i32, i32, i32, i32),
     spacing: i32,
 ) -> QuoteLayout {
+    layout_with_attr(chars, adv, m, orient, band, spacing, None)
+}
+
+/// 带出处分界的排版入口（2026-11-24 审查 U3）。
+///
+/// `attr_from` 是出处段（「——　作者」）在 `chars` 里的起始下标，**仅横版生效**：
+/// 出处独立成行、右对齐；正文多行时左对齐。`None` = 整段都是正文（旧行为）。
+/// 竖版忽略它 —— 竖版的出处归落款条，主文本来就不带出处尾巴。
+pub fn layout_with_attr(
+    chars: &[char],
+    adv: &[i32],
+    m: Metrics,
+    orient: Orient,
+    band: (i32, i32, i32, i32),
+    spacing: i32,
+    attr_from: Option<usize>,
+) -> QuoteLayout {
     if chars.is_empty() || adv.len() < chars.len() {
         return QuoteLayout {
             shrink: 100,
@@ -324,7 +341,7 @@ pub fn layout(
         };
     }
     match orient {
-        Orient::Horizontal => layout_h(chars, adv, m, band, spacing),
+        Orient::Horizontal => layout_h(chars, adv, m, band, spacing, attr_from),
         Orient::Vertical => layout_v(chars, adv, m, band, spacing),
     }
 }
@@ -337,11 +354,14 @@ fn layout_h(
     m: Metrics,
     band: (i32, i32, i32, i32),
     spacing: i32,
+    attr_from: Option<usize>,
 ) -> QuoteLayout {
     let (bl, bt, br, bb) = band;
     let avail_w = (br - bl).max(1);
     let avail_h = (bb - bt).max(1);
     let n = chars.len();
+    // 出处分界：[0..attr_start) 正文，[attr_start..n) 出处（「——　作者」）。
+    let mut attr_start = attr_from.map(|k| k.min(n)).unwrap_or(n);
 
     let line_w = |v: &[usize]| -> i32 {
         let mut s = 0;
@@ -354,52 +374,111 @@ fn layout_h(
         s
     };
 
-    // ---- ① 贪心折行（含行首 / 行尾禁则）
-    let mut lines: Vec<Vec<usize>> = Vec::new();
-    let mut cur: Vec<usize> = Vec::new();
-    for i in 0..n {
-        if !cur.is_empty() && line_w(&cur) + adv[i] + spacing > avail_w {
-            if no_start(chars[i]) {
-                // 行首禁则：不换行，把它挤在本行（允许 ≤ 1 字宽的溢出）
-                cur.push(i);
-                continue;
+    // ---- ① 贪心折行（含行首 / 行尾禁则）。正文与出处共用同一条规则，
+    // 下标全程是**全局**的（src 要指回原文，合批靠它判相邻）。
+    let wrap = |from: usize, to: usize| -> Vec<Vec<usize>> {
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        let mut cur: Vec<usize> = Vec::new();
+        for i in from..to {
+            if !cur.is_empty() && line_w(&cur) + adv[i] + spacing > avail_w {
+                if no_start(chars[i]) {
+                    // 行首禁则：不换行，把它挤在本行（允许 ≤ 1 字宽的溢出）
+                    cur.push(i);
+                    continue;
+                }
+                if cur.len() >= 2 && no_end(chars[*cur.last().unwrap()]) {
+                    // 行尾禁则：把它一起拖到下一行去，别让它孤零零收尾
+                    let last = cur.pop().unwrap();
+                    lines.push(std::mem::take(&mut cur));
+                    cur.push(last);
+                } else {
+                    lines.push(std::mem::take(&mut cur));
+                }
             }
-            if cur.len() >= 2 && no_end(chars[*cur.last().unwrap()]) {
-                // 行尾禁则：把它一起拖到下一行去，别让它孤零零收尾
-                let last = cur.pop().unwrap();
-                lines.push(std::mem::take(&mut cur));
-                cur.push(last);
-            } else {
-                lines.push(std::mem::take(&mut cur));
-            }
+            cur.push(i);
         }
-        cur.push(i);
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
+    };
+    let mut lines = wrap(0, attr_start);
+    let mut attr_lines = wrap(attr_start, n);
+
+    // ---- ② 纵向容量：出处行固定占位，正文给它让路；放不下截断 + 省略号
+    let max_lanes = (avail_h / m.line_h.max(1)).max(1) as usize;
+    // 「一个字都不许丢」压过「出处独立行」：独立行会把正文挤到截断时，
+    // 退回内联出处（旧行为）—— D1 回归（60 字长句默认窗口不丢字）钉着这条。
+    if attr_start < n && lines.len() + attr_lines.len() > max_lanes {
+        lines = wrap(0, n);
+        attr_lines = Vec::new();
+        attr_start = n;
     }
 
-    // ---- ② 纵向容量：放不下就截断到最后一行 + 省略号
-    let max_lanes = (avail_h / m.line_h.max(1)).max(1) as usize;
-    let mut truncated = lines.len() > max_lanes;
-    let used = lines.len().min(max_lanes);
-    let ext_h = if used == 0 {
+    // ---- ①b 孤行控制（审查 U3）：正文末行不足 4 字时从上一行借字。
+    // 「其大。」这类两字尾行读起来像排版事故。借字受禁则约束：借来的字
+    // 落在末行行首（不得犯行首禁则），上一行新尾不得犯行尾禁则，且末行
+    // 借完不得超宽 —— 任一不满足就停，宁留孤行不出破排。
+    if lines.len() >= 2 && lines.last().unwrap().len() < 4 {
+        let need = 4 - lines.last().unwrap().len();
+        let prev = lines.len() - 2;
+        for _ in 0..need {
+            if lines[prev].len() <= 2 {
+                break;
+            }
+            let idx = *lines[prev].last().unwrap();
+            if no_start(chars[idx]) {
+                break;
+            }
+            let new_tail = lines[prev][lines[prev].len() - 2];
+            if no_end(chars[new_tail]) {
+                break;
+            }
+            if line_w(lines.last().unwrap()) + adv[idx] + spacing > avail_w {
+                break;
+            }
+            lines[prev].pop();
+            lines.last_mut().unwrap().insert(0, idx);
+        }
+    }
+
+    // ---- ②b 容量分配（max_lanes 已在上面算过）
+    let attr_used = attr_lines.len().min(max_lanes.saturating_sub(1));
+    let body_used = lines.len().min(max_lanes - attr_used);
+    let mut truncated = lines.len() > body_used || attr_lines.len() > attr_used;
+    let total = body_used + attr_used;
+    let ext_h = if total == 0 {
         0
     } else {
-        (used as i32 - 1) * m.line_h + m.char_h
+        (total as i32 - 1) * m.line_h + m.char_h
     };
     let oy = bt + (avail_h - ext_h) / 2;
 
+    // ---- ③ 对齐（审查 U3）：单行正文且无出处 → 居中（短句卡片感，旧行为）；
+    // 其余正文左对齐（消除逐行居中的两侧参差），出处右对齐独立行。
+    let body_left = attr_start < n || body_used > 1;
+
     let mut glyphs: Vec<Glyph> = Vec::new();
-    'outer: for (j, line) in lines.iter().take(used).enumerate() {
-        let x0 = bl + (avail_w - line_w(line)) / 2;
+    'outer: for j in 0..total {
+        let (line, x0) = if j < body_used {
+            let line = &lines[j];
+            let x0 = if body_left {
+                bl
+            } else {
+                bl + (avail_w - line_w(line)) / 2
+            };
+            (line, x0)
+        } else {
+            let line = &attr_lines[j - body_used];
+            (line, (br - line_w(line)).max(bl))
+        };
         let mut x = x0;
         for (k, &i) in line.iter().enumerate() {
             if k > 0 {
                 x += spacing;
             }
             // 最后一行的字若越过右缘，就地截断（禁则带出来的那一字宽的溢出）
-            if j + 1 == used && x + adv[i] > br && !glyphs.is_empty() {
+            if j + 1 == total && x + adv[i] > br && !glyphs.is_empty() {
                 truncated = true;
                 break 'outer;
             }
@@ -432,7 +511,7 @@ fn layout_h(
     let (ext_w, ext_h) = bounds(&glyphs, m);
     QuoteLayout {
         glyphs,
-        lanes: used as i32,
+        lanes: total as i32,
         extent: (ext_w, ext_h),
         shrink: 100,
         overflow: truncated,
@@ -646,6 +725,48 @@ mod tests {
         assert!(q.lanes >= 2, "30 字塞进 200px 应当折行，实际 {} 行", q.lanes);
         assert_eq!(q.glyphs.len(), 30, "200x200 够放 3 行以上，不该丢字");
         assert!(!q.ellipsis);
+    }
+
+    #[test]
+    fn 横版单行无出处仍居中() {
+        // 短句卡片感是旧行为里对的部分，保留：5 字 100px 在 200px 版心居中
+        let (ch, adv) = uni(5);
+        let q = layout(&ch, &adv, metrics(), Orient::Horizontal, band(), 0);
+        assert_eq!(q.lanes, 1);
+        assert_eq!(q.glyphs[0].x, 50);
+    }
+
+    #[test]
+    fn 横版出处独立行右对齐正文左对齐() {
+        // 正文 12 字 + 出处「——　老子」5 字。出处必须自成一行、右缘贴版心右缘；
+        // 正文多行（含出处时）左对齐，不再逐行居中。
+        let mut ch: Vec<char> = vec!['国'; 12];
+        ch.extend("——　老子".chars());
+        let adv = vec![20; ch.len()];
+        let q = layout_with_attr(&ch, &adv, metrics(), Orient::Horizontal, band(), 0, Some(12));
+        let attr: Vec<&Glyph> = q.glyphs.iter().filter(|g| g.src >= 12).collect();
+        assert_eq!(attr.len(), 5, "出处 5 字一个不许丢");
+        assert!(
+            attr.windows(2).all(|w| w[0].y == w[1].y),
+            "出处必须同一行"
+        );
+        let body_ys: Vec<i32> = q.glyphs.iter().filter(|g| g.src < 12).map(|g| g.y).collect();
+        assert!(body_ys.iter().all(|&y| y != attr[0].y), "出处不得与正文同行");
+        assert_eq!(attr.last().unwrap().x + 20, band().2, "出处右缘贴版心右缘");
+        let body_first = q.glyphs.iter().find(|g| g.src < 12).unwrap();
+        assert_eq!(body_first.x, band().0, "正文左对齐");
+    }
+
+    #[test]
+    fn 横版孤行借字到四字() {
+        // 22 字 → 贪心 [10,10,2]，末行两字是孤行；借字后末行 ≥ 4 字。
+        let (ch, adv) = uni(22);
+        let q = layout(&ch, &adv, metrics(), Orient::Horizontal, band(), 0);
+        assert_eq!(q.lanes, 3);
+        assert_eq!(q.glyphs.len(), 22, "借字不丢字");
+        let last_y = q.glyphs.last().unwrap().y;
+        let n_last = q.glyphs.iter().filter(|g| g.y == last_y).count();
+        assert!(n_last >= 4, "孤行应借到 ≥4 字，实际 {}", n_last);
     }
 
     #[test]

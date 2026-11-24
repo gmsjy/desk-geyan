@@ -57,7 +57,6 @@ pub(crate) fn selftest() -> i32 {
         keep_mask: true,
         ..Default::default()
     });
-    a.fonts.destroy();
     a.fonts = Fonts::build(&a.cfg.font, a.cfg.eff_scale_pct(), a.cfg.clock_scale, a.cfg.quote_scale);
     a.list = quotes::library();
     a.qi = 0;
@@ -483,7 +482,6 @@ pub(crate) fn selftest() -> i32 {
         let fresh_normal = App::new();
         let prep = |b: &mut App| {
             b.cfg = Config::default();
-            b.fonts.destroy();
             b.fonts = Fonts::build(&b.cfg.font, b.cfg.eff_scale_pct(), b.cfg.clock_scale, b.cfg.quote_scale);
             b.list = quotes::library();
             b.qi = 0;
@@ -680,7 +678,10 @@ pub(crate) fn selftest() -> i32 {
                 col_ok = false; // 中列瓦片必须无缝相接
             }
         }
-        if ncol >= 1 && ql.col_x[0].1 != band.2 {
+        // 首列右缘贴「居中后的」版心右缘：U5 之后 frame_layout 可能把 br 左移
+        // 一个居中偏移，偏移量读内核缓存（v_center），不自己再推一遍。
+        let (_, v_off) = a.v_center.get();
+        if ncol >= 1 && ql.col_x[0].1 != band.2 - v_off {
             col_ok = false; // 首列右缘贴版心右缘
         }
         rows.push((
@@ -692,7 +693,7 @@ pub(crate) fn selftest() -> i32 {
                 ql.glyphs.len(),
                 ql.col_x.first().map(|t| t.0).unwrap_or(-1),
                 ql.col_x.last().map(|t| t.1).unwrap_or(-1),
-                band.2
+                band.2 - v_off
             ),
         ));
 
@@ -861,7 +862,8 @@ pub(crate) fn selftest() -> i32 {
         //    最右墨迹 x=br；`--dump` 实测 300×660 右缘曾被切 9px 的那次，
         //    切的正是 x ≥ br 这几列）。任何静态裁剪区切在 br 都会先抹掉
         //    这圈外溢 ⇒ 外溢窗口从 br 起算（含），注毒实测内测墨查不出裁剪。
-        let br = band.2;
+        //    U5 居中之后有效右缘 = band.2 - 居中偏移（读内核缓存，不自己推）。
+        let br = band.2 - a.v_center.get().1;
         let mut edge_ink = 0usize;
         let mut spill_ink = 0usize;
         let mut max_ink_x: i32 = -1;
@@ -1637,7 +1639,8 @@ pub(crate) fn selftest() -> i32 {
             MI_DATE,
             MI_SECONDS,
             MI_QUOTE,
-            MI_SHADOW,
+            // 桌面适配（2026-11-24）：塞在「显示内容」行尾，不增面板高度
+            MI_DESK_FIT,
             MI_TOPMOST,
             MI_AUTOHIDE,
             MI_AUTOSTART,
@@ -1645,8 +1648,6 @@ pub(crate) fn selftest() -> i32 {
             MI_PAUSE,
             MI_FAV_ONLY,
             MI_SHRINK_FIT,
-            MI_GLASS,
-            MI_TEXT,
             MI_ORIENT_BASE,
             MI_ORIENT_BASE + 1,
             MI_ANIM_BASE,
@@ -1655,6 +1656,11 @@ pub(crate) fn selftest() -> i32 {
             MI_ANIM_BASE + 3,
             MI_SPEED_DOWN,
             MI_SPEED_UP,
+            // 渲染模式与阴影归入外观组（2026-11-24 审查 U2）：
+            // 它们是外观属性，不是「窗口与行为」/「显示内容」。
+            MI_GLASS,
+            MI_TEXT,
+            MI_SHADOW,
             MI_SCALE_DOWN,
             MI_SCALE_UP,
             MI_OP_DOWN,
@@ -1686,6 +1692,7 @@ pub(crate) fn selftest() -> i32 {
             MI_ISLAND_ITEM_BASE + 3,
             MI_ISLAND_ITEM_BASE + 4,
             MI_ISLAND_ITEM_BASE + 5,
+            MI_ISLAND_ITEM_BASE + 6,
             MI_ISLAND_ROT_DOWN,
             MI_ISLAND_ROT_UP,
             MI_ISLAND_OP_DOWN,
@@ -1696,6 +1703,12 @@ pub(crate) fn selftest() -> i32 {
             MI_ISLAND_W_UP,
             MI_ISLAND_H_DOWN,
             MI_ISLAND_H_UP,
+            // 新消息的两件事：拉长时长与提示点颜色（2026-11-24 产品逻辑）。
+            // 手工登记在这里是**故意的** —— 这条断言的全部价值就是「加了控件
+            // 必须有人签字」，自动跟随等于把签字环节删掉。
+            MI_ISLAND_PEEK_DOWN,
+            MI_ISLAND_PEEK_UP,
+            MI_ISLAND_DOT_COLOR,
         ];
         let got = config_ui::table_cmds();
         let mut uniq = got.clone();
@@ -1735,6 +1748,58 @@ pub(crate) fn selftest() -> i32 {
                     Some(m) => format!("（{}）", m),
                     None => String::new(),
                 }
+            ),
+        ));
+    }
+
+    // ---- ⑥d 桌面适配：一键切档必须真的把对比度拉到可用
+    //
+    // 这条钉的是**产品承诺**：用户点一下「浅底」，字就该看得清。
+    // 判据用 WCAG 对比度，而不是「颜色变了没有」—— 改一个相近色也能让
+    // 后者通过，而那正是要防的（2026-11-24 实测：浅金 #F5D98B 在浅灰桌面
+    // #E2E8ED 上只有 **1.03:1**，灰度上完全糊掉）。
+    //
+    // 断言还会红的两条：`fit_paint()` 偷偷改了用户原值（切回自定找不回来），
+    // 以及两档配色撞成同一个色（「切换」变空操作）。
+    {
+        let c = a.cfg.clone();
+        let paint_of = |fit: i32| {
+            let mut t = c.clone();
+            t.fit = fit;
+            t.fit_paint()
+        };
+        let (p_custom, p_light, p_dark) = (paint_of(0), paint_of(1), paint_of(2));
+
+        // 背景取实测值：浅灰 Excel 工具栏 / 项目默认深色壁纸。
+        // `opacity` 也是实测的（用户配置 191）—— 半透明会把文字拉向背景，
+        // 不带上它算出来的对比度是假的。
+        const BG_LIGHT: u32 = 0xE2E8ED;
+        const BG_DARK: u32 = 0x0B0D12;
+        let a8 = c.opacity.clamp(1, 255) as u8;
+
+        let r_custom = contrast_after_alpha(p_custom.color, BG_LIGHT, a8);
+        let r_light = contrast_after_alpha(p_light.color, BG_LIGHT, a8);
+        let r_dark = contrast_after_alpha(p_dark.color, BG_DARK, a8);
+
+        // 「不动用户原值」是这功能的立身之本：切回自定必须逐字段还原。
+        let untouched = p_custom.color == c.color
+            && p_custom.date == c.date_color
+            && p_custom.quote == c.quote_paint_color()
+            && p_custom.shadow == c.shadow;
+        let distinct = p_light.color != p_dark.color;
+        let ok = untouched
+            && distinct
+            && p_light.shadow
+            && !p_dark.shadow
+            && r_light >= 4.5
+            && r_dark >= 4.5;
+
+        rows.push((
+            "桌面适配·切档后对比度（WCAG 正文 4.5:1）",
+            ok,
+            format!(
+                "浅底 {:.2}:1（同背景自定 {:.2}:1）· 深底 {:.2}:1 · 原值未动={} · 两档不同={} · 描边 {} / {}",
+                r_light, r_custom, r_dark, untouched, distinct, p_light.shadow, p_dark.shadow
             ),
         ));
     }
@@ -2787,7 +2852,14 @@ pub(crate) fn selftest() -> i32 {
         let op = a.text_alpha();
         build_frame(&mut a, op);
         let cr = a.clock_rect;
-        let main_left = a.cfg.w - 24 - ql.extent.0; // br(w-24) - 主文宽
+        // 主文左缘读**真实字形最小 x**：U5 居中之后主文不再贴 br，
+        // 用 w-24-extent 推会偏一个居中偏移量（与 hug_sign 同一口径）。
+        let main_left = ql
+            .glyphs
+            .iter()
+            .map(|g| g.x)
+            .min()
+            .unwrap_or(a.cfg.w - 24);
         let hug_ok = (cr.right - (main_left - 24)).abs() <= 2 && cr.left >= 24;
         rows.push((
             "竖版·落款跟排（右缘贴主文左缘）",
@@ -3073,4 +3145,38 @@ pub(crate) fn selftest() -> i32 {
     } else {
         3
     }
+}
+
+// ---------------------------------------------------------------- 对比度
+
+/// WCAG 2.x 相对亮度（sRGB → 线性）。
+fn rel_lum(rgb: u32) -> f32 {
+    let f = |v: u32| {
+        let x = v as f32 / 255.0;
+        if x <= 0.03928 {
+            x / 12.92
+        } else {
+            ((x + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = ((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+    0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+}
+
+/// 文字按 `alpha` 混到背景之后，与背景的 WCAG 对比度。
+///
+/// **先在 sRGB 空间混，再算亮度** —— 这是绘制时的真实行为（`compose` 里按
+/// alpha 逐通道混）。反过来「先算亮度再混」会高估对比度，算出来的数比屏幕
+/// 上好看，而这种偏差恰好会掩盖「半透明导致文字发糊」这一类故障。
+fn contrast_after_alpha(fg: u32, bg: u32, alpha: u8) -> f32 {
+    let k = alpha as f32 / 255.0;
+    let mix = |shift: u32| {
+        let f = ((fg >> shift) & 0xFF) as f32;
+        let b = ((bg >> shift) & 0xFF) as f32;
+        (f * k + b * (1.0 - k)).round() as u32
+    };
+    let composed = (mix(16) << 16) | (mix(8) << 8) | mix(0);
+    let (l1, l2) = (rel_lum(composed), rel_lum(bg));
+    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
 }

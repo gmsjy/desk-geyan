@@ -155,6 +155,8 @@ pub const VK_LEFT: u32 = 0x25;
 pub const VK_UP: u32 = 0x26;
 pub const VK_RIGHT: u32 = 0x27;
 pub const VK_DOWN: u32 = 0x28;
+/// 桌面适配一键切换
+pub const VK_A: u32 = 0x41;
 pub const VK_C: u32 = 0x43;
 pub const VK_D: u32 = 0x44;
 pub const VK_E: u32 = 0x45;
