@@ -690,35 +690,73 @@ fn probe_inner() -> i32 {
                 crate::ffi::gui_resources().map(|(g, _)| g).unwrap_or(0)
             };
             let g0 = gdi(a);
-            config_ui::open(a);
-            let opened = a.config.is_open();
-            let n = a.config.list_len();
-            config_ui::close(a);
-            let closed = !a.config.is_open();
-            let g1 = gdi(a);
-            // 再来一轮：这一轮必须一点都不涨
-            config_ui::open(a);
-            config_ui::close(a);
-            let g2 = gdi(a);
 
-            let no_leak = g1 == 0 || g2 <= g1;
+            // ---- 预热两轮（**不参与判定**）
+            //
+            // 头几次建窗会冒出**一次性**的系统 GDI 对象，实测落点完全不稳定：
+            // 有时 +9（36→45），有时 +97（36→133），有时干脆落到第三、四轮。
+            // 它们不是我们建的（我们建的一律在 `free_resources` /
+            // `release_owned_after_destroy` 里删），而且**只出现一次**。
+            // 所以判据不能写成「相邻两轮必须相等」—— 那 88 个一落进判定区间
+            // 就是假红（本机实测 5 次里红 1 次）。理由见下面的 `grows <= 1`。
+            let mut opened_ok = false;
+            let mut n = 0usize;
+            let mut closed_ok = false;
+            for _ in 0..2 {
+                config_ui::open(a);
+                opened_ok = a.config.is_open();
+                n = a.config.list_len();
+                // 让面板**真的画一遍**：那批一次性对象里有一部分是主题 / 字体
+                // 缓存在首次绘制时才惰性分配的。
+                crate::bench::pump();
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                config_ui::close(a);
+                closed_ok = !a.config.is_open();
+            }
+            let warm = gdi(a);
+
+            // ---- 判定段：连点 4 次「关闭」按钮
+            //
+            // 必须点**按钮**，不能调 `config_ui::close()`：两条路各写一遍释放
+            // 逻辑，历史上漏的正是按钮这一边 —— `free_resources()` +
+            // `DestroyWindow()` 之后少了 `release_owned_after_destroy()`，
+            // 3 个色刷（推迟到销毁后删，结果没人删）与 2 个窗口图标
+            // **每点一次漏 8~9 个**（图标自带的位图也算 GDI 对象）。只测
+            // `close()` 的话这条泄漏永远绿 —— 注毒实测连点四轮涨
+            // 140→148→157→166，判据立刻红。
+            //
+            // 判据是「**涨的轮数 ≤ 1**」，不是「每轮都不涨」：
+            //   * 真泄漏 ⇒ 每轮都涨（+5/轮 × 4 轮 = 涨 4 次），必红；
+            //   * 一次性系统对象 ⇒ 至多落在一轮里（涨 1 次），不冤判。
+            // 换成「相邻两轮相等」会把后者的落点当成泄漏 —— 假红比漏判更毁人。
+            let mut seq: Vec<u32> = Vec::new();
+            let mut btns = 0;
+            for _ in 0..4 {
+                config_ui::open(a);
+                if config_ui::test_click_close(a) {
+                    btns += 1;
+                }
+                seq.push(gdi(a));
+            }
+            let grows = seq.windows(2).filter(|w| w[1] > w[0]).count();
+            let no_leak = seq[0] == 0 || grows <= 1;
             rows.push((
-                "设置面板：建窗 + 字体列表 + 开关两轮不涨句柄",
-                if !was && opened && n > 0 && closed && no_leak {
+                "设置面板：建窗 + 字体列表 + 连点 4 次关闭按钮不漏句柄",
+                if !was && opened_ok && n > 0 && closed_ok && btns == 4 && no_leak {
                     R::Pass
                 } else {
                     R::Fail
                 },
                 format!(
-                    "建窗={} · 字体列表 {} 项 · 关闭后句柄已清={} · GDI {}→{}→{}（首轮 +{}，二轮 Δ{}）",
-                    opened,
+                    "建窗={} · 字体列表 {} 项 · 关闭后句柄已清={} · 点按钮关成功 {}/4 · GDI 起点 {} · 预热 {} · 连点后 {}（涨的轮数 {}，须 ≤1）",
+                    opened_ok,
                     n,
-                    closed,
+                    closed_ok,
+                    btns,
                     g0,
-                    g1,
-                    g2,
-                    g1.saturating_sub(g0),
-                    g2 as i64 - g1 as i64
+                    warm,
+                    seq.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("→"),
+                    grows
                 ),
             ));
         }

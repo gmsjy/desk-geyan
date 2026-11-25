@@ -1689,9 +1689,18 @@ unsafe fn on_setting_click(a: &mut App, id: i32) -> bool {
         Role::Radio => on_menu(a, c.cmd),
         Role::NumDown | Role::NumUp | Role::ColorNext | Role::Menu => on_menu(a, c.cmd),
         Role::Close => {
-            let hwnd = a.config.hwnd;
-            a.config.free_resources();
-            DestroyWindow(hwnd);
+            // **必须走 `close()`，不能自己抄一遍 `free_resources` + `DestroyWindow`。**
+            // 这条路径以前抄漏了最后一步 `release_owned_after_destroy()`：
+            // 三个色刷（`sel_brush` / `bg_brush` / `frame_brush`）在
+            // `free_resources` 里被挪进 `pending` 等着窗口销毁后删，而这里
+            // 销毁完就 return 了 —— 于是**每点一次关闭按钮漏 8~9 个 GDI 句柄**
+            // （3 个色刷 + 2 个窗口图标及其自带位图，`--probe` 实测连点四轮
+            // 140→148→157→166）。
+            //
+            // `--probe` 里那条「开关两轮不涨句柄」抓不到它：那条走的是
+            // `config_ui::close()`，永远干净。所以那边另加了一条**点按钮**的断言
+            // （`test_click_close`），路径不同，缺陷只在前一条路上。
+            close(a);
             return true;
         }
         _ => {}
@@ -1787,6 +1796,32 @@ pub fn test_click_cmd(a: &mut App, cmd: u32) -> bool {
     }
     unsafe { SendMessageW(c.hwnd, BM_CLICK, 0, 0) };
     true
+}
+
+/// **仅供自检**：点一下面板上那个「关闭」按钮。
+///
+/// 和 [`test_click_cmd`] 一样用 `BM_CLICK`（真人点鼠标就是这条路：按钮
+/// wndproc → `WM_COMMAND`/`BN_CLICKED` → `on_setting_click`），但它**必须单独
+/// 存在**：`config_ui::close()` 是「程序自己关窗」那条路，而关闭按钮走的是
+/// `on_setting_click` 的 `Role::Close` 分支 —— 两条路各写一遍释放逻辑，
+/// 就一定会有一边漏。历史上漏的正是按钮这一边（3 个刷子 + 2 个图标）。
+///
+/// 返回窗口是否真的关掉了（`false` = 面板上找不到关闭按钮，或点完窗还在）。
+pub fn test_click_close(a: &mut App) -> bool {
+    let Some(c) = a.config.ctls.iter().find(|c| matches!(c.role, Role::Close)) else {
+        return false;
+    };
+    let (hwnd, btn) = (a.config.hwnd, c.hwnd);
+    if hwnd.is_null() || btn.is_null() {
+        return false;
+    }
+    unsafe {
+        SendMessageW(btn, BM_CLICK, 0, 0);
+        // `DestroyWindow` 是同步的：`SendMessageW` 返回时窗口已经没了。
+        // 用 `IsWindow` 复核而不是信 `cfg.hwnd` —— 后者被 `free_resources`
+        // 提前清空了，拿它判断等于自己证明自己。
+        IsWindow(hwnd) == 0 && !a.config.is_open()
+    }
 }
 
 /// **仅供自检**：`cmd` 的「反命令」—— 再点一下就能回到原值的那条。
