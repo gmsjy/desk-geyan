@@ -199,7 +199,11 @@ impl std::fmt::Display for ParseError {
 /// 不是字体的可伸缩变体 —— 又高又窄的定界符会显得笔画偏重。
 pub fn parse(src: &str) -> Result<Node, ParseError> {
     let cs: Vec<char> = src.chars().collect();
-    let mut p = Parser { cs: &cs, i: 0 };
+    let mut p = Parser {
+        cs: &cs,
+        i: 0,
+        depth: 0,
+    };
     let row = p.row(false)?;
     if p.i < p.cs.len() {
         // `row(false)` 只在遇到 `}` 时提前停下；到这里说明多了一个右括号
@@ -222,9 +226,23 @@ pub fn parse_or_text(src: &str) -> Node {
     }
 }
 
+/// 结构嵌套上限。
+///
+/// **这是防栈溢出的闸门，不是排版偏好**：`row` / `command` 都是递归下降，
+/// 词库里一条 `{{{{...` 或 `\frac\frac\frac...` 就能把栈吃穿。而进程是
+/// `panic = "abort"`（`Cargo.toml`），栈溢出**没有 unwind**，
+/// `parse_or_text` 那层 `Result::Err` 兜底根本接不住 —— 表现是直接退出，
+/// 且若这条坏句子进了轮播索引，就是「每次开机即崩」。
+///
+/// 64 层对真实公式是奢侈的余量（`T = 2\pi\sqrt{\frac{L}{g}}` 只用到 6 层），
+/// 换个上限不会误伤任何正常写法。
+const MAX_DEPTH: u16 = 64;
+
 struct Parser<'a> {
     cs: &'a [char],
     i: usize,
+    /// 当前递归深度（只统计**结构**层，平坦兄弟不累计）。
+    depth: u16,
 }
 
 impl<'a> Parser<'a> {
@@ -232,8 +250,38 @@ impl<'a> Parser<'a> {
         self.cs.get(self.i).copied()
     }
 
+    /// 递归闸门：进一层结构占一个坑，出来归还（**出错也要还**，
+    /// 否则同一次解析里一次失败会把后面的深度预算全吃掉）。
+    ///
+    /// 闸门放在 `row` 与 `command` 上：解析器里所有递归环都至少经过这两个之一 ——
+    ///   * 花括号 / 上下标 / `\frac` 的花括号参数 → `row`
+    ///   * `\frac\frac\frac...`（无花括号的裸参数链）、`\left(\left(...` → `command`
+    ///
+    /// 只守 `row` 会漏掉后两种，只守 `command` 会漏掉 `{{{{`。
+    fn guarded<T>(
+        &mut self,
+        pos: usize,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(ParseError {
+                pos,
+                msg: "公式嵌套过深（超过 64 层）",
+            });
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
+
     /// 读一段「行」：一直读到 `}`（`in_group` 为真时）或串尾。
     fn row(&mut self, in_group: bool) -> Result<Node, ParseError> {
+        let pos = self.i;
+        self.guarded(pos, |p| p.row_inner(in_group))
+    }
+
+    fn row_inner(&mut self, in_group: bool) -> Result<Node, ParseError> {
         let mut out: Vec<Node> = Vec::new();
         loop {
             match self.peek() {
@@ -364,6 +412,11 @@ impl<'a> Parser<'a> {
 
     /// `\` 开头的命令。
     fn command(&mut self) -> Result<Node, ParseError> {
+        let pos = self.i;
+        self.guarded(pos, |p| p.command_inner())
+    }
+
+    fn command_inner(&mut self) -> Result<Node, ParseError> {
         let start = self.i;
         self.i += 1; // 吃掉 '\'
         let Some(c) = self.peek() else {
@@ -1274,6 +1327,38 @@ pub trait FontAt {
     fn font(&self, px: i32) -> HFONT;
     /// 同一号字、顺时针转 90°。
     fn font_rot(&self, px: i32) -> HFONT;
+
+    /// **跨帧**的行度量缓存（px → 上高/下深）。
+    ///
+    /// 为什么需要它：公式排版每一帧都要把整棵树重新量一遍（字号是排版时
+    /// 才算出来的，预热不了），而一条公式里同时存在正文字号、上标 0.62、
+    /// 分式 0.82、根号按内容反算 —— 四五个字号，每个字号几十次
+    /// `GetTextMetrics`。`GdiMeasure` 自己那份 `HashMap` 是**每帧新建**的，
+    /// 出了这一帧就没了，于是稳态下每帧都在重复同一批 GDI 调用。
+    /// 实测（`--perf` 竖版公式帧）：排版 225~404µs，其中绝大部分是这笔。
+    ///
+    /// 默认返回 `None`（无缓存）—— 没有 `gfx::Fonts` 的场合（`--math` 样张、
+    /// 单测）照旧用 `GdiMeasure` 自己那份，不需要为此多担任何状态。
+    fn cached_tm(&self, _px: i32) -> Option<(i32, i32)> {
+        None
+    }
+    fn store_tm(&self, _px: i32, _m: (i32, i32)) {}
+
+    /// 同上，单字墨迹（`(字, px)` → `Ink`）。
+    fn cached_ink(&self, _ch: char, _px: i32) -> Option<Ink> {
+        None
+    }
+    fn store_ink(&self, _ch: char, _px: i32, _i: Ink) {}
+
+    /// 同上，单字**步进宽度**（`GetTextExtentPoint32W` 的结果）。
+    ///
+    /// 单独一格而不是复用 `Ink::adv`：两者语义不同 —— `adv` 来自
+    /// `GLYPHMETRICS.gmCellIncX`，这里是 `GetTextExtentPoint32W` 的整段宽度，
+    /// 字体 hinting / 整段取整会让它们差 1px，混用就会让版心宽度漂。
+    fn cached_adv(&self, _ch: char, _px: i32) -> Option<i32> {
+        None
+    }
+    fn store_adv(&self, _ch: char, _px: i32, _w: i32) {}
 }
 
 /// 建一支字体。`esc` 是 `lfEscapement` / `lfOrientation`（0.1°）。
@@ -1374,6 +1459,39 @@ impl FontSrc<'_> {
             FontSrc::Ext(e) => e.font_rot(px),
         }
     }
+    fn cached_tm(&self, px: i32) -> Option<(i32, i32)> {
+        match self {
+            FontSrc::Owned(_) => None,
+            FontSrc::Ext(e) => e.cached_tm(px),
+        }
+    }
+    fn store_tm(&self, px: i32, m: (i32, i32)) {
+        if let FontSrc::Ext(e) = self {
+            e.store_tm(px, m);
+        }
+    }
+    fn cached_ink(&self, ch: char, px: i32) -> Option<Ink> {
+        match self {
+            FontSrc::Owned(_) => None,
+            FontSrc::Ext(e) => e.cached_ink(ch, px),
+        }
+    }
+    fn store_ink(&self, ch: char, px: i32, i: Ink) {
+        if let FontSrc::Ext(e) = self {
+            e.store_ink(ch, px, i);
+        }
+    }
+    fn cached_adv(&self, ch: char, px: i32) -> Option<i32> {
+        match self {
+            FontSrc::Owned(_) => None,
+            FontSrc::Ext(e) => e.cached_adv(ch, px),
+        }
+    }
+    fn store_adv(&self, ch: char, px: i32, w: i32) {
+        if let FontSrc::Ext(e) = self {
+            e.store_adv(ch, px, w);
+        }
+    }
 }
 
 /// 真正落到 GDI 上的度量器。度量**按字号缓存**，字体由 `FontSrc` 提供。
@@ -1426,6 +1544,11 @@ impl<'a> GdiMeasure<'a> {
         if let Some(&m) = self.metrics.borrow().get(&px) {
             return m;
         }
+        // 跨帧缓存优先：稳态下这里应当**恒命中**，一次 GDI 都不进。
+        if let Some(m) = self.src.cached_tm(px) {
+            self.metrics.borrow_mut().insert(px, m);
+            return m;
+        }
         let f = self.font(px);
         let mut tm: TEXTMETRICW = unsafe { std::mem::zeroed() };
         unsafe {
@@ -1434,6 +1557,7 @@ impl<'a> GdiMeasure<'a> {
         }
         let m = (tm.tmAscent as i32, tm.tmDescent as i32);
         self.metrics.borrow_mut().insert(px, m);
+        self.src.store_tm(px, m);
         m
     }
 
@@ -1446,6 +1570,10 @@ impl<'a> GdiMeasure<'a> {
         let px = px.max(SCRIPT_MIN_PX);
         let key = (ch as u32, px);
         if let Some(&i) = self.inks.borrow().get(&key) {
+            return i;
+        }
+        if let Some(i) = self.src.cached_ink(ch, px) {
+            self.inks.borrow_mut().insert(key, i);
             return i;
         }
         let f = self.font(px);
@@ -1489,6 +1617,7 @@ impl<'a> GdiMeasure<'a> {
             }
         };
         self.inks.borrow_mut().insert(key, i);
+        self.src.store_ink(ch, px, i);
         i
     }
 }
@@ -1496,8 +1625,23 @@ impl<'a> GdiMeasure<'a> {
 impl Measure for GdiMeasure<'_> {
     fn text(&self, s: &[char], px: i32) -> TextMetric {
         let (ascent, descent) = self.tm(px);
+        // 单字走跨帧缓存：公式排版里 99% 的量字都是单字（每个 `Node::Char`
+        // 一次）。多字串照旧现量 —— 它们只出现在 `\sin` 这类函数名上，
+        // 量到也不多，为它再开一层拼接缓存不值。
+        let w = if let [ch] = s {
+            match self.src.cached_adv(*ch, px) {
+                Some(w) => w,
+                None => {
+                    let w = measure_run(self.hdc, self.font(px), s);
+                    self.src.store_adv(*ch, px, w);
+                    w
+                }
+            }
+        } else {
+            measure_run(self.hdc, self.font(px), s)
+        };
         TextMetric {
-            w: measure_run(self.hdc, self.font(px), s),
+            w,
             ascent,
             descent,
         }
@@ -2061,6 +2205,43 @@ mod tests {
         let mut m = fake();
         let mb = layout(&n, 40, &mut m);
         assert!(!mb.items.is_empty());
+    }
+
+    #[test]
+    fn 深层嵌套报错而不炸栈() {
+        // 栈溢出在 `panic = "abort"` 下**没有 unwind**，`parse_or_text` 的
+        // `Err` 兜底接不住 —— 这个测试只要跑完（而不是整个测试进程消失）就已经
+        // 断言了核心；再加一道「必须是 Err 而不是 Ok」把语义也钉住。
+        let cases = [
+            "{".repeat(2000),       // 花括号链（走 row 环）
+            "\\frac".repeat(2000),  // 裸参数链：brace_arg→base→command，不经过 row
+            "\\left(".repeat(2000), // 定界符链：delim→atom→base→command
+            "x^".to_string() + &"{".repeat(2000),
+        ];
+        for src in cases {
+            let e = parse(&src).expect_err("深层嵌套必须报错");
+            assert!(e.msg.contains("嵌套过深"), "{}… 实际报错：{}", &src[..8], e);
+        }
+        // 兜底路径仍然活着：整串当文字排出来
+        let n = parse_or_text(&"{".repeat(2000));
+        let mut m = fake();
+        let _ = layout(&n, 40, &mut m);
+    }
+
+    #[test]
+    fn 闸门不误伤合法深度与平坦表达式() {
+        // 平坦兄弟不累计深度：200 个并列组照常过
+        assert!(parse(&"a{a}".repeat(200)).is_ok(), "平坦表达式被闸门误伤");
+        assert!(
+            parse(&"\\frac{1}{2}".repeat(200)).is_ok(),
+            "并列分式被闸门误伤"
+        );
+        // 真实写法里最深的几条（6 层上下）
+        let deep = "\\sqrt{\\frac{\\sqrt{\\frac{\\sqrt{a}}{b}}}{c}}";
+        assert!(parse(deep).is_ok(), "6 层嵌套被闸门误伤");
+        // 上限边界：恰好 MAX_DEPTH 层要能过（含首层 row，故取 MAX_DEPTH-1 个 `{`）
+        let edge = "{".repeat(MAX_DEPTH as usize - 1) + &"}".repeat(MAX_DEPTH as usize - 1);
+        assert!(parse(&edge).is_ok(), "{} 层应可通过", MAX_DEPTH - 1);
     }
 
     #[test]

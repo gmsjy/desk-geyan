@@ -136,7 +136,28 @@ pub struct Fonts {
     math: RefCell<HashMap<i32, HFONT>>,
     /// 同一批字号的**顺时针 90°** 版本（竖版整块旋转用，见 `tex::draw_rot`）。
     math_rot: RefCell<HashMap<i32, HFONT>>,
+    /// 公式度量的**跨帧**缓存：字号 → (上高, 下深)。
+    ///
+    /// 和 `math` 同一个理由，但更狠：公式排版每帧都要把整棵树重量一遍，
+    /// 而 `tex::GdiMeasure` 自己那份缓存是**每帧新建**的 —— 稳态下等于
+    /// 每帧重跑几十次 `GetTextMetrics` / `GetGlyphOutline`。
+    /// 挂在这里就是「量一次，一帧之外还能用」。随 `Fonts` 一起销毁，
+    /// 换 DPI / 换字体时 `Fonts` 重建，缓存自然失效。
+    math_tm: RefCell<HashMap<i32, (i32, i32)>>,
+    /// 同上，单字墨迹：`(字, 字号)` → `Ink`。
+    math_ink: RefCell<HashMap<(u32, i32), crate::tex::Ink>>,
+    /// 同上，单字步进宽度：`(字, 字号)` → px。
+    math_adv: RefCell<HashMap<(u32, i32), i32>>,
 }
+
+/// 公式度量缓存（`math_ink` / `math_adv`）的条目上限。
+///
+/// 这层缓存的价值是「稳态零 GDI 度量」（`--perf` 竖版公式 1509 → 1120µs），
+/// 但它挂在 `Fonts` 上／与进程同寿，键里**带字符** —— 词库轮播会把「见过的字
+/// × 字号」一直攒下去：768 条词库约 2 万字，乘上几个字号就是十万级条目。
+/// 到顶就整表清空：代价只是清空后那一帧回到未命中（与冷启动同价），
+/// 而**只有遇到新字才会再触发清空** —— 同一句反复画是纯命中，不会被反复清。
+const MATH_CACHE_MAX: usize = 1 << 16;
 
 /// 缩字回退的候选档（百分比）。老板定的下限是 70%。
 pub const QUOTE_SHRINK_STEPS: [i32; 3] = [100, 85, 70];
@@ -191,6 +212,9 @@ impl Fonts {
             ],
             math: RefCell::new(HashMap::new()),
             math_rot: RefCell::new(HashMap::new()),
+            math_tm: RefCell::new(HashMap::new()),
+            math_ink: RefCell::new(HashMap::new()),
+            math_adv: RefCell::new(HashMap::new()),
             face: f,
         }
     }
@@ -307,6 +331,33 @@ impl crate::tex::FontAt for Fonts {
     }
     fn font_rot(&self, px: i32) -> HFONT {
         self.math_font_rot(px)
+    }
+    fn cached_tm(&self, px: i32) -> Option<(i32, i32)> {
+        self.math_tm.borrow().get(&px).copied()
+    }
+    fn store_tm(&self, px: i32, m: (i32, i32)) {
+        self.math_tm.borrow_mut().insert(px, m);
+    }
+    fn cached_ink(&self, ch: char, px: i32) -> Option<crate::tex::Ink> {
+        self.math_ink.borrow().get(&(ch as u32, px)).copied()
+    }
+    fn store_ink(&self, ch: char, px: i32, i: crate::tex::Ink) {
+        let mut c = self.math_ink.borrow_mut();
+        // 见 `MATH_CACHE_MAX`：到顶整表清空，别让它跟着词库无限长。
+        if c.len() >= MATH_CACHE_MAX {
+            c.clear();
+        }
+        c.insert((ch as u32, px), i);
+    }
+    fn cached_adv(&self, ch: char, px: i32) -> Option<i32> {
+        self.math_adv.borrow().get(&(ch as u32, px)).copied()
+    }
+    fn store_adv(&self, ch: char, px: i32, w: i32) {
+        let mut c = self.math_adv.borrow_mut();
+        if c.len() >= MATH_CACHE_MAX {
+            c.clear();
+        }
+        c.insert((ch as u32, px), w);
     }
 }
 
@@ -856,7 +907,7 @@ impl Frame {
                     continue;
                 }
 
-                let (bq, bd) = bands.get(x as u16);
+                let (bq, bd) = bands.get(x as u16, y as u16);
                 let sa = if shv == 255 {
                     0
                 } else {
@@ -1078,6 +1129,13 @@ pub const MAX_BANDS: usize = crate::layout::MAX_COLS + 1;
 pub struct Band {
     pub x0: u16,
     pub x1: u16,
+    /// 纵向范围。**绝大多数带是全高的**（列带按 x 切分，纵向不设限）；
+    /// 只有「出处列」那条需要它 —— 出处和页头日期都在 `CH_DATE` 通道上，
+    /// 而页头日期在窗口顶端、出处列在下半截，两者的 **x 区间经常重叠**
+    /// （竖版极简：日期 x=145..，出处 x=140..）。不带 y 的话，出处淡入
+    /// 会把页头日期一起压暗，那半截字在 260ms 里莫名变灰。
+    pub y0: u16,
+    pub y1: u16,
     /// 格言通道系数（0..=255）
     pub qk: u8,
     /// 日期通道系数（0..=255）
@@ -1099,6 +1157,8 @@ impl BandTable {
             bands: [Band {
                 x0: 0,
                 x1: 0,
+                y0: 0,
+                y1: u16::MAX,
                 qk: 255,
                 dk: 255,
             }; MAX_BANDS],
@@ -1113,16 +1173,25 @@ impl BandTable {
         t
     }
 
-    /// 加一条带。区间为空或超出容量时返回 false（调用方保证列数 ≤ 容量：
-    /// 竖版窗口宽度装不下 16 列主文；真超了就是排版层的 bug，由 `--selftest`
-    /// 的列顺序断言间接守着）。
+    /// 加一条**全高**的带（按 x 切分）。区间为空或超出容量时返回 false
+    /// （调用方保证列数 ≤ 容量：竖版窗口宽度装不下 16 列主文；真超了就是
+    /// 排版层的 bug，由 `--selftest` 的列顺序断言间接守着）。
     pub fn push(&mut self, x0: i32, x1: i32, qk: u8, dk: u8) -> bool {
-        if self.n >= MAX_BANDS || x1 <= x0 {
+        self.push_box(x0, x1, 0, i32::MAX, qk, dk)
+    }
+
+    /// 加一条**限定纵向范围**的带。给「同一通道、不同 y」的两种内容分账用
+    /// （见 `Band::y0` 的注释：出处列 vs 页头日期）。
+    pub fn push_box(&mut self, x0: i32, x1: i32, y0: i32, y1: i32, qk: u8, dk: u8) -> bool {
+        if self.n >= MAX_BANDS || x1 <= x0 || y1 <= y0 {
             return false;
         }
+        let c = |v: i32| (v.max(0) as u32).min(u16::MAX as u32) as u16;
         self.bands[self.n] = Band {
-            x0: (x0.max(0) as u32).min(u16::MAX as u32) as u16,
-            x1: (x1.max(0) as u32).min(u16::MAX as u32) as u16,
+            x0: c(x0),
+            x1: c(x1),
+            y0: c(y0),
+            y1: c(y1),
             qk,
             dk,
         };
@@ -1130,16 +1199,19 @@ impl BandTable {
         true
     }
 
-    /// 查 `x` 落在哪条带：`(格言系数, 日期系数)`；无带 = 都不缩放。
-    /// 通带（n==1）是绝大多数帧的形态，一次比较就返回。
+    /// 查 `(x, y)` 落在哪条带：`(格言系数, 日期系数)`；无带 = 都不缩放。
+    /// 通带（n==1）是绝大多数帧的形态，两次比较就返回。
     #[inline]
-    pub fn get(&self, x: u16) -> (u32, u32) {
+    pub fn get(&self, x: u16, y: u16) -> (u32, u32) {
         if self.n == 1 {
             let b = &self.bands[0];
-            return (b.qk as u32, b.dk as u32);
+            if y >= b.y0 && y < b.y1 {
+                return (b.qk as u32, b.dk as u32);
+            }
+            return (255, 255);
         }
         for b in &self.bands[..self.n] {
-            if x >= b.x0 && x < b.x1 {
+            if x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1 {
                 return (b.qk as u32, b.dk as u32);
             }
         }
@@ -1593,5 +1665,33 @@ mod tests {
         body_coverage_into(&mut px, 5, 0, 3);
         body_coverage_into(&mut px, 100, 100, 3); // 缓冲区不够
         assert!(px.iter().all(|p| *p == 0), "非法入参却写了像素");
+    }
+
+    /// 带表的**纵向**限定：同一 x 上，署名带只该管它自己那几行。
+    ///
+    /// 为什么需要这条：出处列和页头日期**都在 `CH_DATE` 通道上**，两者的
+    /// x 区间可以重叠（竖版极简：日期 x≈145、出处 x≈102~134，窗口一窄就撞上）。
+    /// 只按 x 分带的话，出处淡入会把页头日期一起压暗 —— 那几行日期本该是
+    /// 静帧锚点。`push_box` 的 y 范围就是为了把这两笔账分开。
+    #[test]
+    fn band_box_limits_by_y() {
+        let mut t = BandTable::empty();
+        assert!(t.push_box(100, 140, 400, 500, 64, 64), "出处带应当塞得下");
+        assert!(t.push(0, i32::MAX, 200, 255), "通带应当塞得下");
+        // 带内：两条系数都按出处带
+        assert_eq!(t.get(120, 450), (64, 64));
+        // 同 x、带外（页头日期那一行）：退回通带
+        assert_eq!(t.get(120, 30), (200, 255));
+        // 带外 x：通带
+        assert_eq!(t.get(300, 450), (200, 255));
+    }
+
+    /// 单条带（通带）也必须尊重 y 范围 —— 快路径 `n == 1` 不能无条件返回。
+    #[test]
+    fn band_single_entry_still_honors_y() {
+        let mut t = BandTable::empty();
+        t.push_box(0, 100, 10, 20, 0, 0);
+        assert_eq!(t.get(50, 15), (0, 0));
+        assert_eq!(t.get(50, 25), (255, 255), "带外必须不缩放");
     }
 }

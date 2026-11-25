@@ -133,18 +133,32 @@ fn perf_inner() -> i32 {
             text: "国".repeat(60),
             author: "测试".to_string(),
         };
+        // 公式样本。**这一档以前从来没进过基准** —— 两个最坏帧都是
+        // `"国".repeat(60)`，一个 `$` 都没有，于是「公式路径贵十倍」
+        // 这件事在 `--perf` 的达标结论里根本看不见（实测竖版复杂公式
+        // 曾到 4ms 量级，而基准一直报 1.1ms 达标）。
+        //
+        // 样本选**最有代表性的那种**：一条独立公式 + 一句带分式的公式，
+        // 覆盖 `\frac` / `\sqrt` / 上下标三条最贵的排版支路。
+        let math = Quote {
+            text: "单摆周期 $T = 2\\pi\\sqrt{\\frac{L}{g}}$ 与点电荷场强 $E = k\\frac{Q}{r^2}$ 都是平方反比"
+                .to_string(),
+            author: "测试".to_string(),
+        };
         let mut worst_us = 0.0f64;
         let mut worst_what = "";
         let mut worst_rows: Vec<(&'static str, f64, String)> = Vec::new();
-        for (name, orient, w, h) in [
-            ("最坏帧 · 横版多行（60 字折行）", Orient::Horizontal, 620, 260),
-            ("最坏帧 · 竖版卷轴（落款 3 列）", Orient::Vertical, 300, 660),
+        for (name, orient, w, h, q) in [
+            ("最坏帧 · 横版多行（60 字折行）", Orient::Horizontal, 620, 260, &long),
+            ("最坏帧 · 竖版卷轴（60 字）", Orient::Vertical, 300, 660, &long),
+            ("最坏帧 · 横版公式", Orient::Horizontal, 620, 260, &math),
+            ("最坏帧 · 竖版公式", Orient::Vertical, 300, 660, &math),
         ] {
             a.cfg.orient = orient;
             a.cfg.w = w;
             a.cfg.h = h;
             a.cfg.anim = Anim::Static; // 去掉动效：量的是排版 + 绘制本身
-            a.list[a.qi] = long.clone();
+            a.list[a.qi] = q.clone();
             a.rebuild_fonts();
             // 预热：换尺寸后的第一趟要把帧缓冲重建到新尺寸，那是**一次性**的钱。
             // 不预热的话这一档会系统性偏高 —— 而它恰好是「排版层贵不贵」的唯一数据。
@@ -167,10 +181,26 @@ fn perf_inner() -> i32 {
                 worst_us = total;
                 worst_what = name;
             }
+            // 报**这一帧实际画了多少内容**。不报的话，「同一句话但装得下了」
+            // 会被读成「性能退化 25%」—— 上一轮就是这么误判的：
+            // 老版本竖版 60 字装不下（1 列 / 缩 70% / 溢出），只画 29 字；
+            // 新版本装得下（4 列 / 100%），画满 60 字，成本自然翻倍。
+            let lay = {
+                let cb = layout_clock(a);
+                frame_layout(a, &cb)
+            };
             worst_rows.push((
                 name,
                 total,
-                format!("画 {:.0} + 上屏 {:.0} µs · 红线 1200", tb, tu),
+                format!(
+                    "画 {:.0} + 上屏 {:.0} µs · {} 字 {} 列 缩{}%{} · 红线 1200",
+                    tb,
+                    tu,
+                    lay.glyphs.len(),
+                    lay.col_ranges.len(),
+                    lay.shrink,
+                    if lay.overflow { " 溢出" } else { "" }
+                ),
             ));
         }
         // PR1.1/12.8 留档：**过渡期（Leave 半程）**的一帧成本。过渡期比稳态
