@@ -114,38 +114,69 @@ fn frame_mod(a: &App, ql: &QuoteLayout, cb: &ClockBox, qk: f32) -> FrameMod {
     let ncols = ql.col_ranges.len();
     let staggered = a.trans.phase() == transition::Phase::Arrive && ncols > 1;
 
-    // 出处列（日期通道的带）：k = 最左列（阅读序最末）
+    // 出处列的**有效系数**：错峰期跟最左列（阅读序最末才落定），其余相位跟整块 `qk`。
+    //
+    // 以前只在错峰期算它，于是 Leave / Gap 期出处**完全不淡**：颜色系数恒 255、
+    // 阴影灰度恒 0，换句时正文在淡、署名钉着不动，收尾那一下像「跳」了一下。
     let author = cb.sig.iter().find(|c| c.is_author);
-    let author_k = a.trans.col_k(ncols - 1, ncols);
-    let author_gray = if author.is_some() && author_k < 1.0 {
+    let author_k = if staggered {
+        a.trans.col_k(ncols - 1, ncols)
+    } else {
+        qk
+    };
+    let author_u8 = (author_k * 255.0).round().clamp(0.0, 255.0) as u8;
+    let author_gray = if author.is_some() && author_u8 < 255 {
         shadow_gray(author_k)
     } else {
         0
+    };
+
+    // 出处带：x 范围是署名那一列，**y 范围限定到署名自己的高度**。
+    //
+    // 为什么必须带 y：出处和页头日期**都在 `CH_DATE` 通道上**，而两者的 x
+    // 区间经常重叠（竖版极简实测：日期 x=145..、出处 x=140..）。只按 x 分带
+    // 的话，出处淡入会把页头日期一起压暗 —— 那半截日期在 260ms 里莫名变灰，
+    // 而它本该是静帧锚点。
+    //
+    // 两条系数都给 `author_u8`，但**真正起作用的是日期那条**：署名画在
+    // `CH_DATE` 通道上，格言系数在这个矩形里没有墨迹可乘。
+    //
+    // 格言那条不写死 255 是防一手：`get` 是先匹配先赢，万一哪天排版让
+    // 「署名列」与「某条主文列」x 区间重叠，写 255 就等于给那几行正文
+    // 免了淡出（入场时「提前浮出」、出场时「不肯消失」）。给它同一个 k，
+    // 重叠时最坏也只是「跟着署名一起淡」，不会露馅。
+    let push_author = |t: &mut gfx::BandTable| {
+        if let Some(ac) = author {
+            let h = (ac.s.len() as i32) * cb.sig_cell.max(1);
+            t.push_box(
+                ac.x,
+                ac.x + cb.sig_w.max(1),
+                ac.y,
+                ac.y + h.max(1),
+                author_u8,
+                author_u8,
+            );
+        }
     };
 
     let mut col_grays = Vec::new();
     // **先建出处带、再建列带**：`get` 先匹配先赢，而末列瓦片为了兜住阴影
     // 外溢会左扩到窗口边缘、恰好盖住出处区 —— 出处带后 push 就永远排不上号
     // （实测：比值全 1.000，出处只动了阴影没动颜色）。
-    // 非错峰相位 `col_k == quote_k`，出处随整块 qk 走即可，不需要单独的带。
+    // 非错峰相位所有列同一个 k，出处随整块 qk 走即可，不需要单独的列带。
     let bands = if staggered {
         // 列数 + 出处那条必须装得下。装不下就整体退化成通带：
         // 逐列带只装进去一部分的话，落在外面的列 `get` 查不到带、
         // 系数退回 255（满亮），于是过渡期间右半边会「不淡入地闪一下」——
         // 比「整块一起淡入」难看得多，而且几乎不可能凭描述复现。
-        let need = ql.col_x.len() + usize::from(author.is_some());
+        let need = ql.col_x.len() + usize::from(author.is_some() && author_u8 < 255);
         if need > gfx::MAX_BANDS {
             BAND_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             gfx::BandTable::uniform(qk_u8, 255)
         } else {
             let mut t = gfx::BandTable::empty();
-            if let Some(ac) = author {
-                t.push(
-                    ac.x,
-                    ac.x + cb.sig_w.max(1),
-                    255,
-                    (author_k * 255.0).round().clamp(0.0, 255.0) as u8,
-                );
+            if author_u8 < 255 {
+                push_author(&mut t);
             }
             for (i, &(g0, g1)) in ql.col_ranges.iter().enumerate() {
                 let k = a.trans.col_k(i, ncols);
@@ -163,6 +194,13 @@ fn frame_mod(a: &App, ql: &QuoteLayout, cb: &ClockBox, qk: f32) -> FrameMod {
             }
             t
         }
+    } else if author.is_some() && author_u8 < 255 {
+        // 非错峰（出场 / 空档 / 呼吸）：整块一条通带，但出处那一列要单独
+        // 一条日期带，否则署名不跟着淡。通带**后 push**，出处先赢。
+        let mut t = gfx::BandTable::empty();
+        push_author(&mut t);
+        t.push(0, i32::MAX, qk_u8, 255);
+        t
     } else {
         gfx::BandTable::uniform(qk_u8, 255)
     };

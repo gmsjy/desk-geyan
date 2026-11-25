@@ -908,8 +908,136 @@ pub(crate) fn selftest() -> i32 {
             },
         ));
 
-        // ⑧ 竖版首列完整可见（孤儿项：右缘墨迹被裁剪区切掉的回归守卫）。
+        // ⑦b 署名**在场**时：它必须跟着淡，页头日期必须纹丝不动。
         //
+        //    ⑦ 那句是「带出处且最长」的 36 字，竖版会把版面撑满、署名按设计让位，
+        //    于是 ⑦ 里 `author_col` 恒为 None —— 它只验到「日期不动」，
+        //    「署名跟着淡」这一半从来没被真跑过（跳过的地方正是缺陷藏身的地方）。
+        //
+        //    实测两种页面的缺陷不同：
+        //    * **出场（Leave / Gap）**：正文按 qk 淡出，署名却钉在 255 不动 ——
+        //      带表在非错峰相位只推一条通带（日期系数恒 255），署名的日期
+        //      系数没人为它降过。换句收尾时那一下「跳」，就是它。
+        //    * **入场（Arrive）**：署名按 author_k 淡，但那条带**没有 y 范围**，
+        //      同 x 的页头日期会被一起压暗（两者都在 `CH_DATE` 通道上）。
+        //
+        //    这里量出场半程：正文比值 = qk，署名比值必须**跟着 qk**，
+        //    页头日期逐位相同。注毒法验证过：把署名带去掉，署名比值恒 1.000，
+        //    这条立刻红。
+        let keep_quote = a.list[a.qi].clone();
+        let (keep_style, keep_anim) = (a.cfg.v_style, a.cfg.anim);
+        a.cfg.v_style = VStyle::Minimal;
+        a.cfg.anim = Anim::Static;
+        a.list[a.qi] = Quote {
+            text: "春眠不觉晓处处闻啼鸟夜来风雨声花落".to_string(),
+            author: "孟浩然".to_string(),
+        };
+        let (v5, v6, want_leave);
+        {
+            let mut b1: Vec<u32> = Vec::new();
+            let mut b2: Vec<u32> = Vec::new();
+            let mut qk = 0.0f32;
+            for _ in 0..5 {
+                let stamp = clock_stamp(&a.cfg);
+                a.trans.settle();
+                a.phase = 0.0;
+                let op = a.text_alpha();
+                build_frame(&mut a, op);
+                b1 = a.frame.out_pixels().to_vec();
+                // 出场半程：Leave 走一半，k≈0.5，正是「正文在淡、署名不动」最显眼的时刻
+                a.trans.start_leave(0);
+                a.trans.step(transition::LEAVE_S * 0.5);
+                qk = a.trans.quote_k();
+                build_frame(&mut a, op);
+                b2 = a.frame.out_pixels().to_vec();
+                if clock_stamp(&a.cfg) == stamp {
+                    break;
+                }
+            }
+            v5 = b1;
+            v6 = b2;
+            want_leave = qk as f64;
+        }
+        let n0 = a.frame.channel_mask(0);
+        let n1 = a.frame.channel_mask(1);
+        let n2 = a.frame.channel_mask(2);
+        let cb_raw = layout_clock(&mut a);
+        let ql_raw = frame_layout(&a, &cb_raw);
+        let cb_s = place_sign(&a.cfg, cb_raw, &ql_raw);
+        let ac = cb_s.sig.iter().find(|c| c.is_author);
+        let (mut ax0, mut ax1, mut ay0, mut ay1) = (0i32, 0i32, 0i32, 0i32);
+        if let Some(c) = ac {
+            ax0 = c.x;
+            ax1 = c.x + cb_s.sig_w.max(1);
+            ay0 = c.y;
+            ay1 = c.y + c.s.len() as i32 * cb_s.sig_cell.max(1);
+        }
+        let (mut q_sum, mut q_n) = (0f64, 0usize);
+        let (mut au_sum, mut au_n) = (0f64, 0usize);
+        let (mut dt_bad, mut dt_n) = (0usize, 0usize);
+        let fw = a.cfg.w;
+        let fh = a.cfg.h;
+        for y in 0..fh {
+            for x in 0..fw {
+                let i = (y * fw + x) as usize;
+                let (c0, c1, c2) = (n0[i], n1[i], n2[i]);
+                // 只取**单通道**像素：重叠处归属由「最强通道」定，不参与比例
+                if (c0 > 0) as u8 + (c1 > 0) as u8 + (c2 > 0) as u8 != 1 {
+                    continue;
+                }
+                let a1 = (v5[i] >> 24) & 0xFF;
+                let a2 = (v6[i] >> 24) & 0xFF;
+                if a1 < 48 {
+                    continue;
+                }
+                if c2 > 0 {
+                    q_sum += a2 as f64 / a1 as f64;
+                    q_n += 1;
+                } else if c1 > 0 {
+                    if x >= ax0 && x < ax1 && y >= ay0 && y < ay1 {
+                        au_sum += a2 as f64 / a1 as f64;
+                        au_n += 1;
+                    } else {
+                        dt_n += 1;
+                        if (a2 as i32 - a1 as i32).abs() > 1 {
+                            dt_bad += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let q_ratio = if q_n > 0 { q_sum / q_n as f64 } else { f64::NAN };
+        let au_ratio = if au_n > 0 { au_sum / au_n as f64 } else { f64::NAN };
+        let ok_7b = ac.is_some()
+            && q_n > 50
+            && au_n > 20
+            && (q_ratio - want_leave).abs() <= 0.08
+            && (au_ratio - want_leave).abs() <= 0.08
+            && dt_n > 20
+            && dt_bad == 0;
+        rows.push((
+            "PR3·出场时正文与署名同步淡、页头日期不动",
+            ok_7b,
+            format!(
+                "正文 {} px 比值 {:.3} · 署名 {} px 比值 {:.3}{}（都应≈{:.3}）· 页头日期 {} px（异常 {}）",
+                q_n,
+                q_ratio,
+                au_n,
+                au_ratio,
+                if ac.is_some() { "" } else { "（署名没生成）" },
+                want_leave,
+                dt_n,
+                dt_bad
+            ),
+        ));
+        // 还原：后面的断言读的是原来那句与环境
+        a.list[a.qi] = keep_quote;
+        a.cfg.v_style = keep_style;
+        a.cfg.anim = keep_anim;
+        a.trans.settle();
+        a.phase = 0.0;
+
+        // ⑧ 竖版首列完整可见（孤儿项：右缘墨迹被裁剪区切掉的回归守卫）。
         //    旧判据是「版心右缘外还有 1px 外溢墨」—— 它成立靠的是一个巧合：
         //    竖版正文**右起**，首列字紧贴版心右缘，字形墨迹天然越过步进框
         //    1~2px。现在 A/B 两形态改成按墨迹居中（`Align::Center`），首列
