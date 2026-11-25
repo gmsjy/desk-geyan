@@ -164,6 +164,13 @@ pub struct Samples {
     /// 通知正文可能与上一条一模一样（「收到一条新消息」重复出现），
     /// 比字符串会把第二条当成没发生。
     pub notice_key: i64,
+    /// 基线那条通知的到达时刻（FILETIME，100ns；0 = 没有）。只用于认出
+    /// 「库被重建后的新通知」，见 [`notice_is_new`]。
+    pub notice_arrival: i64,
+    /// **本次采样是否读到了新通知**。`tick` 只看这一个标志判新 ——
+    /// 不能拿 `notice_key` 前后比较：库被重建后新通知的编号比基线小。
+    /// 每次采样先清零，同一秒内的后续拍不会重复报。
+    pub notice_new: bool,
     /// 正在播放的媒体行（`晴天 - 周杰伦`）。没有会话时为 `None`。
     pub media: Option<String>,
     /// 未读条数（封顶 99）
@@ -216,6 +223,8 @@ impl Default for Samples {
             battery: None,
             msg: None,
             notice_key: 0,
+            notice_arrival: 0,
+            notice_new: false,
             media: None,
             unread: 0,
             dot_visible: false,
@@ -485,6 +494,9 @@ impl Samples {
         self.clock = fmt_clock(now, opts.seconds);
         self.date = fmt_date(now);
         self.counting = opts.unread;
+        // 新通知只报一拍：同一秒内的后续拍在下面 `stamp == self.stamp` 处
+        // 提前返回，不会走到读库那一步。
+        self.notice_new = false;
         let stamp = (now.wDay as u64) * 86400
             + (now.wHour as u64) * 3600
             + (now.wMinute as u64) * 60
@@ -536,16 +548,7 @@ impl Samples {
         // （「收到一条新消息」这种模板文案），比字符串会把第二条当成没发生。
         if opts.notice && items.msg {
             if let Some(n) = crate::island::feed::latest() {
-                // **冷启动基线**：`prev == 0` 是第一次采样，只记住「当前最新是
-                // 哪条」，不当成新消息。
-                //
-                // 不这么做的话，每次启动挂件都会把库里最新一条通知重新弹一遍
-                // —— 而那是几小时前、甚至几天前的（库里有跨大半年的残留行）。
-                // 用户看到的是「刚打开就冒出一条看过的通知，而且一直不消失」。
-                if notice_is_new(self.notice_key, n.id) {
-                    self.msg = Some(n.line());
-                }
-                self.notice_key = n.id;
+                self.notice_new = self.take_notice(n);
             }
         }
 
@@ -771,7 +774,10 @@ pub fn segments(s: &Samples, items: &Items, clock_short: bool, peek: bool) -> Ve
 /// 拉长态正文的字符上限。
 ///
 /// 28 字 × 13px ≈ 364，加时钟（≈34）、绿点（6 + 两侧间距）与内边距（28）
-/// ≈ 440，落在 `geom::COMPACT_PEEK_MAX_W`（460）之内 ⇒ 单页。
+/// ≈ 440，落在 `geom::COMPACT_PEEK_MAX_W`（540）之内 ⇒ 单页。
+/// 注意常态宽度有 `base_w` 下限（拉长不比常态窄）：七项全开时常态本身就
+/// 有 527px，比这里算出来的还宽 —— 此时「拉长」不表现为变宽，而是
+/// 状态三格与媒体让位给正文。
 /// 拉长态**不带状态三格**（见 `segments` 里 `if peek { continue }`），
 /// 所以这里的预算只花在正文上 —— 常态与拉长态的宽度差因此是实打实的。
 pub const PEEK_BODY_CHARS: usize = 28;
@@ -795,7 +801,7 @@ pub const MEDIA_CHARS_IDLE: usize = 20;
 /// 有事件（`MSG n` / 通知正文）占位时的媒体长度，见 [`MEDIA_CHARS_IDLE`]。
 pub const MEDIA_CHARS_BUSY: usize = 11;
 
-/// 绿点呼吸期（30s）内常态显示的通知正文长度。
+/// 绿点呼吸期（`geom::DOT_BREATHE_MS` = 10s）内常态显示的通知正文长度。
 ///
 /// 比拉长态（`PEEK_BODY_CHARS = 28`）短得多：这段是**常态**里额外塞的，
 /// 常态本来就装着时钟 + 状态三格，再长就要分页。12 字够看清「谁发的 +
@@ -804,11 +810,46 @@ pub const NOTICE_CHARS: usize = 12;
 
 /// 这条通知该不该当作「新到达」。
 ///
-/// `prev == 0` 是**冷启动**：第一次采样只建立基线，不弹。
+/// `prev_id == 0` 是**冷启动**：第一次采样只建立基线，不弹。
 /// 否则每次启动都会把库里最新一条（可能是几天前的）当成新通知弹出来 ——
 /// 而且它会一直挂在胶囊上，看起来就是「看过了也不消失」。
-fn notice_is_new(prev: i64, id: i64) -> bool {
-    prev != 0 && id != prev
+///
+/// 之后要同时认对两件事，单看 `Id` 做不到：
+///
+/// * **被移除**：通知在操作中心被移除后它的行会从库里删掉（真机复现），
+///   `latest()` 退回到上一行 —— `Id` 与到达时刻都只会更小。那不是
+///   「又来了一条」，写成 `!=` 会让用户每清一条，岛就把前一条旧通知重放
+///   一遍（绿点重新呼吸、胶囊换成旧正文）。
+/// * **库被重建**：`Id` 从头来，比上一条小，但新通知的到达时刻一定更晚。
+///   只写 `id > prev_id` 的话，重建之后要重启挂件才恢复提示。
+///
+/// 所以判据是「编号前进，**或**到达时刻更新」。系统时钟被往回拨时，新通知
+/// 的 `Id` 仍然更大，前半句兜住；到达时刻缺失（0）时只看编号。
+fn notice_is_new(prev_id: i64, prev_arrival: i64, n: &crate::island::feed::Notice) -> bool {
+    if prev_id == 0 {
+        return false;
+    }
+    n.id > prev_id || (n.arrival > 0 && prev_arrival > 0 && n.arrival > prev_arrival)
+}
+
+impl Samples {
+    /// 把这一拍读到的最新通知并入采样。返回「是否有新通知到达」。
+    ///
+    /// **基线只在真的来了新通知（或冷启动）时才动**：被移除的那一拍
+    /// `notice_key` 原地不动。不过 `tick` 已经不靠比较它来判新，而是看
+    /// [`Samples::notice_new`] —— 库被重建后新通知的编号比基线小，比较
+    /// 编号会漏。
+    pub fn take_notice(&mut self, n: crate::island::feed::Notice) -> bool {
+        let fresh = notice_is_new(self.notice_key, self.notice_arrival, &n);
+        if fresh || self.notice_key == 0 {
+            if fresh {
+                self.msg = Some(n.line());
+            }
+            self.notice_key = n.id;
+            self.notice_arrival = n.arrival;
+        }
+        fresh
+    }
 }
 
 /// 按**字符**（不是字节）截断，超长补省略号。
@@ -841,6 +882,52 @@ pub fn msg_line(s: &Samples) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(Id, 到达时刻)` 一起给：判新同时看两者，只给 `Id` 造不出
+    /// 「库被重建」与「被移除」的区别。
+    fn notice(id: i64, arrival: i64, title: &str) -> crate::island::feed::Notice {
+        crate::island::feed::Notice {
+            app: "微信".into(),
+            title: title.into(),
+            body: String::new(),
+            id,
+            arrival,
+        }
+    }
+
+    /// 真机复现过的缺陷：清掉最新一条通知后，`latest()` 退回到上一行
+    /// （编号、到达时刻都更小）。基线必须原地不动，正文也不能被旧通知覆盖。
+    #[test]
+    fn take_notice_never_replays_a_removed_notice() {
+        let mut s = Samples {
+            notice_key: 2056,
+            notice_arrival: 900,
+            msg: Some("微信 · B".to_string()),
+            ..Default::default()
+        };
+        // ① 库里最新一行从 2056 退回 2055（A，展示过）
+        assert!(!s.take_notice(notice(2055, 800, "A")));
+        assert_eq!(s.notice_key, 2056);
+        assert_eq!(s.msg.as_deref(), Some("微信 · B"));
+        // ② 再退一步也不动
+        assert!(!s.take_notice(notice(2054, 700, "旧")));
+        assert_eq!(s.notice_key, 2056);
+        assert_eq!(s.msg.as_deref(), Some("微信 · B"));
+        // ③ 真的来了新通知才前移
+        assert!(s.take_notice(notice(2057, 1000, "C")));
+        assert_eq!(s.notice_key, 2057);
+        assert_eq!(s.notice_arrival, 1000);
+        assert_eq!(s.msg.as_deref(), Some("微信 · C"));
+        // ④ 库被重建：编号从头来，但到达时刻更新 —— 仍要认出来
+        assert!(s.take_notice(notice(1, 5000, "新库")));
+        assert_eq!(s.notice_key, 1);
+        assert_eq!(s.msg.as_deref(), Some("微信 · 新库"));
+        // ⑤ 冷启动：第一次只记基线，不写正文
+        let mut cold = Samples::default();
+        assert!(!cold.take_notice(notice(9, 100, "旧")));
+        assert_eq!((cold.notice_key, cold.notice_arrival), (9, 100));
+        assert_eq!(cold.msg, None);
+    }
 
     #[test]
     fn items_parse_ignores_unknown_and_keeps_input_order() {
@@ -998,17 +1085,25 @@ mod tests {
 
     /// 冷启动不能把历史通知当成新消息。
     ///
-    /// 库里最新一条可能是几天前的（41 条 Notification 里最老的跨了大半年、
-    /// 用户清空通知中心也不会删行），所以「第一次读到就弹」必然误报：
-    /// 每次启动挂件都冒出一条看过的通知。
+    /// 库里最新一条可能是几天前的（41 条 Notification 里最老的跨了大半年），
+    /// 所以「第一次读到就弹」必然误报：每次启动挂件都冒出一条看过的通知。
+    ///
+    /// 判新同时看 `Id` 与到达时刻，四种情形各一条断言：
+    /// 冷启动 / 同一条 / 新通知 / **被移除后 `latest()` 退回上一行** /
+    /// **库被重建后编号回绕**。后两条方向相反，缺任一边都会出错。
     #[test]
     fn notice_is_new_ignores_the_cold_start_baseline() {
-        assert!(!notice_is_new(0, 2041), "冷启动把历史通知当成新的了");
-        assert!(!notice_is_new(2041, 2041), "同一条通知重复弹");
-        assert!(notice_is_new(2041, 2042), "新通知没被认出来");
-        // `Id` 是自增主键，但判据只要求「不同」—— 库被重建后编号可能回绕，
-        // 那时 `id < prev` 也是新的一条，不能写成 `id > prev`。
-        assert!(notice_is_new(2041, 7), "编号回绕后的通知没被认出来");
+        assert!(!notice_is_new(0, 0, &notice(2041, 10, "")), "冷启动把历史通知当成新的了");
+        assert!(!notice_is_new(2041, 10, &notice(2041, 10, "")), "同一条通知重复弹");
+        assert!(notice_is_new(2041, 10, &notice(2042, 11, "")), "新通知没被认出来");
+        // 被移除：`latest()` 退回到上一行，编号与到达时刻都更小
+        assert!(!notice_is_new(2041, 10, &notice(2040, 9, "")), "被移除的通知让上一条重放了");
+        // `Id` 是自增主键，但库被重建后编号从头来；那时 `id < prev_id`
+        // 也是新的一条 —— 靠「到达时刻更新」认出来，不能只写 `id > prev_id`。
+        assert!(notice_is_new(2041, 10, &notice(7, 11, "")), "库重建后的通知没被认出来");
+        // 到达时刻缺失时只看编号
+        assert!(!notice_is_new(2041, 0, &notice(7, 0, "")));
+        assert!(notice_is_new(2041, 0, &notice(2042, 0, "")));
     }
 
     /// 通知正文只活在呼吸期：圆点转常亮（`dot_visible` 仍为真）时必须收。

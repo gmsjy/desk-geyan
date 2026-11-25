@@ -63,11 +63,11 @@ pub(crate) struct Island {
     pub hover: geom::HoverState,
     /// 当前是否「想要展开」（悬停判定的意图，不是状态机状态）
     pub want: bool,
-    /// 新消息触发的「临时展开」到什么时候（`None` = 没有 peek）。
+    /// 新消息触发的「横向拉长」到什么时候（`None` = 没有拉长）。
     ///
-    /// 与 `want` 并列而不是复用：悬停是**用户意图**，peek 是**内容事件**；
-    /// 两者都可能要求展开，但结束条件不同（手移开 vs 计时到点）。
-    /// 想展开 = `want || peeking`，只在这一处合并。
+    /// 与 `want` 并列而不是复用：悬停是**用户意图**，决定展开面板；
+    /// 拉长是**内容事件**，只在收起态把胶囊横向撑宽（高度不变）。
+    /// 两者互不干涉：拉长不进状态机，`desired` 只等于 `want`。
     pub peek_until: Option<Instant>,
     /// 是否已经取过一次样。**首帧取样不算「新消息」**：启动时 `seen\` 里
     /// 24h 内的历史未读会让 `unread` 从 0 跳到 N，`msg` 也会从 `None` 变成
@@ -654,7 +654,6 @@ pub(crate) fn tick(a: &mut App) {
         a.island.samples.unread,
         a.island.samples.msg.clone(),
         a.island.samples.media.clone(),
-        a.island.samples.notice_key,
     );
     let now_time = crate::util::local_time();
     let opts = {
@@ -682,7 +681,7 @@ pub(crate) fn tick(a: &mut App) {
         a.island.dirty = true;
     }
 
-    // ---- ④b 新消息 → 临时展开（peek）。触发源要两个，缺一个都会漏：
+    // ---- ④b 新消息 → 横向拉长（peek）。触发源要三个，缺一个都会漏：
     //      `unread` 涨了（同文重复到达；或关掉计数时正文没变但确实来了新的），
     //      或 `msg` 变了（正文不同）。只看 `msg` 会被「两条一样的消息」骗过去。
     let first_sample = !a.island.sampled_once;
@@ -693,7 +692,12 @@ pub(crate) fn tick(a: &mut App) {
             // 系统通知：**必须单独判**。通知正文会重复（「收到一条新消息」
             // 这种模板文案），两条接连到达时 `msg` 字符串一模一样，
             // 只比字符串会把第二条当成没发生 —— 绿点不亮、不拉长。
-            || stamps_before.7 != a.island.samples.notice_key);
+            //
+            // 看 `notice_new` 而不是比较 `notice_key`：通知被移除后库里的行
+            // 跟着删，「最新一条」会退回成上一行；而库被重建后新通知的编号
+            // 反而比基线小。两种情形下比较编号都会判反，`Samples::take_notice`
+            // 已经把「是不是真的新」判好。
+            || a.island.samples.notice_new);
     if new_msg {
         // 绿点闪不闪只看 `fresh`（有没看过的新消息），与「拉不拉长」解耦：
         // 用户把 `island_peek_ms` 设成 0 只关掉拉长，绿点仍要提示。

@@ -866,6 +866,86 @@ fn islandtest_inner() -> i32 {
         format!("呼吸中含正文={said}（须 true）· 转常亮后={after_breathe}（须 false）· 熄灭后={gone}（须 false）"),
     );
 
+    // ㉕ 通知被移除 ≠ 来了新通知（不重放）
+    //
+    // 真机复现过的缺陷：通知在操作中心被清掉后，库里的行跟着删，`latest()`
+    // 退回到上一行（`Id` 更小）。判新若写 `!=`，用户每清一条，岛就把前一条
+    // 旧通知当成新的重放 —— 绿点重新呼吸、胶囊换成旧正文。
+    //
+    // 回退那一半走**真实的 `tick`**（会去读本机通知库），所以基线取一个真实
+    // `Id` 永远到不了的大数：无论本机库是空、有几条、还是正好在来新通知，
+    // 这一拍读到的都必然是「回退」。正向那一半 `tick` 造不出来（要真发一条），
+    // 直接喂 `take_notice` —— `tick` 判新看的就是它维护的基线。
+    let (sampled, db_read, key_kept, msg_kept, fired, key_moved, msg_moved, rebuild_ok) =
+        with_app(|a| {
+        a.cfg.island = true;
+        if !a.island.on() {
+            unsafe { island::create(a) };
+        }
+        // 计数关掉：`unread` 涨落是另一条触发源，会搅浑「通知这一条没触发」
+        a.cfg.island_unread = false;
+        a.cfg.island_notify = true;
+        a.island.consume_events = false;
+        a.island.items = Items::parse("clock,dot,msg");
+        island::force_state(a, State::Collapsed);
+        a.island.sampled_once = true;
+        a.island.fresh = false;
+        a.island.peek_until = None;
+        a.island.samples.msg = Some("上一条".to_string());
+        a.island.samples.unread = 0;
+        let big = i64::MAX / 2;
+        a.island.samples.notice_key = big;
+        // 到达时刻也给个大数：判新是「编号前进 或 到达时刻更新」，
+        // 两者都压住，本机库无论读到什么都必然落在「回退」那一侧。
+        a.island.samples.notice_arrival = i64::MAX;
+        // `update` 按秒节流：不跨过秒边界就提前返回，根本走不到读库那一步，
+        // 于是这一步**空过**（反向验证时改回 `!=` 它照样绿）。把上次的采样
+        // 戳置成不可能相等的值，强制这一拍采样。
+        a.island.samples.stamp = u64::MAX;
+        island::tick(a);
+        let sampled = a.island.samples.stamp != u64::MAX;
+        // 仅作信息：本机有没有读到通知库。没库的机器上前半是空过的，
+        // 不计入判定（否则在干净机器上恒红），但要在输出里说出来。
+        let db_read = crate::island::feed::latest().is_some();
+        let key_kept = a.island.samples.notice_key == big;
+        let msg_kept = a.island.samples.msg.as_deref() == Some("上一条");
+        let fired = a.island.fresh || a.island.peek_until.is_some();
+
+        // 正向：真来了新通知 → 基线前移、正文换新
+        a.island.samples.notice_key = 2056;
+        a.island.samples.notice_arrival = 900;
+        let n = crate::island::feed::Notice {
+            app: "微信".into(),
+            title: "张三".into(),
+            body: String::new(),
+            id: 2057,
+            arrival: 1000,
+        };
+        a.island.samples.take_notice(n);
+        let key_moved = a.island.samples.notice_key == 2057;
+        let msg_moved = a.island.samples.msg.as_deref() == Some("微信 · 张三");
+
+        // 库被重建：编号比基线小，但到达时刻更新 —— 仍要认出来（`Id` 回绕）
+        let rebuilt = crate::island::feed::Notice {
+            app: "微信".into(),
+            title: "新库".into(),
+            body: String::new(),
+            id: 1,
+            arrival: 5000,
+        };
+        let rebuild_ok = a.island.samples.take_notice(rebuilt)
+            && a.island.samples.msg.as_deref() == Some("微信 · 新库");
+        (sampled, db_read, key_kept, msg_kept, fired, key_moved, msg_moved, rebuild_ok)
+    })
+    .unwrap_or((false, false, false, false, true, false, false, false));
+    all &= row(
+        sampled && key_kept && msg_kept && !fired && key_moved && msg_moved && rebuild_ok,
+        "㉕ 通知被移除不重放（回退非新）· 新通知与库重建仍识别",
+        format!(
+            "本拍已采样={sampled}（须 true）· 读到通知库={db_read}（仅信息）· 回退后基线不动={key_kept}（须 true）· 正文不被旧通知覆盖={msg_kept}（须 true）· 未触发提示={fired}（须 false）· 新通知前移={key_moved}（须 true）· 换正文={msg_moved}（须 true）· 库重建后识别={rebuild_ok}（须 true）"
+        ),
+    );
+
     // 收尾：关窗
     with_app(|a| {
         a.cfg.island = false;
@@ -875,7 +955,7 @@ fn islandtest_inner() -> i32 {
     println!(
         "\n{}",
         if all {
-            "灵动岛自检 25 步全 PASS（⓪ + ①~㉔）"
+            "灵动岛自检 26 步全 PASS（⓪ + ①~㉕）"
         } else {
             "存在失败项"
         }

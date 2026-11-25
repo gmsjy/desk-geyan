@@ -2,8 +2,10 @@
 //!
 //! # 为什么走通知数据库而不是 WinRT
 //!
-//! `UserNotificationListener` 是 UWP 才有的能力，桌面 exe 没有 package
-//! identity，`RequestAccessAsync` 会直接拒绝。而通知库
+//! `UserNotificationListener` 是官方入口，但要求**包身份**：未打包的
+//! 桌面 exe 没有，`RequestAccessAsync` 会直接拒绝；要走它得做成 MSIX 或
+//! 稀疏包，再加 `userNotificationListener` 受限能力与用户授权
+//! （对比见 `Windows通知API调研-2026-11-24.md` §3）。而通知库
 //! `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` 是
 //! **普通 SQLite 文件**：`mode=ro` 能只读打开（WpnUserService 持有写锁但
 //! 不禁止读），里面的 `Notification.Payload` 就是完整的 toast XML ——
@@ -108,6 +110,10 @@ pub struct Notice {
     /// 通知表主键。**判「是不是新的」只能靠它** —— 时间戳在跨秒、跨天、
     /// 以及系统时钟被校正时都不可靠，而 `Id` 单调递增。
     pub id: i64,
+    /// 到达时刻（`Notification.ArrivalTime`，FILETIME，100ns）。**只用来认
+    /// 「库被重建后的新通知」** —— 那时 `Id` 从头来、比上一条小，但到达
+    /// 时刻一定更晚。缺失时为 0。
+    pub arrival: i64,
 }
 
 impl Notice {
@@ -198,7 +204,7 @@ pub fn latest() -> Option<Notice> {
 unsafe fn query_latest(api: &Api, db: Sqlite) -> Option<Notice> {
     // `Order` 是 SQL 保留字，必须加双引号 —— 不加会得到
     // `near "Order": syntax error`，而那个错误只表现为「查不到」。
-    let sql = b"SELECT n.Id, n.Payload, h.PrimaryId \
+    let sql = b"SELECT n.Id, n.Payload, h.PrimaryId, n.ArrivalTime \
                 FROM Notification n LEFT JOIN NotificationHandler h \
                 ON h.RecordId = n.HandlerId \
                 ORDER BY n.\"Order\" DESC LIMIT 1\0";
@@ -240,6 +246,7 @@ unsafe fn query_latest(api: &Api, db: Sqlite) -> Option<Notice> {
                 title,
                 body,
                 id,
+                arrival: (api.col_i64)(st, 3),
             });
         }
     }
@@ -368,6 +375,7 @@ mod tests {
             title: "张三".into(),
             body: String::new(),
             id: 1,
+            ..Default::default()
         };
         assert_eq!(n.line(), "微信 · 张三");
         let n2 = Notice {
@@ -375,6 +383,7 @@ mod tests {
             title: "张三".into(),
             body: "明天评审".into(),
             id: 2,
+            ..Default::default()
         };
         assert_eq!(n2.line(), "微信 · 张三：明天评审");
         // 标题已经含了应用名时不再重复前缀（微信自己发的 toast 就是这样）
@@ -383,6 +392,7 @@ mod tests {
             title: "微信：张三".into(),
             body: String::new(),
             id: 3,
+            ..Default::default()
         };
         assert_eq!(n3.line(), "微信：张三");
     }
